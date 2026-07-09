@@ -1,0 +1,285 @@
+"""Metadata enrichment: TMDb for movies/series, MusicBrainz + Last.fm for music.
+
+Second pipeline stage. Besides filling items.meta for the embedder, this
+is where weak ids get upgraded: imdb-only movies and Last.fm name-keyed
+artists resolve to their authoritative namespace and merge
+(db.merge_item) so accumulated events/candidates follow the item.
+Every processed item gets enriched_at set — even on failure, with an
+enrich_error note in meta — so one bad item can never wedge the queue.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+from typing import Any
+
+from . import db, http, ids
+from .config import Config
+
+TMDB = "https://api.themoviedb.org/3"
+MB = "https://musicbrainz.org/ws/2"
+LASTFM = "https://ws.audioscrobbler.com/2.0/"
+
+# Below this MusicBrainz search score a name match is too fuzzy to
+# auto-merge; keeping the fallback id beats pointing someone's scrobble
+# history at the wrong artist.
+MB_MERGE_SCORE = 90
+
+_LINK_RE = re.compile(r"<a\s[^>]*>.*?</a>\.?", re.S)
+_READ_MORE_RE = re.compile(r"\s*Read more(?: on Last\.fm)?\.?\s*$", re.I)
+
+
+def run(
+    conn: sqlite3.Connection,
+    cfg: Config,
+    domain: str | None = None,
+    limit: int | None = None,
+) -> dict[str, int]:
+    stats = {"enriched": 0, "merged": 0, "skipped": 0, "errors": 0}
+    sql = (
+        "SELECT * FROM items WHERE enriched_at IS NULL"
+        + (" AND domain=?" if domain else "")
+        + " ORDER BY (EXISTS(SELECT 1 FROM candidates c WHERE c.item_id = items.id)"
+        "   OR EXISTS(SELECT 1 FROM events e WHERE e.item_id = items.id)) DESC,"
+        " updated_at DESC LIMIT ?"
+    )
+    args = ([domain] if domain else []) + [-1 if limit is None else limit]
+    for row in conn.execute(sql, args).fetchall():
+        cur = conn.execute("SELECT enriched_at FROM items WHERE id=?", (row["id"],)).fetchone()
+        if cur is None or cur["enriched_at"] is not None:
+            continue  # merged away or already handled earlier this run
+        eff = {"id": row["id"]}  # tracks the post-merge id for error attribution
+        try:
+            _enrich_one(conn, cfg, row, eff, stats)
+        except Exception as exc:
+            db.upsert_item(conn, eff["id"], row["domain"],
+                           meta={"enrich_error": str(exc)}, enriched=True)
+            stats["errors"] += 1
+    return stats
+
+
+def _enrich_one(
+    conn: sqlite3.Connection,
+    cfg: Config,
+    row: sqlite3.Row,
+    eff: dict[str, str],
+    stats: dict[str, int],
+) -> None:
+    item_id = row["id"]
+    ids_map = json.loads(row["ids"])
+    _, ns, key = ids.parse(item_id)
+    if ns != "lastfm":  # the id's own namespace is an external id too
+        ids_map.setdefault(ns, key)
+    domain = row["domain"]
+    if domain == "movie":
+        _movie(conn, cfg, item_id, ids_map, eff, stats)
+    elif domain == "series":
+        _series(conn, cfg, item_id, ids_map, stats)
+    elif domain == "artist":
+        _artist(conn, cfg, item_id, row["title"], ids_map, eff, stats)
+    else:  # album | track
+        _release_or_recording(conn, item_id, domain, ids_map, stats)
+
+
+# ── movies / series (TMDb) ───────────────────────────────────────────
+
+
+def _movie(conn, cfg, item_id, ids_map, eff, stats) -> None:
+    api_key = cfg.tmdb.get("api_key")
+    if not api_key:
+        stats["skipped"] += 1
+        return
+    tmdb_id = ids_map.get("tmdb")
+    if not tmdb_id:
+        imdb = ids_map.get("imdb")
+        if not imdb:
+            raise LookupError("movie has neither tmdb nor imdb id")
+        found = http.get_json(f"{TMDB}/find/{imdb}",
+                              params={"api_key": api_key, "external_source": "imdb_id"})
+        results = (found or {}).get("movie_results") or []
+        if not results:
+            raise LookupError(f"tmdb /find: no movie for imdb {imdb}")
+        tmdb_id = results[0]["id"]
+        canonical = ids.make("movie", "tmdb", str(tmdb_id))
+        if canonical != item_id:
+            db.merge_item(conn, item_id, canonical)
+            stats["merged"] += 1
+            item_id = eff["id"] = canonical
+    data = http.get_json(
+        f"{TMDB}/movie/{tmdb_id}",
+        params={"api_key": api_key, "append_to_response": "keywords", "language": "en-US"})
+    kw = data.get("keywords") or {}
+    meta = {
+        "genres": [g["name"] for g in data.get("genres") or []],
+        "keywords": [k["name"] for k in kw.get("keywords") or kw.get("results") or []],
+        "overview": data.get("overview"),
+        "original_language": data.get("original_language"),
+        "popularity": data.get("popularity"),
+        "vote_average": data.get("vote_average"),
+        "runtime": data.get("runtime"),
+    }
+    db.upsert_item(conn, item_id, "movie", title=data.get("title"),
+                   year=_year(data.get("release_date")), ids={**ids_map, "tmdb": tmdb_id},
+                   meta=meta, enriched=True)
+    stats["enriched"] += 1
+
+
+def _series(conn, cfg, item_id, ids_map, stats) -> None:
+    api_key = cfg.tmdb.get("api_key")
+    if not api_key:
+        stats["skipped"] += 1
+        return
+    tmdb_id = ids_map.get("tmdb")
+    if not tmdb_id:
+        tvdb = ids_map.get("tvdb")
+        if not tvdb:
+            raise LookupError("series has neither tvdb nor tmdb id")
+        found = http.get_json(f"{TMDB}/find/{tvdb}",
+                              params={"api_key": api_key, "external_source": "tvdb_id"})
+        results = (found or {}).get("tv_results") or []
+        if not results:
+            raise LookupError(f"tmdb /find: no series for tvdb {tvdb}")
+        tmdb_id = results[0]["id"]
+    data = http.get_json(
+        f"{TMDB}/tv/{tmdb_id}",
+        params={"api_key": api_key, "append_to_response": "keywords", "language": "en-US"})
+    kw = data.get("keywords") or {}
+    meta = {
+        "genres": [g["name"] for g in data.get("genres") or []],
+        # TV nests keywords under "results", unlike movies' "keywords"
+        "keywords": [k["name"] for k in kw.get("results") or kw.get("keywords") or []],
+        "overview": data.get("overview"),
+        "original_language": data.get("original_language"),
+        "popularity": data.get("popularity"),
+        "number_of_seasons": data.get("number_of_seasons"),
+    }
+    db.upsert_item(conn, item_id, "series", title=data.get("name"),
+                   year=_year(data.get("first_air_date")), ids={**ids_map, "tmdb": tmdb_id},
+                   meta=meta, enriched=True)
+    stats["enriched"] += 1
+
+
+# ── artists (MusicBrainz + Last.fm) ──────────────────────────────────
+
+
+def _artist(conn, cfg, item_id, title, ids_map, eff, stats) -> None:
+    name = title or ids.parse(item_id)[2]
+    mbid = ids_map.get("mbid")
+    if not mbid:
+        hit = _mb_search_artist(name)
+        if hit is None:
+            # No confident MB match: enrich the fallback item from
+            # Last.fm alone so it still leaves the queue.
+            meta = _lastfm_artist_meta(cfg, None, name)
+            db.upsert_item(conn, item_id, "artist", meta=meta, enriched=True)
+            stats["enriched"] += 1
+            return
+        mbid = hit["id"]
+        canonical = ids.make("artist", "mbid", mbid)
+        if canonical != item_id:
+            db.merge_item(conn, item_id, canonical)
+            stats["merged"] += 1
+            item_id = eff["id"] = canonical
+    data = http.get_json(f"{MB}/artist/{mbid}", params={"inc": "tags+genres", "fmt": "json"})
+    meta = {
+        "tags": _top_tag_names(data.get("tags")),
+        "genres": _top_tag_names(data.get("genres"), cap=None),
+        "type": data.get("type"),
+        "country": data.get("country"),
+        "begin_year": _year((data.get("life-span") or {}).get("begin")),
+    }
+    db.upsert_item(conn, item_id, "artist", title=data.get("name"),
+                   ids={**ids_map, "mbid": mbid}, meta=meta, enriched=True)
+    lf = _lastfm_artist_meta(cfg, mbid, data.get("name") or name)
+    if lf:
+        db.upsert_item(conn, item_id, "artist", meta=lf)
+    stats["enriched"] += 1
+
+
+def _mb_search_artist(name: str) -> dict[str, Any] | None:
+    query = f'artist:"{name.replace(chr(34), "")}"'
+    data = http.get_json(f"{MB}/artist", params={"query": query, "fmt": "json", "limit": 3})
+    hits = (data or {}).get("artists") or []
+    if hits and int(hits[0].get("score") or 0) >= MB_MERGE_SCORE:
+        return hits[0]
+    return None
+
+
+def _lastfm_artist_meta(cfg: Config, mbid: str | None, name: str | None) -> dict[str, Any]:
+    api_key = cfg.lastfm.get("api_key")
+    if not api_key:
+        return {}
+    base = {"method": "artist.getInfo", "api_key": api_key, "format": "json"}
+    data = None
+    if mbid:
+        # Last.fm's mbid index is patchy; fall back to the name lookup.
+        try:
+            data = http.get_json(LASTFM, params={**base, "mbid": mbid})
+        except http.ApiError:
+            data = None
+        if not (isinstance(data, dict) and data.get("artist")):
+            data = None
+    if data is None and name:
+        data = http.get_json(LASTFM, params={**base, "artist": name})
+    artist = data.get("artist") if isinstance(data, dict) else None
+    if not isinstance(artist, dict):
+        return {}
+    meta: dict[str, Any] = {}
+    summary = (artist.get("bio") or {}).get("summary")
+    if summary:
+        meta["bio"] = _clean_bio(summary)
+    listeners = (artist.get("stats") or {}).get("listeners")
+    try:
+        meta["listeners"] = int(listeners)
+    except (TypeError, ValueError):
+        pass
+    similar = (artist.get("similar") or {}).get("artist") or []
+    meta["similar"] = [a["name"] for a in similar if isinstance(a, dict) and a.get("name")]
+    return meta
+
+
+def _clean_bio(summary: str) -> str:
+    return _READ_MORE_RE.sub("", _LINK_RE.sub("", summary)).strip()
+
+
+# ── albums / tracks (MusicBrainz) ────────────────────────────────────
+
+
+def _release_or_recording(conn, item_id, domain, ids_map, stats) -> None:
+    mbid = ids_map.get("mbid")
+    if not mbid:
+        # Name-keyed tracks/albums feed artist aggregation, not ranking —
+        # not worth an MB search each; just close them out.
+        db.upsert_item(conn, item_id, domain, enriched=True)
+        stats["skipped"] += 1
+        return
+    endpoint = "recording" if domain == "track" else "release"
+    data = http.get_json(f"{MB}/{endpoint}/{mbid}",
+                         params={"inc": "artist-credits+tags", "fmt": "json"})
+    credits = data.get("artist-credit") or []
+    meta = {
+        "artists": [c["artist"]["name"] for c in credits
+                    if isinstance(c, dict) and isinstance(c.get("artist"), dict)],
+        "tags": _top_tag_names(data.get("tags")),
+    }
+    db.upsert_item(conn, item_id, domain, title=data.get("title"),
+                   year=_year(data.get("date") or data.get("first-release-date")),
+                   meta=meta, enriched=True)
+    stats["enriched"] += 1
+
+
+# ── shared ───────────────────────────────────────────────────────────
+
+
+def _top_tag_names(tags: list[dict[str, Any]] | None, cap: int | None = 10) -> list[str]:
+    ranked = sorted(tags or [], key=lambda t: -(t.get("count") or 0))
+    names = [t["name"] for t in ranked if t.get("name")]
+    return names[:cap] if cap else names
+
+
+def _year(date_str: str | None) -> int | None:
+    if isinstance(date_str, str) and len(date_str) >= 4 and date_str[:4].isdigit():
+        return int(date_str[:4])
+    return None

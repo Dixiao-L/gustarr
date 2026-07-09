@@ -1,0 +1,209 @@
+"""Offline Jellyfin collector tests against an httpx.MockTransport fake server."""
+
+from __future__ import annotations
+
+import json
+import re
+
+import httpx
+import pytest
+
+from gustarr import config as C
+from gustarr import db
+from gustarr import http as ghttp
+from gustarr.collect import jellyfin
+from gustarr.signals import WEIGHTS
+
+BASE = "http://jelly.test"
+MBID = "a74b1b7f-71a5-4011-9441-d0b5e4122711"
+ARTIST_MBID = f"artist:mbid:{MBID}"
+ARTIST_LASTFM = "artist:lastfm:boards of canada"
+
+
+@pytest.fixture(autouse=True)
+def _no_politeness(monkeypatch):
+    monkeypatch.setattr(ghttp, "HOST_DELAYS", {})
+
+
+def make_cfg(tmp_path, user="tab"):
+    return C._build({
+        "core": {"data_dir": str(tmp_path)},
+        "jellyfin": {"url": BASE, "api_key": "sekrit", "user": user},
+    })
+
+
+def server_state():
+    return {
+        "users": [{"Name": "Tab", "Id": "u1"}, {"Name": "guest", "Id": "u2"}],
+        "library": [
+            {"Id": "m1", "Type": "Movie", "Name": "The Matrix", "ProductionYear": 1999,
+             "ProviderIds": {"Tmdb": "603", "Imdb": "tt0133093"},
+             "UserData": {"Played": True, "IsFavorite": True, "PlayCount": 1,
+                          "LastPlayedDate": "2024-05-01T20:00:00.0000000Z"}},
+            {"Id": "m2", "Type": "Movie", "Name": "Obscure Film",
+             "ProviderIds": {"Imdb": "tt0000001"},
+             "UserData": {"Played": False, "IsFavorite": False}},
+            {"Id": "s1", "Type": "Series", "Name": "Severance", "ProductionYear": 2022,
+             "ProviderIds": {"Tvdb": "371980"},
+             "UserData": {"Played": True, "IsFavorite": False}},
+            {"Id": "a1", "Type": "MusicArtist", "Name": "Radiohead",
+             "ProviderIds": {"MusicBrainzArtist": MBID}, "UserData": {}},
+            {"Id": "a2", "Type": "MusicArtist", "Name": "Boards of Canada",
+             "ProviderIds": {}, "UserData": {}},
+            {"Id": "x1", "Type": "Movie", "Name": "", "ProviderIds": {}, "UserData": {}},
+        ],
+        "episodes": [
+            {"Id": "e1", "Type": "Episode", "SeriesId": "s1"},
+            {"Id": "e2", "Type": "Episode", "SeriesId": "s1"},
+            {"Id": "e3", "Type": "Episode", "SeriesId": "s1"},
+        ],
+        "by_id": {
+            "s1": {"Id": "s1", "Type": "Series", "Name": "Severance", "ProductionYear": 2022,
+                   "ProviderIds": {"Tvdb": "371980"}, "RecursiveItemCount": 5},
+            "a1": {"Id": "a1", "Type": "MusicArtist", "Name": "Radiohead",
+                   "ProviderIds": {"MusicBrainzArtist": MBID}},
+            "a2": {"Id": "a2", "Type": "MusicArtist", "Name": "Boards of Canada",
+                   "ProviderIds": {}},
+        },
+        "audio": [
+            {"Id": "t1", "Type": "Audio", "Name": "Paranoid Android", "Album": "OK Computer",
+             "ArtistItems": [{"Id": "a1", "Name": "Radiohead"}],
+             "UserData": {"PlayCount": 7, "LastPlayedDate": "2024-06-01T10:00:00.0000000Z"}},
+            {"Id": "t2", "Type": "Audio", "Name": "Roygbiv", "Album": "MHTRTC",
+             "ArtistItems": [{"Id": "a2", "Name": "Boards of Canada"}],
+             "UserData": {"PlayCount": 1, "LastPlayedDate": "2024-06-02T10:00:00.0000000Z"}},
+        ],
+        "pbr_rows": [[1, "2024-06-01 10:00:00", "u1", "t1", "Audio", 240],
+                     [2, "2024-06-02 20:00:00", "u1", "m1", "Movie", 8160]],
+        "pbr_available": True,
+    }
+
+
+def make_transport(state):
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("X-Emby-Token") == "sekrit"
+        path = request.url.path
+        q = dict(request.url.params)
+        if path == "/Users":
+            return httpx.Response(200, json=state["users"])
+        if path == "/user_usage_stats/submit_custom_query":
+            if not state["pbr_available"]:
+                return httpx.Response(404, text="plugin not installed")
+            body = json.loads(request.content)
+            cur = int(re.search(r"rowid > (\d+)", body["CustomQueryString"]).group(1))
+            rows = [r for r in state["pbr_rows"] if r[0] > cur]
+            cols = ["rowid", "DateCreated", "UserId", "ItemId", "ItemType", "PlayDuration"]
+            return httpx.Response(200, json={"colums": cols, "results": rows})
+        if path == "/Users/u1/Items":
+            if "Ids" in q:
+                found = [state["by_id"][i] for i in q["Ids"].split(",") if i in state["by_id"]]
+                return httpx.Response(200, json={"Items": found,
+                                                 "TotalRecordCount": len(found)})
+            inc = q.get("IncludeItemTypes", "")
+            if "Episode" in inc:
+                data = state["episodes"]
+            elif "Audio" in inc:
+                data = state["audio"]
+            else:
+                data = state["library"]
+            start = int(q.get("StartIndex", 0))
+            page = data[start:start + 2]  # tiny pages force the pagination loop
+            return httpx.Response(200, json={"Items": page, "TotalRecordCount": len(data)})
+        return httpx.Response(404)
+
+    return httpx.MockTransport(handler)
+
+
+def test_sync_maps_canonical_ids_and_events(tmp_path):
+    conn = db.connect(tmp_path / "t.db")
+    state = server_state()
+    stats = jellyfin.sync(conn, make_cfg(tmp_path), transport=make_transport(state))
+
+    row = conn.execute("SELECT * FROM items WHERE id='movie:tmdb:603'").fetchone()
+    assert row["title"] == "The Matrix" and row["year"] == 1999
+    assert json.loads(row["ids"]) == {"tmdb": 603, "imdb": "tt0133093"}
+    assert json.loads(row["meta"])["jellyfin_id"] == "m1"
+    have = {r["id"] for r in conn.execute("SELECT id FROM items")}
+    assert {"movie:imdb:tt0000001", "series:tvdb:371980", ARTIST_MBID, ARTIST_LASTFM} <= have
+
+    ev = {(r["item_id"], r["kind"]): r for r in conn.execute("SELECT * FROM events")}
+    assert ev[("movie:tmdb:603", "favorite")]["weight"] == WEIGHTS["favorite"]
+    assert ev[("movie:tmdb:603", "complete")]["weight"] == WEIGHTS["complete"]
+    assert ev[("movie:tmdb:603", "complete")]["ts"] == "2024-05-01T20:00:00Z"
+    assert all(r["source"] == "jellyfin" for r in ev.values())
+    # a Played series must not yield complete from the library pass (3/5 < 80%)
+    assert ("series:tvdb:371980", "complete") not in ev
+    assert ev[("series:tvdb:371980", "play")]["weight"] == WEIGHTS["play"]
+    assert ev[(ARTIST_MBID, "scrobble")]["weight"] == pytest.approx(5 * WEIGHTS["scrobble"])
+    assert json.loads(ev[(ARTIST_MBID, "scrobble")]["meta"])["delta"] == 7
+    assert ev[(ARTIST_LASTFM, "scrobble")]["weight"] == pytest.approx(WEIGHTS["scrobble"])
+
+    assert stats["items"] == 5 and stats["skipped"] == 1
+    assert stats["favorites"] == 1 and stats["completes"] == 1
+    assert stats["series_plays"] == 1 and stats["series_completes"] == 0
+    assert stats["scrobbles"] == 2
+    assert stats["playback_reporting"] == 2
+    assert db.get_state(conn, "jellyfin:pbr_rowid") == "2"
+
+
+def test_second_sync_is_a_noop(tmp_path):
+    conn = db.connect(tmp_path / "t.db")
+    cfg = make_cfg(tmp_path)
+    transport = make_transport(server_state())
+    jellyfin.sync(conn, cfg, transport=transport)
+    before = conn.execute("SELECT COUNT(*) c FROM events").fetchone()["c"]
+
+    stats = jellyfin.sync(conn, cfg, transport=transport)
+    after = conn.execute("SELECT COUNT(*) c FROM events").fetchone()["c"]
+    assert after == before
+    assert stats["favorites"] == stats["completes"] == 0
+    assert stats["series_plays"] == stats["series_completes"] == stats["scrobbles"] == 0
+    assert stats["playback_reporting"] == 0
+
+
+def test_progress_deltas_emit_incrementally(tmp_path, monkeypatch):
+    conn = db.connect(tmp_path / "t.db")
+    cfg = make_cfg(tmp_path)
+    state = server_state()
+    transport = make_transport(state)
+    jellyfin.sync(conn, cfg, transport=transport)
+
+    # one more episode (4/5 >= 80%) and two more listens of t1
+    state["episodes"].append({"Id": "e4", "Type": "Episode", "SeriesId": "s1"})
+    state["audio"][0]["UserData"] = {"PlayCount": 9,
+                                     "LastPlayedDate": "2024-06-15T10:00:00.0000000Z"}
+    # both syncs run within the same wall-clock second; distinct 'now' keeps
+    # the (ts,item,kind,source) uniqueness key from swallowing the new play
+    monkeypatch.setattr(jellyfin.db, "now", lambda: "2099-01-01T00:00:00Z")
+    stats = jellyfin.sync(conn, cfg, transport=transport)
+    assert stats["series_plays"] == 1 and stats["series_completes"] == 1
+    assert stats["scrobbles"] == 1
+    row = conn.execute(
+        "SELECT weight, meta FROM events WHERE kind='scrobble' AND ts='2024-06-15T10:00:00Z'"
+    ).fetchone()
+    assert row["weight"] == pytest.approx(2 * WEIGHTS["scrobble"])
+    assert json.loads(row["meta"])["delta"] == 2
+    complete = conn.execute(
+        "SELECT meta FROM events WHERE kind='complete' AND item_id='series:tvdb:371980'"
+    ).fetchone()
+    assert json.loads(complete["meta"]) == {"episodes_played": 4, "episodes_total": 5}
+
+    monkeypatch.setattr(jellyfin.db, "now", lambda: "2099-01-02T00:00:00Z")
+    stats3 = jellyfin.sync(conn, cfg, transport=transport)
+    assert stats3["series_plays"] == stats3["series_completes"] == stats3["scrobbles"] == 0
+
+
+def test_missing_user_errors_clearly(tmp_path):
+    conn = db.connect(tmp_path / "t.db")
+    cfg = make_cfg(tmp_path, user="nobody")
+    with pytest.raises(ValueError, match="nobody"):
+        jellyfin.sync(conn, cfg, transport=make_transport(server_state()))
+
+
+def test_playback_reporting_absent_is_skipped(tmp_path):
+    conn = db.connect(tmp_path / "t.db")
+    state = server_state()
+    state["pbr_available"] = False
+    stats = jellyfin.sync(conn, make_cfg(tmp_path), transport=make_transport(state))
+    assert stats["playback_reporting"] == "unavailable"
+    assert stats["items"] == 5  # the rest of the sync still ran
