@@ -29,8 +29,11 @@ CREATE TABLE IF NOT EXISTS items (
 CREATE INDEX IF NOT EXISTS idx_items_domain ON items(domain);
 
 -- Every taste signal, append-only. weight is the label contribution
--- (see signals.py); one row per (ts,item,kind,source) so re-syncs are
--- idempotent.
+-- (see signals.py); one row per (ts,item,kind,source,dedup) so re-syncs
+-- are idempotent. dedup disambiguates genuinely distinct same-second
+-- events (e.g. two tracks by one artist scrobbled in the same second
+-- both mirror to the artist item) — collectors pass a stable
+-- discriminator like the originating track id.
 CREATE TABLE IF NOT EXISTS events (
   id      INTEGER PRIMARY KEY,
   ts      TEXT NOT NULL,                 -- ISO8601 UTC
@@ -38,10 +41,20 @@ CREATE TABLE IF NOT EXISTS events (
   kind    TEXT NOT NULL,                 -- play|complete|scrobble|loved|favorite|library_add|approve|reject|abandon
   weight  REAL NOT NULL,
   source  TEXT NOT NULL,                 -- jellyfin|lastfm|listenbrainz|arr|user
+  dedup   TEXT NOT NULL DEFAULT '',
   meta    TEXT NOT NULL DEFAULT '{}',
-  UNIQUE(ts, item_id, kind, source)
+  UNIQUE(ts, item_id, kind, source, dedup)
 );
 CREATE INDEX IF NOT EXISTS idx_events_item ON events(item_id);
+
+-- Fallback → canonical id mappings recorded by merge_item, so a
+-- collector re-minting a name-keyed id after enrich merged it away
+-- gets transparently redirected instead of resurrecting the fallback
+-- row (and re-running the whole merge every night).
+CREATE TABLE IF NOT EXISTS item_aliases (
+  alias_id     TEXT PRIMARY KEY,
+  canonical_id TEXT NOT NULL
+);
 
 -- What the *arrs already manage. Never recommend anything in here.
 CREATE TABLE IF NOT EXISTS library (
@@ -118,6 +131,15 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
 # ── items ────────────────────────────────────────────────────────────
 
 
+def canonical_id(conn: sqlite3.Connection, item_id: str) -> str:
+    """Resolve an id through recorded merges. Collectors call this (or
+    rely on upsert_item/add_event doing it) so merged fallback ids never
+    come back to life."""
+    row = conn.execute(
+        "SELECT canonical_id FROM item_aliases WHERE alias_id=?", (item_id,)).fetchone()
+    return row["canonical_id"] if row else item_id
+
+
 def upsert_item(
     conn: sqlite3.Connection,
     item_id: str,
@@ -127,10 +149,12 @@ def upsert_item(
     ids: dict[str, Any] | None = None,
     meta: dict[str, Any] | None = None,
     enriched: bool = False,
-) -> None:
+) -> str:
     """Insert or non-destructively update: never blanks an existing field,
-    merges ids/meta dicts key-wise (new keys win)."""
+    merges ids/meta dicts key-wise (new keys win). Returns the effective
+    id, which differs from item_id when a merge redirected it."""
     ts = now()
+    item_id = canonical_id(conn, item_id)
     row = conn.execute("SELECT ids, meta FROM items WHERE id=?", (item_id,)).fetchone()
     if row is None:
         conn.execute(
@@ -163,6 +187,14 @@ def merge_item(conn: sqlite3.Connection, fallback_id: str, canonical_id: str) ->
         return
     upsert_item(conn, canonical_id, fb["domain"], fb["title"], fb["year"],
                 json.loads(fb["ids"]), json.loads(fb["meta"]))
+    # Record the redirect (and re-point any older aliases at the new
+    # canonical id) so future writes under the fallback id land here.
+    conn.execute("UPDATE item_aliases SET canonical_id=? WHERE canonical_id=?",
+                 (canonical_id, fallback_id))
+    conn.execute(
+        "INSERT INTO item_aliases (alias_id, canonical_id) VALUES (?,?)"
+        " ON CONFLICT(alias_id) DO UPDATE SET canonical_id=excluded.canonical_id",
+        (fallback_id, canonical_id))
     # events: fallback rows may collide with existing canonical rows on the
     # uniqueness key (same scrobble synced under both ids) — drop dupes.
     conn.execute(
@@ -194,12 +226,14 @@ def add_event(
     weight: float,
     source: str,
     meta: dict[str, Any] | None = None,
+    dedup: str = "",
 ) -> bool:
     """Returns False when the event already existed (idempotent re-sync)."""
     cur = conn.execute(
-        "INSERT OR IGNORE INTO events (ts, item_id, kind, weight, source, meta)"
-        " VALUES (?,?,?,?,?,?)",
-        (ts, item_id, kind, weight, source, json.dumps(meta or {})),
+        "INSERT OR IGNORE INTO events (ts, item_id, kind, weight, source, dedup, meta)"
+        " VALUES (?,?,?,?,?,?,?)",
+        (ts, canonical_id(conn, item_id), kind, weight, source, dedup,
+         json.dumps(meta or {})),
     )
     return cur.rowcount > 0
 
