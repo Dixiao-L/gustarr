@@ -20,7 +20,11 @@
           inherit system;
           config.allowUnfreePredicate = pkg:
             let n = lib.getName pkg; in
-            builtins.elem n [ "torch-bin" "triton-bin" ]
+            # torch-bin evaluates under pname "torch" (nixpkgs shares the
+            # name across source/bin variants); its license is
+            # bsd3+issl+unfreeRedistributable purely from the bundled
+            # NVIDIA userspace.
+            builtins.elem n [ "torch" "torch-bin" "triton" "triton-bin" ]
             || lib.hasPrefix "cuda" n
             || lib.hasPrefix "libcu" n
             || lib.hasPrefix "libnv" n
