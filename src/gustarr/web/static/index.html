@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gustarr</title>
+<style>
+  :root {
+    --bg: #f5f5f7; --card: #ffffff; --text: #1d1d1f; --muted: #71717a;
+    --line: #e4e4e7; --accent: #e8590c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141416; --card: #1e1e21; --text: #ececf0; --muted: #9d9da6;
+      --line: #2e2e33; --accent: #ff7a2e;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text); line-height: 1.5;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+      "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC",
+      "Noto Sans JP", sans-serif;
+  }
+  header {
+    position: sticky; top: 0; z-index: 2; display: flex; align-items: center;
+    gap: 16px; flex-wrap: wrap; padding: 12px 20px;
+    background: var(--card); border-bottom: 1px solid var(--line);
+  }
+  header h1 { margin: 0; font-size: 18px; letter-spacing: .02em; }
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; }
+  .chip {
+    font-size: 12px; color: var(--muted); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px;
+  }
+  .chip b { color: var(--text); font-weight: 600; }
+  main { max-width: 1100px; margin: 0 auto; padding: 20px; }
+  h2.domain {
+    font-size: 13px; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--muted); margin: 24px 0 10px;
+  }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+    padding: 14px 16px; display: flex; flex-direction: column; gap: 8px;
+  }
+  .card.busy { opacity: .5; pointer-events: none; }
+  .title { font-weight: 600; font-size: 15px; }
+  .year { color: var(--muted); font-weight: 400; }
+  .genres { font-size: 12px; color: var(--muted); }
+  .score { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+  .bar { flex: 1; height: 4px; border-radius: 2px; background: var(--line); overflow: hidden; }
+  .bar i { display: block; height: 100%; background: var(--accent); }
+  .actions { display: flex; gap: 8px; margin-top: 2px; }
+  button {
+    font: inherit; font-size: 13px; border-radius: 8px; padding: 5px 14px;
+    cursor: pointer; border: 1px solid var(--line); background: transparent; color: var(--text);
+  }
+  button:hover { border-color: var(--accent); }
+  button.approve { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.why { margin-left: auto; border: none; color: var(--muted); padding: 5px 4px; }
+  button.why:hover { color: var(--accent); }
+  .whytext {
+    display: none; font-size: 12.5px; color: var(--muted); white-space: pre-wrap;
+    background: var(--bg); border-radius: 8px; padding: 8px 10px;
+  }
+  .card.open .whytext { display: block; }
+  .empty { color: var(--muted); text-align: center; padding: 48px 0; }
+  .error { color: var(--accent); font-size: 12px; }
+  .error:empty { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>gustarr</h1>
+  <div id="stats" class="chips"></div>
+</header>
+<main>
+  <div id="queue"><p class="empty">Loading…</p></div>
+</main>
+<script>
+(function () {
+  'use strict';
+  const DOMAIN_ORDER = ['movie', 'series', 'artist', 'album', 'track'];
+
+  const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g,
+    c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+
+  async function getJSON(url) {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  }
+
+  function genresOf(r) {
+    let g = r.genres;
+    if (typeof g === 'string') g = g.split(',').map(s => s.trim());
+    return Array.isArray(g) ? g.filter(Boolean) : [];
+  }
+
+  function card(r) {
+    const el = document.createElement('article');
+    el.className = 'card';
+    el.id = 'rec-' + r.id;
+    const score = Number(r.score) || 0;
+    const pct = Math.round(100 * Math.max(0, Math.min(1, score)));
+    const genres = genresOf(r);
+    el.innerHTML =
+      '<div class="title">' + esc(r.title || r.item_id) +
+      (r.year ? ' <span class="year">(' + esc(r.year) + ')</span>' : '') + '</div>' +
+      (genres.length ? '<div class="genres">' + esc(genres.join(' · ')) + '</div>' : '') +
+      '<div class="score"><span class="bar"><i style="width:' + pct + '%"></i></span>' +
+      '<span>' + score.toFixed(2) + '</span></div>' +
+      '<div class="whytext"></div>' +
+      '<div class="actions">' +
+      '<button class="approve">Approve</button>' +
+      '<button class="reject">Reject</button>' +
+      '<button class="why">why?</button>' +
+      '</div>' +
+      '<div class="error"></div>';
+    el.querySelector('.approve').addEventListener('click', () => act(el, r.id, 'approve'));
+    el.querySelector('.reject').addEventListener('click', () => act(el, r.id, 'reject'));
+    el.querySelector('.why').addEventListener('click', () => toggleWhy(el, r.id));
+    return el;
+  }
+
+  async function act(el, id, action) {
+    el.classList.add('busy');
+    el.querySelector('.error').textContent = '';
+    try {
+      const r = await fetch('/api/recs/' + id + '/' + action, {method: 'POST'});
+      if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + await r.text());
+      const section = el.closest('section');
+      el.remove();
+      if (section) {
+        const left = section.querySelectorAll('.card').length;
+        if (!left) section.remove();
+        else section.querySelector('h2').textContent = section.dataset.domain + ' · ' + left;
+      }
+      if (!document.querySelector('#queue .card')) showEmpty();
+      loadStats();
+    } catch (e) {
+      el.classList.remove('busy');
+      el.querySelector('.error').textContent = String(e.message || e);
+    }
+  }
+
+  async function toggleWhy(el, id) {
+    if (el.classList.contains('open')) { el.classList.remove('open'); return; }
+    el.classList.add('open');
+    const box = el.querySelector('.whytext');
+    if (!box.textContent) {
+      box.textContent = '…';
+      try { box.textContent = (await getJSON('/api/recs/' + id + '/why')).text; }
+      catch (e) { box.textContent = 'failed to load: ' + (e.message || e); }
+    }
+  }
+
+  function chip(label, value) {
+    return '<span class="chip">' + esc(label) + ' <b>' + esc(value) + '</b></span>';
+  }
+
+  async function loadStats() {
+    try {
+      const s = await getJSON('/api/stats');
+      const parts = [];
+      const q = s.recs_by_status || s.queue || {};
+      for (const k of Object.keys(q)) if (typeof q[k] === 'number') parts.push(chip(k, q[k]));
+      const t = s.tables || s;
+      for (const k of ['items', 'events', 'candidates'])
+        if (typeof t[k] === 'number') parts.push(chip(k, t[k]));
+      document.getElementById('stats').innerHTML = parts.join('');
+    } catch (e) { /* the stats strip is decorative — never block the queue on it */ }
+  }
+
+  function showEmpty() {
+    document.getElementById('queue').innerHTML =
+      '<p class="empty">Queue is empty — nothing awaiting review.</p>';
+  }
+
+  async function loadRecs() {
+    const root = document.getElementById('queue');
+    let recs;
+    try { recs = await getJSON('/api/recs?status=proposed'); }
+    catch (e) {
+      root.innerHTML = '<p class="empty">Failed to load queue: ' + esc(e.message || e) + '</p>';
+      return;
+    }
+    if (!recs.length) { showEmpty(); return; }
+    const byDomain = new Map();
+    for (const r of recs) {
+      if (!byDomain.has(r.domain)) byDomain.set(r.domain, []);
+      byDomain.get(r.domain).push(r);
+    }
+    const domains = [...byDomain.keys()].sort((a, b) => {
+      const ia = DOMAIN_ORDER.indexOf(a), ib = DOMAIN_ORDER.indexOf(b);
+      return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+    });
+    root.innerHTML = '';
+    for (const d of domains) {
+      const section = document.createElement('section');
+      section.dataset.domain = d;
+      const h = document.createElement('h2');
+      h.className = 'domain';
+      h.textContent = d + ' · ' + byDomain.get(d).length;
+      const grid = document.createElement('div');
+      grid.className = 'grid';
+      for (const r of byDomain.get(d)) grid.appendChild(card(r));
+      section.appendChild(h);
+      section.appendChild(grid);
+      root.appendChild(section);
+    }
+  }
+
+  loadStats();
+  loadRecs();
+})();
+</script>
+</body>
+</html>
