@@ -3,6 +3,10 @@
 MMR keeps a run's picks from clustering on one taste mode; a slice of
 each run is reserved for exploration so ranking never goes fully
 exploit-only — the model needs off-policy feedback to keep learning.
+Exploration slots prefer serendipity_* candidates (sampled from
+under-represented regions, so their low scores are expected) and are
+novelty-gated against the positive centroid so the "exploration" label
+never lands on a near-core item.
 """
 
 from __future__ import annotations
@@ -23,6 +27,13 @@ SOURCE_BONUS = 0.03
 EXT_BONUS = 0.05
 NEG_PULL = 0.6
 EXPLORE_BAND = (40.0, 90.0)  # score percentiles: novel-ish but not junk
+SERENDIPITY_SOURCES = frozenset({"serendipity_tmdb", "serendipity_lastfm"})
+# Serendipity skips the EXPLORE_BAND quality gate (its scores are
+# legitimately low — that's the point) but not this sanity floor.
+SEREN_FLOOR_PCT = 10.0
+# Exploration picks must sit below this percentile of the pool's
+# centroid similarities: outside the taste core, not near-duplicates.
+NOVELTY_PCT = 60.0
 
 
 def _state_json(conn: sqlite3.Connection, key: str) -> dict | None:
@@ -135,8 +146,23 @@ def _rescore_open(
     return len(scorable)
 
 
+def _farthest(pool: list[int], picked: list[int], xn: np.ndarray) -> int:
+    best, best_val = pool[0], -np.inf
+    for j in pool:
+        min_dist = min((1.0 - float(xn[j] @ xn[k]) for k in picked), default=1.0)
+        if min_dist > best_val:
+            best, best_val = j, min_dist
+    return best
+
+
 def _select(
-    scores: np.ndarray, xn: np.ndarray, slots: int, lam: float, explore_frac: float,
+    scores: np.ndarray,
+    xn: np.ndarray,
+    slots: int,
+    lam: float,
+    explore_frac: float,
+    serendipity: set[int],
+    cent_sims: np.ndarray | None,
 ) -> tuple[list[int], set[int]]:
     n_mmr = min(slots, round(slots * (1.0 - explore_frac)))
     picked: list[int] = []
@@ -154,17 +180,26 @@ def _select(
     explored: set[int] = set()
     n_explore = slots - len(picked)
     if n_explore > 0 and remaining:
+        novel = set(remaining)
+        if cent_sims is not None:
+            cap = float(np.percentile(cent_sims, NOVELTY_PCT))
+            novel = {j for j in remaining if float(cent_sims[j]) < cap}
+        floor = float(np.percentile(scores, SEREN_FLOOR_PCT))
+        seren = [j for j in remaining
+                 if j in serendipity and j in novel and float(scores[j]) >= floor]
         lo, hi = np.percentile(scores[remaining], EXPLORE_BAND)
         band = [j for j in remaining if lo <= scores[j] <= hi] or list(remaining)
+        band_novel = [j for j in band if j in novel]
         for _ in range(n_explore):
-            if not band:
+            # Preference: serendipity, then the novelty-gated band, then the
+            # ungated band (the old behaviour) so gating never starves slots.
+            pool = seren or band_novel or band
+            if not pool:
                 break
-            best, best_val = band[0], -np.inf
-            for j in band:
-                min_dist = min((1.0 - float(xn[j] @ xn[k]) for k in picked), default=1.0)
-                if min_dist > best_val:
-                    best, best_val = j, min_dist
-            band.remove(best)
+            best = _farthest(pool, picked, xn)
+            for p in (seren, band_novel, band):
+                if best in p:
+                    p.remove(best)
             picked.append(best)
             explored.add(best)
     return picked, explored
@@ -223,9 +258,15 @@ def run(conn: sqlite3.Connection, cfg: Config, top: int = 20) -> dict:
         ])
         scores = base + bonus
 
+        seren_idx = {j for j, i in enumerate(ids)
+                     if info[i]["sources"] & SERENDIPITY_SOURCES}
+        cent_sims = None
+        if centroid is not None and centroid.get("dim") == x.shape[1] and centroid.get("pos"):
+            cent_sims = xn @ _unit(_vec(centroid["pos"]))
+
         slots = min(top, ARTIST_TOP) if domain == "artist" else top
         slots = min(slots, len(ids))
-        picked, explored = _select(scores, xn, slots, lam, explore_frac)
+        picked, explored = _select(scores, xn, slots, lam, explore_frac, seren_idx, cent_sims)
 
         exemplars = (centroid or {}).get("exemplars") or []
         ex_vecs = {
@@ -250,6 +291,8 @@ def run(conn: sqlite3.Connection, cfg: Config, top: int = 20) -> dict:
                 "seeds": sorted(titles.get(s) or s for s in info[item_id]["seeds"]),
                 "exploration": j in explored,
             }
+            if j in explored and info[item_id]["sources"] & SERENDIPITY_SOURCES:
+                why["serendipity"] = True
             # OR IGNORE: the partial unique index on open recommendations
             # is the last line of defence against double-queueing.
             cur = conn.execute(

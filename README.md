@@ -44,6 +44,25 @@ Taste labels come from `signals.py` — one reviewable table: completion
 +0.8, loved +1.0, library-add +0.6, your reject −1.0, … with 1-year
 half-life recency decay and log-scaled listen counts.
 
+## Echo-chamber resistance
+
+A single-user recommender trained on its own output converges on a
+bubble unless that's engineered against. gustarr's guards:
+
+- **Serendipity candidates** sampled from *under*-represented genres,
+  decades and 2-hop artist neighborhoods (quality-floored) — the pool
+  itself contains things similarity search would never surface.
+- **Exploration slots** (default 15% of each run) are filled from that
+  pool, gated to be genuinely far from the taste centroid, and clearly
+  labeled in the CLI/UI.
+- **Soft rejects**: declining a labeled long-shot counts 0.3× — an
+  experiment that didn't land shouldn't close a whole region of taste.
+- **No self-reinforcement**: items gustarr adds autonomously carry zero
+  training weight until *you* actually watch, love, or reject them.
+- **Drift is measured**: `gustarr stats` reports genre entropy of
+  recent recommendations vs. your library and the exploration approval
+  rate, so narrowing shows up as a number, not a feeling.
+
 ## Honest limitations
 
 - Single-user cold start is real. Until ~50 labeled interactions per

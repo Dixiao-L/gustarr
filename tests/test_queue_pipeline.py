@@ -10,7 +10,7 @@ import pytest
 
 from gustarr import config as C
 from gustarr import db, pipeline, queue
-from gustarr.signals import WEIGHTS
+from gustarr.signals import WEIGHTS, aggregate_label
 
 
 @pytest.fixture
@@ -104,6 +104,36 @@ def test_reject_writes_negative_event(conn):
     assert ev["source"] == "user"
 
 
+def test_exploration_reject_is_soft(conn):
+    rid = add_rec(conn, "movie:tmdb:8", title="Wildcard", why={"exploration": True})
+    queue.set_status(conn, rid, "rejected")
+
+    ev = conn.execute("SELECT * FROM events WHERE kind='reject'").fetchone()
+    assert ev["weight"] == pytest.approx(WEIGHTS["reject"] * 0.3)
+    assert ev["weight"] == pytest.approx(-0.3)
+    assert json.loads(ev["meta"]) == {"rec_id": rid, "exploration": True}
+    # the stored weight is what training sees — no special-casing downstream
+    assert aggregate_label([(ev["ts"], ev["kind"], ev["weight"])]) == pytest.approx(-0.3, abs=1e-3)
+
+
+def test_reject_with_falsy_exploration_stays_full_weight(conn):
+    rid = add_rec(conn, "movie:tmdb:8", title="Safe Bet", why={"exploration": False})
+    queue.set_status(conn, rid, "rejected")
+
+    ev = conn.execute("SELECT * FROM events WHERE kind='reject'").fetchone()
+    assert ev["weight"] == WEIGHTS["reject"] == -1.0
+    assert json.loads(ev["meta"]) == {"rec_id": rid}
+
+
+def test_exploration_approve_keeps_full_weight(conn):
+    rid = add_rec(conn, "movie:tmdb:9", title="Wildcard", why={"exploration": True})
+    queue.set_status(conn, rid, "approved")
+
+    ev = conn.execute("SELECT * FROM events WHERE kind='approve'").fetchone()
+    assert ev["weight"] == WEIGHTS["approve"] == 1.0
+    assert json.loads(ev["meta"]) == {"rec_id": rid}
+
+
 def test_double_approve_raises(conn):
     rid = add_rec(conn, "movie:tmdb:1", title="M")
     queue.set_status(conn, rid, "approved")
@@ -161,6 +191,16 @@ def test_explain_renders_all_sections(conn):
     assert len(text.splitlines()) >= 6
 
 
+def test_explain_serendipity_marker(conn):
+    ser = add_rec(conn, "movie:tmdb:70", title="Left Field", year=2011,
+                  why={"sources": ["serendipity"], "serendipity": True})
+    plain = add_rec(conn, "movie:tmdb:71", title="Safe Bet", year=2012,
+                    why={"sources": ["tmdb_similar"]})
+
+    assert "(serendipity)" in queue.explain(conn, ser)
+    assert "(serendipity)" not in queue.explain(conn, plain)
+
+
 def test_explain_unknown_rec_raises(conn):
     with pytest.raises(ValueError):
         queue.explain(conn, 42)
@@ -200,6 +240,62 @@ def test_store_stats(conn):
     assert s["models"]["movie"] == "2026-07-01T00:00:00Z"
     # 3 items carry events/candidates; only the artist has a vector
     assert s["embedding_coverage"] == {"needed": 3, "embedded": 1}
+
+
+def test_store_stats_diversity_entropy_and_share(conn):
+    # recs: Drama x2, Comedy x2 — an even 2-genre split is exactly 1 bit;
+    # the genre-less rec must be skipped, not counted as a genre
+    add_rec(conn, "movie:tmdb:1", title="A", genres=["Drama"])
+    add_rec(conn, "movie:tmdb:2", title="B", genres=["Comedy"])
+    add_rec(conn, "movie:tmdb:3", title="C", genres=["Drama", "Comedy"])
+    add_rec(conn, "movie:tmdb:4", title="D", why={"exploration": True})
+
+    # library: Drama x3, Sci-Fi x1 → -(0.75*log2(0.75) + 0.25*log2(0.25)) = 0.811
+    for i, genre in enumerate(["Drama", "Drama", "Drama", "Sci-Fi"]):
+        item = db.upsert_item(conn, f"movie:tmdb:{100 + i}", "movie", f"L{i}",
+                              meta={"genres": [genre]})
+        conn.execute("INSERT INTO library (item_id, arr) VALUES (?, 'radarr')", (item,))
+
+    d = queue.store_stats(conn)["diversity"]
+    assert d["genre_entropy_recs"] == 1.0
+    assert d["genre_entropy_library"] == 0.811
+    assert d["exploration_share"] == 0.25
+    assert d["exploration_approval_rate"] is None  # nothing acted yet
+
+
+def test_store_stats_diversity_empty_store(conn):
+    d = queue.store_stats(conn)["diversity"]
+    assert d == {"genre_entropy_recs": 0.0, "genre_entropy_library": 0.0,
+                 "exploration_share": 0.0, "exploration_approval_rate": None}
+
+
+def test_store_stats_exploration_approval_rate(conn):
+    def rec(i, status, exploration):
+        add_rec(conn, f"movie:tmdb:{i}", title=f"T{i}", status=status,
+                why={"exploration": True} if exploration else {})
+
+    rec(1, "approved", True)
+    rec(2, "rejected", True)
+    rec(3, "added", True)
+    rec(4, "auto_added", True)  # acted, but not a user approval
+    rec(5, "proposed", True)    # not acted → excluded entirely
+    rec(6, "approved", False)   # not exploration → excluded entirely
+
+    d = queue.store_stats(conn)["diversity"]
+    assert d["exploration_approval_rate"] == 0.5  # approved + added out of 4 acted
+
+
+def test_store_stats_diversity_windows_last_100_recs(conn):
+    # the oldest rec would poison both metrics if the 100-rec window leaked
+    add_rec(conn, "movie:tmdb:1000", title="Old", genres=["Western"],
+            why={"exploration": True})
+    for i in range(100):
+        add_rec(conn, f"movie:tmdb:{i}", title=f"T{i}",
+                genres=["Drama"] if i % 2 else ["Comedy"])
+
+    d = queue.store_stats(conn)["diversity"]
+    assert d["genre_entropy_recs"] == 1.0  # 50/50 Drama-Comedy; Western aged out
+    assert d["exploration_share"] == 0.0
 
 
 # ── pipeline ─────────────────────────────────────────────────────────

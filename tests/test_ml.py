@@ -338,6 +338,129 @@ def test_rank_end_to_end(tmp_path):
     assert still_open["status"] == "proposed"
 
 
+def test_rank_serendipity_wins_exploration_slots(tmp_path):
+    """Serendipity-sourced candidates get first claim on exploration slots
+    even though they score below the old 40-90 band; leftover slots fill
+    from the band; the bottom-decile sanity floor still applies."""
+    conn = db.connect(tmp_path / "t.db")
+    cfg = make_cfg(tmp_path, exploration_frac=0.4, diversity_lambda=0.3)
+    model = cfg.model.embed_model
+    vecs = {
+        "s1": axis(0),                                          # MMR pick
+        "s2": unit(0.8 * axis(0) + 0.6 * axis(2)),              # MMR pick
+        "s3": unit(0.8 * axis(0) + 0.6 * axis(3)),              # MMR pick
+        "b1": unit(0.45 * axis(0) + 0.893 * axis(6)),           # in the 40-90 band
+        "b2": unit(0.5 * axis(0) + 0.866 * axis(1)),            # above the band's p90
+        "sr": unit(-0.4 * axis(0) + 0.917 * axis(5)),           # serendipity, sub-band score
+        "sj": -axis(0),                                         # serendipity, bottom decile
+    }
+    for name, v in vecs.items():
+        iid = f"movie:tmdb:{name}"
+        db.upsert_item(conn, iid, "movie", title=name.upper())
+        put_vec(conn, iid, v, model)
+        source = "serendipity_tmdb" if name in ("sr", "sj") else "tmdb_similar"
+        add_candidate(conn, iid, source=source)
+    db.set_state(conn, "model:movie", json.dumps({
+        "w": b64(4.0 * axis(0)), "b": -1.0, "dim": DIM, "embed_model": model,
+        "trained_at": db.now(), "n_pos": 10, "n_neg": 3, "n_weak": 20}))
+    db.set_state(conn, "centroid:movie", json.dumps({
+        "pos": b64(axis(0)), "neg": None, "dim": DIM, "embed_model": model,
+        "exemplars": []}))
+
+    stats = rank_mod.run(conn, cfg, top=5)
+    assert stats["proposed"] == 5
+    whys = {r["item_id"]: json.loads(r["why"]) for r in conn.execute(
+        "SELECT item_id, why FROM recommendations WHERE status='proposed'")}
+    # 3 MMR + 2 exploration: sr beats b1 (band member with the higher
+    # score) for the first slot; the remainder fills from the band. sj is
+    # serendipity too but scores in the bottom decile — sanity floor.
+    assert set(whys) == {f"movie:tmdb:{n}" for n in ("s1", "s2", "s3", "sr", "b1")}
+    sr = whys["movie:tmdb:sr"]
+    assert sr["exploration"] is True and sr["serendipity"] is True
+    assert sr["sources"] == ["serendipity_tmdb"]
+    b1 = whys["movie:tmdb:b1"]
+    assert b1["exploration"] is True and "serendipity" not in b1
+    for name in ("s1", "s2", "s3"):
+        w = whys[f"movie:tmdb:{name}"]
+        assert w["exploration"] is False and "serendipity" not in w
+
+
+def test_rank_exploration_novelty_gate_excludes_near_core(tmp_path):
+    """An in-band, maximally-distant-from-picked item that still hugs the
+    positive centroid loses the exploration slot to a genuinely novel one."""
+    conn = db.connect(tmp_path / "t.db")
+    cfg = make_cfg(tmp_path, exploration_frac=0.34)
+    model = cfg.model.embed_model
+    # Taste axis (head) is e1; core axis (centroid) is e0, so scores and
+    # centroid similarity decouple. "core" is the most distant in-band
+    # item — the old max-distance rule would pick it — but sits at
+    # cos 0.9 to the centroid, far above the pool's 60th percentile.
+    vecs = {
+        "h1": axis(1) + 0.1 * axis(0),
+        "h2": 0.8 * axis(1) + 0.6 * axis(2) + 0.15 * axis(0),
+        "mid": 0.5 * axis(1) + 0.866 * axis(5) + 0.2 * axis(0),
+        "novel": 0.45 * axis(1) + 0.893 * axis(4) - 0.1 * axis(0),
+        "core": 0.9 * axis(0) + 0.3 * axis(1) + 0.316 * axis(3),
+        "j1": -axis(1) - 0.05 * axis(0),
+        "j2": -axis(1) + 0.05 * axis(0) + 0.1 * axis(6),
+    }
+    for name, v in vecs.items():
+        iid = f"movie:tmdb:{name}"
+        db.upsert_item(conn, iid, "movie", title=name.upper())
+        put_vec(conn, iid, v, model)
+        add_candidate(conn, iid)
+    db.set_state(conn, "model:movie", json.dumps({
+        "w": b64(4.0 * axis(1)), "b": -1.0, "dim": DIM, "embed_model": model,
+        "trained_at": db.now(), "n_pos": 10, "n_neg": 3, "n_weak": 20}))
+    db.set_state(conn, "centroid:movie", json.dumps({
+        "pos": b64(axis(0)), "neg": None, "dim": DIM, "embed_model": model,
+        "exemplars": []}))
+
+    stats = rank_mod.run(conn, cfg, top=3)
+    assert stats["proposed"] == 3
+    whys = {r["item_id"]: json.loads(r["why"]) for r in conn.execute(
+        "SELECT item_id, why FROM recommendations WHERE status='proposed'")}
+    assert set(whys) == {"movie:tmdb:h1", "movie:tmdb:h2", "movie:tmdb:novel"}
+    assert whys["movie:tmdb:novel"]["exploration"] is True
+    assert "serendipity" not in whys["movie:tmdb:novel"]
+
+
+def test_rank_exploration_fallback_without_serendipity(tmp_path):
+    """No serendipity candidates and a novelty gate that filters every
+    remaining item (all sit exactly on the pool's 60th centroid-sim
+    percentile): the old band max-distance logic still fills the slot."""
+    conn = db.connect(tmp_path / "t.db")
+    cfg = make_cfg(tmp_path, exploration_frac=0.34)
+    model = cfg.model.embed_model
+    vecs = {  # all orthogonal to the e0 centroid → cent_sims all equal
+        "f1": axis(1),
+        "f2": unit(0.8 * axis(1) + 0.6 * axis(2)),
+        "f3": unit(0.5 * axis(1) + 0.866 * axis(3)),
+        "f4": axis(4),
+        "f5": -axis(1),
+    }
+    for name, v in vecs.items():
+        iid = f"movie:tmdb:{name}"
+        db.upsert_item(conn, iid, "movie", title=name.upper())
+        put_vec(conn, iid, v, model)
+        add_candidate(conn, iid)
+    db.set_state(conn, "model:movie", json.dumps({
+        "w": b64(4.0 * axis(1)), "b": -1.0, "dim": DIM, "embed_model": model,
+        "trained_at": db.now(), "n_pos": 10, "n_neg": 3, "n_weak": 20}))
+    db.set_state(conn, "centroid:movie", json.dumps({
+        "pos": b64(axis(0)), "neg": None, "dim": DIM, "embed_model": model,
+        "exemplars": []}))
+
+    stats = rank_mod.run(conn, cfg, top=3)
+    assert stats["proposed"] == 3  # gate never leaves slots unfilled
+    whys = {r["item_id"]: json.loads(r["why"]) for r in conn.execute(
+        "SELECT item_id, why FROM recommendations WHERE status='proposed'")}
+    # f4 is the pre-serendipity band pick: in the 40-90 band, max distance.
+    assert set(whys) == {"movie:tmdb:f1", "movie:tmdb:f2", "movie:tmdb:f4"}
+    assert whys["movie:tmdb:f4"]["exploration"] is True
+    assert "serendipity" not in whys["movie:tmdb:f4"]
+
+
 def test_rank_centroid_fallback_artist(tmp_path):
     conn = db.connect(tmp_path / "t.db")
     cfg = make_cfg(tmp_path)

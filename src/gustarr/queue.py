@@ -8,8 +8,9 @@ the status flip and the event are written together here.
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
-from typing import Any
+from typing import Any, Iterable
 
 from . import db, ids, signals
 
@@ -66,7 +67,7 @@ def set_status(conn: sqlite3.Connection, rec_id: int, status: str) -> dict[str, 
     if status not in ("approved", "rejected"):
         raise ValueError(f"only approved/rejected can be set here, not {status!r}")
     row = conn.execute(
-        "SELECT item_id, status FROM recommendations WHERE id=?", (rec_id,)).fetchone()
+        "SELECT item_id, status, why FROM recommendations WHERE id=?", (rec_id,)).fetchone()
     if row is None:
         raise ValueError(f"no recommendation #{rec_id}")
     if row["status"] in TERMINAL_STATUSES:
@@ -78,8 +79,15 @@ def set_status(conn: sqlite3.Connection, rec_id: int, status: str) -> dict[str, 
     conn.execute(
         "UPDATE recommendations SET status=?, acted_at=? WHERE id=?", (status, ts, rec_id))
     kind = "approve" if status == "approved" else "reject"
-    added = db.add_event(
-        conn, ts, row["item_id"], kind, signals.WEIGHTS[kind], "user", meta={"rec_id": rec_id})
+    weight = signals.WEIGHTS[kind]
+    meta: dict[str, Any] = {"rec_id": rec_id}
+    if kind == "reject" and json.loads(row["why"] or "{}").get("exploration"):
+        # Exploration picks are deliberate off-policy probes; a full-strength
+        # reject would teach the model never to leave the bubble again.
+        # Approvals stay full weight — a hit is a hit however it was found.
+        weight *= 0.3
+        meta["exploration"] = True
+    added = db.add_event(conn, ts, row["item_id"], kind, weight, "user", meta=meta)
     return {"updated": 1, "events": int(added)}
 
 
@@ -133,9 +141,12 @@ def explain(conn: sqlite3.Connection, rec_id: int) -> str:
 
     why = json.loads(row["why"] or "{}")
     meta = json.loads(row["meta"])
-    lines = [
+    header = (
         f"#{row['id']} {row['title'] or row['item_id']} ({row['year'] or '?'}) — {row['domain']}"
-    ]
+    )
+    if why.get("serendipity"):
+        header += " (serendipity)"
+    lines = [header]
     genres = meta.get("genres") or []
     if genres:
         lines.append("genres: " + ", ".join(map(str, genres)))
@@ -154,6 +165,43 @@ def explain(conn: sqlite3.Connection, rec_id: int) -> str:
 
 
 # ── store overview ───────────────────────────────────────────────────
+
+
+def _genre_entropy(metas: Iterable[str]) -> float:
+    """Shannon entropy (bits, 3dp) of the genre histogram over items.meta
+    json strings; genre-less items contribute nothing."""
+    counts: dict[str, int] = {}
+    for meta in metas:
+        for g in json.loads(meta).get("genres") or []:
+            counts[str(g)] = counts.get(str(g), 0) + 1
+    total = sum(counts.values())
+    if not total:
+        return 0.0
+    return round(-sum(n / total * math.log2(n / total) for n in counts.values()), 3)
+
+
+def _diversity(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Is the queue actually wider than the library it feeds on?"""
+    recent = conn.execute(
+        "SELECT r.why, i.meta FROM recommendations r JOIN items i ON i.id = r.item_id"
+        " ORDER BY r.id DESC LIMIT 100").fetchall()
+    n_explore = sum(1 for r in recent if json.loads(r["why"] or "{}").get("exploration"))
+    acted = positive = 0
+    for r in conn.execute(
+            "SELECT status, why FROM recommendations"
+            " WHERE status IN ('approved','rejected','added','auto_added')"):
+        if json.loads(r["why"] or "{}").get("exploration"):
+            acted += 1
+            # 'added' implies a prior approve; 'auto_added' skipped the user,
+            # so it counts as acted but never as an approval.
+            positive += r["status"] in ("approved", "added")
+    return {
+        "genre_entropy_recs": _genre_entropy(r["meta"] for r in recent),
+        "genre_entropy_library": _genre_entropy(r["meta"] for r in conn.execute(
+            "SELECT i.meta FROM library l JOIN items i ON i.id = l.item_id")),
+        "exploration_share": round(n_explore / len(recent), 3) if recent else 0.0,
+        "exploration_approval_rate": round(positive / acted, 3) if acted else None,
+    }
 
 
 def store_stats(conn: sqlite3.Connection) -> dict[str, Any]:
@@ -198,4 +246,5 @@ def store_stats(conn: sqlite3.Connection) -> dict[str, Any]:
         "sync": sync,
         "models": models,
         "embedding_coverage": {"needed": needed, "embedded": embedded},
+        "diversity": _diversity(conn),
     }
