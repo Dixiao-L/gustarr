@@ -3,9 +3,13 @@
 Seeds are the top positively-labelled items per domain (same label
 policy as training — signals.aggregate_label). Movies/series fan out
 through TMDb recommendations/similar plus a genre-keyed discover pass
-for exploration; artists through Last.fm similar. Exclusions (library,
-open/acted recommendations, rejected items) are applied at insert time —
-nothing is deleted from the pool, excluded rows simply never enter.
+for exploration; artists through Last.fm similar. A serendipity pass
+counters the bubble those sources create: TMDb discover over the user's
+under-represented genres and least-visited decade (quality-floored),
+and a damped 2-hop Last.fm fan-out from the best hop-1 candidates.
+Exclusions (library, open/acted recommendations, rejected items) are
+applied at insert time — nothing is deleted from the pool, excluded
+rows simply never enter.
 """
 
 from __future__ import annotations
@@ -28,6 +32,20 @@ TOP_GENRES = 5
 # just balloon the enrich/embed backlog without improving picks.
 MAX_NEW_PER_SOURCE = 200
 
+# Serendipity: deliberate off-taste probes. Tighter cap than the taste
+# sources — seasoning, not the meal.
+SERENDIPITY_MAX_NEW = 100
+SOURCE_CAPS = {"serendipity_tmdb": SERENDIPITY_MAX_NEW, "serendipity_lastfm": SERENDIPITY_MAX_NEW}
+SERENDIPITY_GENRE_PROBES = 4
+# Quality floor: serendipity should be great-but-unfamiliar, not random junk.
+SERENDIPITY_VOTE_FLOOR = 500
+SERENDIPITY_HOP_SEEDS = 5
+SERENDIPITY_HOP_LIMIT = 20
+SERENDIPITY_DAMPING = 0.8  # 2 hops out: trust transitive similarity less
+# Pre-1960 discover mostly surfaces archive noise; post-2019 the regular
+# discover pass already skews recent.
+SERENDIPITY_DECADES = range(1960, 2020, 10)
+
 # Anything already decided on (queued, added by apply, or terminally
 # failed to actuate) or ever rejected must never re-enter the pool —
 # 'failed' is terminal, so re-proposing it would just re-fail in apply.
@@ -38,6 +56,7 @@ def run(conn: sqlite3.Connection, cfg: Config, domain: str | None = None) -> dic
     domains = [domain] if domain else ["movie", "series", "artist"]
     stats: dict[str, Any] = {
         "seeds": {}, "new": {}, "updated": {}, "skipped": 0, "capped": [], "errors": 0,
+        "serendipity": 0,
     }
     pool = _Pool(conn, stats)
     tmdb_key = cfg.tmdb.get("api_key")
@@ -50,10 +69,14 @@ def run(conn: sqlite3.Connection, cfg: Config, domain: str | None = None) -> dic
             stats["seeds"][dom] = len(seeds)
             _tmdb_similar(tmdb_key, dom, seeds, pool, stats)
             _tmdb_discover(conn, tmdb_key, dom, positives, pool, stats)
+            _tmdb_serendipity(conn, tmdb_key, dom, positives, pool, stats)
         elif dom == "artist" and lastfm_key:
             positives = _positive_items(conn, "artist")
             _lastfm_similar(conn, lastfm_key, [iid for iid, _ in positives[:SEED_LIMIT]],
                             pool, stats)
+            _lastfm_serendipity(conn, lastfm_key, positives, pool, stats)
+    stats["serendipity"] = sum(
+        n for src, n in stats["new"].items() if src.startswith("serendipity_"))
     return stats
 
 
@@ -82,7 +105,7 @@ class _Pool:
         exists = self.conn.execute(
             "SELECT 1 FROM candidates WHERE item_id=? AND source=?", (item_id, source)
         ).fetchone() is not None
-        if not exists and self.new_rows[source] >= MAX_NEW_PER_SOURCE:
+        if not exists and self.new_rows[source] >= SOURCE_CAPS.get(source, MAX_NEW_PER_SOURCE):
             if source not in self.stats["capped"]:
                 self.stats["capped"].append(source)
             return
@@ -213,7 +236,7 @@ def _genre_map(conn: sqlite3.Connection, api_key: str, media: str) -> dict[str, 
     return mapping
 
 
-def _top_genres(conn: sqlite3.Connection, positives: list[tuple[str, float]]) -> list[str]:
+def _genre_counts(conn: sqlite3.Connection, positives: list[tuple[str, float]]) -> Counter[str]:
     counts: Counter[str] = Counter()
     for iid, _ in positives:
         row = conn.execute("SELECT meta FROM items WHERE id=?", (iid,)).fetchone()
@@ -223,7 +246,11 @@ def _top_genres(conn: sqlite3.Connection, positives: list[tuple[str, float]]) ->
             name = g.get("name") if isinstance(g, dict) else g
             if name:
                 counts[str(name).strip().lower()] += 1
-    return [name for name, _ in counts.most_common(TOP_GENRES)]
+    return counts
+
+
+def _top_genres(conn: sqlite3.Connection, positives: list[tuple[str, float]]) -> list[str]:
+    return [name for name, _ in _genre_counts(conn, positives).most_common(TOP_GENRES)]
 
 
 def _tmdb_discover(conn: sqlite3.Connection, api_key: str, domain: str,
@@ -258,56 +285,185 @@ def _tmdb_discover(conn: sqlite3.Connection, api_key: str, domain: str,
             pool.add(item_id, domain, title, year, ids_d, meta, "tmdb_discover", None, score)
 
 
+# ── serendipity: TMDb ────────────────────────────────────────────────
+
+
+def _under_represented_genres(gmap: dict[str, int], counts: Counter[str]) -> list[str]:
+    """Genres whose share of the positive mentions falls below the
+    uniform share — the user's blind spots, absent genres included.
+    Rarest first, tie by name, so probe order is deterministic."""
+    if not gmap:
+        return []
+    total = sum(counts.values())
+    uniform = 1.0 / len(gmap)
+    under = sorted(
+        (counts.get(name, 0), name) for name in gmap
+        if (counts.get(name, 0) / total if total else 0.0) < uniform)
+    return [name for _, name in under[:SERENDIPITY_GENRE_PROBES]]
+
+
+def _least_seen_decade(conn: sqlite3.Connection, positives: list[tuple[str, float]]) -> int:
+    counts: Counter[int] = Counter()
+    for iid, _ in positives:
+        row = conn.execute("SELECT year FROM items WHERE id=?", (iid,)).fetchone()
+        year = row["year"] if row else None
+        if year and SERENDIPITY_DECADES[0] <= year < SERENDIPITY_DECADES[-1] + 10:
+            counts[year - year % 10] += 1
+    # earliest decade wins ties so the probe is deterministic
+    return min(SERENDIPITY_DECADES, key=lambda d: (counts[d], d))
+
+
+def _tmdb_serendipity(conn: sqlite3.Connection, api_key: str, domain: str,
+                      positives: list[tuple[str, float]], pool: _Pool,
+                      stats: dict[str, Any]) -> None:
+    """Anti-bubble discover: top-rated titles from under-represented
+    genres (one genre per call) plus the least-visited decade."""
+    if not positives:
+        return  # no taste baseline to diverge from
+    media = "movie" if domain == "movie" else "tv"
+    try:
+        gmap = _genre_map(conn, api_key, media)
+    except http.ApiError:
+        stats["errors"] += 1
+        gmap = {}
+    probes: list[dict[str, Any]] = [
+        {"with_genres": str(gmap[name])}
+        for name in _under_represented_genres(gmap, _genre_counts(conn, positives))]
+    decade = _least_seen_decade(conn, positives)
+    date_field = "primary_release_date" if domain == "movie" else "first_air_date"
+    probes.append({f"{date_field}.gte": f"{decade}-01-01",
+                   f"{date_field}.lte": f"{decade + 9}-12-31"})
+    for probe in probes:
+        try:
+            data = http.get_json(f"{TMDB}/discover/{media}", params={
+                "api_key": api_key, "sort_by": "vote_average.desc",
+                "vote_count.gte": SERENDIPITY_VOTE_FLOOR, "page": 1, **probe,
+            })
+        except http.ApiError:
+            stats["errors"] += 1
+            continue
+        for r in (data or {}).get("results") or []:
+            parsed = _tmdb_result(domain, r)
+            if parsed:
+                item_id, title, year, ids_d, meta, score = parsed
+                pool.add(item_id, domain, title, year, ids_d, meta,
+                         "serendipity_tmdb", None, score)
+
+
 # ── Last.fm ──────────────────────────────────────────────────────────
+
+
+def _artist_query_params(conn: sqlite3.Connection, item_id: str, api_key: str,
+                         limit: int) -> dict[str, Any] | None:
+    """artist.getsimilar params for an item, mbid-first; None when the
+    item offers neither an mbid nor a usable name."""
+    _, ns, key = ids.parse(item_id)
+    row = conn.execute("SELECT title, ids FROM items WHERE id=?", (item_id,)).fetchone()
+    stored = json.loads(row["ids"]) if row else {}
+    mbid = key if ns == "mbid" else stored.get("mbid")
+    params: dict[str, Any] = {"method": "artist.getsimilar", "api_key": api_key,
+                              "format": "json", "limit": limit}
+    if mbid:
+        params["mbid"] = mbid
+    else:
+        name = row["title"] if row and row["title"] else (key if ns == "lastfm" else None)
+        if not name:
+            return None
+        params["artist"] = name
+    return params
+
+
+def _similar_artists(data: Any) -> list[dict[str, Any]]:
+    artists = ((data or {}).get("similarartists") or {}).get("artist") or []
+    if isinstance(artists, dict):  # last.fm collapses single-element lists
+        artists = [artists]
+    return artists
+
+
+def _resolve_artist(conn: sqlite3.Connection, pool: _Pool,
+                    a: dict[str, Any]) -> tuple[str, str, str | None, float] | None:
+    """(item_id, name, mbid, match) for one similar-artist entry."""
+    name = a.get("name")
+    if not name:
+        return None
+    mb = a.get("mbid") or None
+    if mb:
+        item_id = ids.make("artist", "mbid", mb)
+        fallback = ids.make("artist", "lastfm", name)
+        # Last.fm asserting name↔mbid identity beats the fuzzy
+        # MusicBrainz search enrich relies on: fold any name-keyed
+        # twin (scrobbles often omit the mbid) into the canonical
+        # item so one artist never lives on as two ids.
+        db.merge_item(conn, fallback, item_id)
+        if fallback in pool.excluded:
+            pool.excluded.add(item_id)
+    else:
+        item_id = ids.make("artist", "lastfm", name)
+    try:
+        score = float(a.get("match") or 0.0)
+    except (TypeError, ValueError):
+        score = 0.0
+    return item_id, name, mb, score
 
 
 def _lastfm_similar(conn: sqlite3.Connection, api_key: str, seed_ids: list[str],
                     pool: _Pool, stats: dict[str, Any]) -> None:
     used = 0
     for seed_id in seed_ids:
-        _, ns, key = ids.parse(seed_id)
-        row = conn.execute("SELECT title, ids FROM items WHERE id=?", (seed_id,)).fetchone()
-        stored = json.loads(row["ids"]) if row else {}
-        mbid = key if ns == "mbid" else stored.get("mbid")
-        params: dict[str, Any] = {"method": "artist.getsimilar", "api_key": api_key,
-                                  "format": "json", "limit": 50}
-        if mbid:
-            params["mbid"] = mbid
-        else:
-            name = row["title"] if row and row["title"] else (key if ns == "lastfm" else None)
-            if not name:
-                continue
-            params["artist"] = name
+        params = _artist_query_params(conn, seed_id, api_key, limit=50)
+        if params is None:
+            continue
         used += 1
         try:
             data = http.get_json(LASTFM, params=params)
         except http.ApiError:
             stats["errors"] += 1
             continue
-        artists = ((data or {}).get("similarartists") or {}).get("artist") or []
-        if isinstance(artists, dict):  # last.fm collapses single-element lists
-            artists = [artists]
-        for a in artists:
-            name = a.get("name")
-            if not name:
+        for a in _similar_artists(data):
+            resolved = _resolve_artist(conn, pool, a)
+            if resolved is None:
                 continue
-            mb = a.get("mbid") or None
-            if mb:
-                item_id = ids.make("artist", "mbid", mb)
-                fallback = ids.make("artist", "lastfm", name)
-                # Last.fm asserting name↔mbid identity beats the fuzzy
-                # MusicBrainz search enrich relies on: fold any name-keyed
-                # twin (scrobbles often omit the mbid) into the canonical
-                # item so one artist never lives on as two ids.
-                db.merge_item(conn, fallback, item_id)
-                if fallback in pool.excluded:
-                    pool.excluded.add(item_id)
-            else:
-                item_id = ids.make("artist", "lastfm", name)
-            try:
-                score = float(a.get("match") or 0.0)
-            except (TypeError, ValueError):
-                score = 0.0
+            item_id, name, mb, score = resolved
             pool.add(item_id, "artist", name, None, {"mbid": mb} if mb else {}, {},
                      "lastfm_similar", seed_id, score)
     stats["seeds"]["artist"] = used
+
+
+# ── serendipity: Last.fm ─────────────────────────────────────────────
+
+
+def _lastfm_serendipity(conn: sqlite3.Connection, api_key: str,
+                        positives: list[tuple[str, float]], pool: _Pool,
+                        stats: dict[str, Any]) -> None:
+    """2-hop neighbourhood: getSimilar on the strongest hop-1 candidates
+    (never library rows or seeds), scores damped for the extra hop."""
+    seeds = {iid for iid, _ in positives}
+    hops = [r["item_id"] for r in conn.execute(
+        "SELECT item_id FROM candidates WHERE source='lastfm_similar'"
+        " AND item_id NOT IN (SELECT item_id FROM library)"
+        " ORDER BY external_score DESC, item_id")
+        if r["item_id"] not in seeds][:SERENDIPITY_HOP_SEEDS]
+    for hop_id in hops:
+        params = _artist_query_params(conn, hop_id, api_key, limit=SERENDIPITY_HOP_LIMIT)
+        if params is None:
+            continue
+        try:
+            data = http.get_json(LASTFM, params=params)
+        except http.ApiError:
+            stats["errors"] += 1
+            continue
+        for a in _similar_artists(data):
+            resolved = _resolve_artist(conn, pool, a)
+            if resolved is None:
+                continue
+            item_id, name, mb, score = resolved
+            item_id = db.canonical_id(conn, item_id)
+            # anything already reachable at hop 1 (or via another source)
+            # is bubble-adjacent, not serendipity — leave it be
+            known = conn.execute(
+                "SELECT 1 FROM candidates WHERE item_id=? AND source!='serendipity_lastfm'",
+                (item_id,)).fetchone()
+            if known is not None:
+                continue
+            pool.add(item_id, "artist", name, None, {"mbid": mb} if mb else {}, {},
+                     "serendipity_lastfm", hop_id, score * SERENDIPITY_DAMPING)
