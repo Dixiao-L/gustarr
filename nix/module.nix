@@ -47,8 +47,8 @@ in
       type = lib.types.package;
       default =
         if cfg.gpu
-        then flake.packages.${pkgs.system}.ml
-        else flake.packages.${pkgs.system}.default;
+        then flake.packages.${pkgs.stdenv.hostPlatform.system}.ml
+        else flake.packages.${pkgs.stdenv.hostPlatform.system}.default;
       defaultText = "gustarr from the flake (ml variant when gpu = true)";
       description = "gustarr package to run.";
     };
