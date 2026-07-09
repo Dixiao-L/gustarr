@@ -11,20 +11,22 @@ flake: { config, lib, pkgs, ... }:
 let
   cfg = config.services.gustarr;
   settingsFormat = pkgs.formats.toml { };
-  configFile = settingsFormat.generate "gustarr.toml" cfg.settings;
+  configFile = settingsFormat.generate "gustarr.toml"
+    (lib.recursiveUpdate { core.data_dir = cfg.stateDir; } cfg.settings);
 
   # CUDA userspace comes bundled in torch-bin's wheel, but libcuda.so
   # (the driver stub) must come from the host driver. NixOS exposes it
   # at /run/opengl-driver/lib.
   gpuEnv = {
     LD_LIBRARY_PATH = "/run/opengl-driver/lib";
-    HF_HOME = "/var/lib/gustarr/hf";
+    HF_HOME = "${cfg.stateDir}/hf";
   };
+
+  defaultStateDir = "/var/lib/gustarr";
 
   commonService = {
     User = "gustarr";
     Group = "gustarr";
-    StateDirectory = "gustarr";
     EnvironmentFile = cfg.environmentFiles;
     # Hardening: these jobs only need the store dir, the network, and
     # (for embed) the GPU device nodes.
@@ -33,7 +35,9 @@ let
     PrivateTmp = true;
     NoNewPrivileges = true;
     SupplementaryGroups = lib.optionals cfg.gpu [ "video" ];
-  };
+  } // (if cfg.stateDir == defaultStateDir
+        then { StateDirectory = "gustarr"; }
+        else { ReadWritePaths = [ cfg.stateDir ]; });
 in
 {
   options.services.gustarr = {
@@ -53,6 +57,17 @@ in
       type = lib.types.bool;
       default = true;
       description = "Use the CUDA ml variant and grant GPU device access to embed/train.";
+    };
+
+    stateDir = lib.mkOption {
+      type = lib.types.path;
+      default = "/var/lib/gustarr";
+      description = ''
+        Where the store, model cache and HF downloads live. The default
+        uses systemd's StateDirectory; any other path (e.g. a ZFS
+        dataset covered by backups) is created via tmpfiles and granted
+        with ReadWritePaths instead.
+      '';
     };
 
     settings = lib.mkOption {
@@ -105,6 +120,10 @@ in
       group = "gustarr";
     };
     users.groups.gustarr = { };
+
+    systemd.tmpfiles.rules = lib.mkIf (cfg.stateDir != defaultStateDir) [
+      "d ${cfg.stateDir} 0750 gustarr gustarr -"
+    ];
 
     systemd.services.gustarr-nightly = lib.mkIf cfg.nightly.enable {
       description = "gustarr nightly pipeline (learn + rank)";
