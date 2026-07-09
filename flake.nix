@@ -44,12 +44,23 @@
           python = pkgs.python312.override {
             packageOverrides = _self: super: {
               torch = super.torch-bin;
-              # Anything downstream (sentence-transformers → transformers)
-              # that reaches for the source torchvision/torchaudio would
-              # inherit attrs torch-bin doesn't expose (cudaSupport) and
-              # trigger an hours-long source build besides.
+              # Anything downstream that reaches for the source torchvision
+              # would inherit attrs torch-bin doesn't expose (cudaSupport)
+              # and trigger an hours-long source build besides.
               torchvision = super.torchvision-bin;
+              # sentence-transformers' nativeCheckInputs pull in ALL its
+              # optional-dependency sets (transformers audio extras →
+              # torchaudio) just to run its own test suite. nixpkgs'
+              # torchaudio-bin is still the cu12 wheel (2.11, wants
+              # libcudart.so.12) and cannot patchelf against the cu13 stack
+              # torch-bin 2.12 brought in — and we don't need to re-run
+              # upstream's tests to package a consumer. pythonImportsCheck
+              # still smoke-tests the import.
               torchaudio = super.torchaudio-bin;
+              sentence-transformers = super.sentence-transformers.overridePythonAttrs (_old: {
+                doCheck = false;
+                nativeCheckInputs = [ ];
+              });
             };
           };
         in
