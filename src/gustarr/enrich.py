@@ -1,11 +1,13 @@
 """Metadata enrichment: TMDb for movies/series, MusicBrainz + Last.fm for music.
 
 Second pipeline stage. Besides filling items.meta for the embedder, this
-is where weak ids get upgraded: imdb-only movies and Last.fm name-keyed
-artists resolve to their authoritative namespace and merge
-(db.merge_item) so accumulated events/candidates follow the item.
-Every processed item gets enriched_at set — even on failure, with an
-enrich_error note in meta — so one bad item can never wedge the queue.
+is where weak ids get upgraded: imdb-only movies, tmdb-only series and
+Last.fm name-keyed artists resolve to their authoritative namespace and
+merge (db.merge_item) so accumulated events/candidates follow the item.
+Permanent per-item failures (bad/missing ids, 4xx) stamp enriched_at
+with an enrich_error note so one bad item can never wedge the queue;
+transient failures (outages, rate limits, bad credentials) leave
+enriched_at NULL so the item retries next run.
 """
 
 from __future__ import annotations
@@ -54,8 +56,15 @@ def run(
         try:
             _enrich_one(conn, cfg, row, eff, stats)
         except Exception as exc:
+            # Only genuinely per-item failures may stamp enriched_at:
+            # 401/403/429, 5xx, transport errors (status None) and
+            # unexpected bugs are service-level, so the item stays
+            # queued instead of being poisoned by one bad night.
+            permanent = isinstance(exc, LookupError) or (
+                isinstance(exc, http.ApiError) and exc.status is not None
+                and 400 <= exc.status < 500 and exc.status not in (401, 403, 429))
             db.upsert_item(conn, eff["id"], row["domain"],
-                           meta={"enrich_error": str(exc)}, enriched=True)
+                           meta={"enrich_error": str(exc)}, enriched=permanent)
             stats["errors"] += 1
     return stats
 
@@ -76,7 +85,7 @@ def _enrich_one(
     if domain == "movie":
         _movie(conn, cfg, item_id, ids_map, eff, stats)
     elif domain == "series":
-        _series(conn, cfg, item_id, ids_map, stats)
+        _series(conn, cfg, item_id, ids_map, eff, stats)
     elif domain == "artist":
         _artist(conn, cfg, item_id, row["title"], ids_map, eff, stats)
     else:  # album | track
@@ -126,7 +135,7 @@ def _movie(conn, cfg, item_id, ids_map, eff, stats) -> None:
     stats["enriched"] += 1
 
 
-def _series(conn, cfg, item_id, ids_map, stats) -> None:
+def _series(conn, cfg, item_id, ids_map, eff, stats) -> None:
     api_key = cfg.tmdb.get("api_key")
     if not api_key:
         stats["skipped"] += 1
@@ -144,7 +153,19 @@ def _series(conn, cfg, item_id, ids_map, stats) -> None:
         tmdb_id = results[0]["id"]
     data = http.get_json(
         f"{TMDB}/tv/{tmdb_id}",
-        params={"api_key": api_key, "append_to_response": "keywords", "language": "en-US"})
+        params={"api_key": api_key, "append_to_response": "keywords,external_ids",
+                "language": "en-US"})
+    # Sonarr can only add by tvdb id, so tmdb-keyed candidates must
+    # upgrade to the canonical tvdb namespace (mirrors _movie's
+    # imdb→tmdb path) or actuation can never reach them.
+    tvdb_id = (data.get("external_ids") or {}).get("tvdb_id") or ids_map.get("tvdb")
+    if tvdb_id:
+        ids_map["tvdb"] = tvdb_id
+        canonical = ids.make("series", "tvdb", str(tvdb_id))
+        if canonical != item_id:
+            db.merge_item(conn, item_id, canonical)
+            stats["merged"] += 1
+            item_id = eff["id"] = canonical
     kw = data.get("keywords") or {}
     meta = {
         "genres": [g["name"] for g in data.get("genres") or []],
@@ -155,6 +176,8 @@ def _series(conn, cfg, item_id, ids_map, stats) -> None:
         "popularity": data.get("popularity"),
         "number_of_seasons": data.get("number_of_seasons"),
     }
+    if not tvdb_id:
+        meta["no_tvdb"] = True  # un-addable in Sonarr; apply reports why
     db.upsert_item(conn, item_id, "series", title=data.get("name"),
                    year=_year(data.get("first_air_date")), ids={**ids_map, "tmdb": tmdb_id},
                    meta=meta, enriched=True)

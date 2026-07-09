@@ -121,9 +121,23 @@ def _norm_ts(raw: str | None) -> str:
     return db.now()
 
 
+def _merged_state(conn: sqlite3.Connection, key: str, pre_merge_key: str) -> str | None:
+    """State lookup that survives an id merge: a cursor written before enrich
+    merged the minted id away lives under the old key; reading it there keeps
+    the first post-merge sync from re-emitting already-counted events."""
+    val = db.get_state(conn, key)
+    if val is None and pre_merge_key != key:
+        val = db.get_state(conn, pre_merge_key)
+    return val
+
+
 def _flag_event(conn: sqlite3.Connection, item_id: str, kind: str, ts: str) -> bool:
     """Favorite/complete are persistent flags, not occurrences: one event per
-    (item, kind) ever, so a drifting fallback ts can't break idempotency."""
+    (item, kind) ever, so a drifting fallback ts can't break idempotency.
+    Checked against the canonical id — after enrich merges the minted id away
+    the flag event lives under the canonical item, and missing it here would
+    re-append the flag with a fresh ts every sync."""
+    item_id = db.canonical_id(conn, item_id)
     row = conn.execute(
         "SELECT 1 FROM events WHERE item_id=? AND kind=? AND source=? LIMIT 1",
         (item_id, kind, SOURCE)).fetchone()
@@ -169,14 +183,18 @@ def _sync_series(conn: sqlite3.Connection, base: str, uid: str, headers: dict[st
         if not fetched:
             continue
         series = fetched[0]
-        item_id, domain, known = _canonical({**series, "Type": series.get("Type") or "Series"})
-        if item_id is None:
+        minted, domain, known = _canonical({**series, "Type": series.get("Type") or "Series"})
+        if minted is None:
             stats["skipped"] += 1
             continue
-        db.upsert_item(conn, item_id, domain, title=series.get("Name"),
+        db.upsert_item(conn, minted, domain, title=series.get("Name"),
                        year=series.get("ProductionYear"), ids=known, meta={"jellyfin_id": sid})
+        # enrich may have merged the minted id away; cursors must follow the
+        # canonical id or a merge would reset them and duplicate the events
+        item_id = db.canonical_id(conn, minted)
         pkey = f"jellyfin:series_played:{item_id}"
-        if count > int(db.get_state(conn, pkey, "0") or 0):
+        prev = _merged_state(conn, pkey, f"jellyfin:series_played:{minted}")
+        if count > int(prev or 0):
             if db.add_event(conn, db.now(), item_id, "play", WEIGHTS["play"], SOURCE,
                             {"episodes_played": count}):
                 stats["series_plays"] += 1
@@ -184,7 +202,7 @@ def _sync_series(conn: sqlite3.Connection, base: str, uid: str, headers: dict[st
         total = int(series.get("RecursiveItemCount") or 0)
         ckey = f"jellyfin:series_complete:{item_id}"
         if total and count >= SERIES_COMPLETE_FRAC * total \
-                and db.get_state(conn, ckey) is None:
+                and _merged_state(conn, ckey, f"jellyfin:series_complete:{minted}") is None:
             if db.add_event(conn, db.now(), item_id, "complete", WEIGHTS["complete"], SOURCE,
                             {"episodes_played": count, "episodes_total": total}):
                 stats["series_completes"] += 1
@@ -207,7 +225,7 @@ def _sync_audio(conn: sqlite3.Connection, base: str, uid: str, headers: dict[str
         db.upsert_item(conn, art_id, domain, title=art.get("Name"),
                        year=art.get("ProductionYear"), ids=known,
                        meta={"jellyfin_id": art.get("Id")})
-        jf_artist[art["Id"]] = art_id
+        jf_artist[art["Id"]] = db.canonical_id(conn, art_id)
     for t in tracks:
         arts = t.get("ArtistItems") or []
         a0 = arts[0] if arts else {}
@@ -219,6 +237,7 @@ def _sync_audio(conn: sqlite3.Connection, base: str, uid: str, headers: dict[str
                 continue
             art_id = ids.make("artist", "lastfm", name)
             db.upsert_item(conn, art_id, "artist", title=name)
+            art_id = db.canonical_id(conn, art_id)
         ud = t.get("UserData") or {}
         # IsPlayed-filtered rows can still carry PlayCount 0 on some servers
         plays = max(int(ud.get("PlayCount") or 0), 1)
@@ -227,10 +246,15 @@ def _sync_audio(conn: sqlite3.Connection, base: str, uid: str, headers: dict[str
         if delta <= 0:
             continue
         weight = WEIGHTS["scrobble"] * min(delta, SCROBBLE_DELTA_CAP)
+        # dedup=track id: two tracks by one artist played the same second are
+        # distinct listens, not one re-synced event. A False return is then a
+        # genuine replay of an already-stored row, so the cursor must hold —
+        # advancing it would silently discard the still-pending plays.
         if db.add_event(conn, _norm_ts(ud.get("LastPlayedDate")), art_id, "scrobble", weight,
-                        SOURCE, {"delta": delta, "track": t.get("Name"), "album": t.get("Album")}):
+                        SOURCE, {"delta": delta, "track": t.get("Name"), "album": t.get("Album")},
+                        dedup=str(t.get("Id") or "")):
             stats["scrobbles"] += 1
-        db.set_state(conn, key, str(plays))
+            db.set_state(conn, key, str(plays))
 
 
 def _sync_playback_reporting(conn: sqlite3.Connection, base: str, headers: dict[str, str],

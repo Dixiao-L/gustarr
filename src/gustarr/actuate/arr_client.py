@@ -5,6 +5,7 @@ client instance since apply reuses one client for a whole run.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from .. import http
@@ -14,6 +15,31 @@ from ..config import ArrConfig
 class ArrError(Exception):
     """Actuation failure that is not a transport error: bad config
     (unknown quality profile), empty lookup, missing profiles."""
+
+
+def _is_duplicate_add(exc: http.ApiError) -> bool:
+    """True only when the arr's 400 says the item itself already exists
+    ("... has already been added" / *ExistsValidator) — NOT any 400 that
+    merely mentions "already", e.g. the path collision "Path is already
+    configured for an existing movie"."""
+    if exc.status != 400:
+        return False
+    detail = getattr(exc, "detail", "") or str(exc)
+    # The body is a JSON list of validation errors, possibly embedded in
+    # the exception message and truncated by http.py; parse when we can.
+    start = detail.find("[")
+    if start >= 0:
+        try:
+            errors = json.loads(detail[start:])
+        except ValueError:
+            errors = None
+        if isinstance(errors, list):
+            return any(
+                "already been added" in str(err.get("errorMessage") or "").lower()
+                or str(err.get("errorCode") or "").endswith("ExistsValidator")
+                for err in errors if isinstance(err, dict))
+    # unparseable (truncated) body: fall back to the exact duplicate phrase
+    return "already been added" in detail.lower()
 
 
 class ArrClient:
@@ -73,8 +99,17 @@ class ArrClient:
                 raise ArrError(f"{self.name} at {self.base} has no root folders")
             paths = [f["path"] for f in folders]
             want = self.cfg.root_folder.rstrip("/")
-            match = next((p for p in paths if p.rstrip("/") == want), None) if want else None
-            self._root = match or paths[0]
+            if not want:
+                self._root = paths[0]
+            else:
+                match = next((p for p in paths if p.rstrip("/") == want), None)
+                if match is None:
+                    # an explicit setting silently ignored would download
+                    # into the wrong place — fail like quality_profile does
+                    raise ArrError(
+                        f"{self.name} root folder {self.cfg.root_folder!r} not found;"
+                        f" available: {', '.join(paths)}")
+                self._root = match
         return self._root
 
     def _post_add(self, path: str, body: dict[str, Any], title: str) -> dict[str, Any]:
@@ -83,7 +118,7 @@ class ArrClient:
         except http.ApiError as exc:
             # The *arrs answer 400 "...has already been added" for
             # duplicates — for us that is the desired end state, not an error.
-            if exc.status == 400 and "already" in str(exc).lower():
+            if _is_duplicate_add(exc):
                 return {"existing": True, "title": title}
             raise
         return {"added": True, "title": title, "arr_id": (resp or {}).get("id")}

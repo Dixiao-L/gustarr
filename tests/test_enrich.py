@@ -31,6 +31,7 @@ SERIES_DETAIL = {
     "first_air_date": "2008-01-20",
     "genres": [{"name": "Drama"}],
     "keywords": {"results": [{"name": "drug cartel"}]},
+    "external_ids": {"tvdb_id": 81189, "imdb_id": "tt0903747"},
     "overview": "A chemistry teacher breaks bad.",
     "original_language": "en",
     "popularity": 300.0,
@@ -162,10 +163,51 @@ def test_series_tvdb_find_then_detail(conn, tmp_path, monkeypatch):
     assert row["enriched_at"] is not None
     assert row["title"] == "Breaking Bad"
     assert row["year"] == 2008
-    assert json.loads(row["ids"]) == {"tvdb": "81189", "tmdb": 1396}
+    assert json.loads(row["ids"]) == {"tvdb": 81189, "tmdb": 1396}
     meta = json.loads(row["meta"])
     assert meta["keywords"] == ["drug cartel"]
     assert meta["number_of_seasons"] == 5
+    assert "no_tvdb" not in meta
+
+
+def test_series_tmdb_keyed_resolves_tvdb_and_merges(conn, tmp_path, monkeypatch):
+    """A tmdb-keyed candidate series must upgrade to the tvdb namespace
+    Sonarr adds by, dragging its candidate rows along."""
+    cfg = make_cfg(tmp_path, tmdb={"api_key": "k"})
+    fid = ids.make("series", "tmdb", "1396")
+    db.upsert_item(conn, fid, "series", title="Breaking Bad", ids={"tmdb": 1396})
+    conn.execute(
+        "INSERT INTO candidates (item_id, source, first_seen, last_seen) VALUES (?,?,?,?)",
+        (fid, "tmdb_similar", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"))
+    api = mock_api(monkeypatch, [("/tv/1396", SERIES_DETAIL)])
+
+    stats = run(conn, cfg)
+
+    cid = ids.make("series", "tvdb", "81189")
+    assert stats["merged"] == 1 and stats["enriched"] == 1 and stats["errors"] == 0
+    assert conn.execute("SELECT 1 FROM items WHERE id=?", (fid,)).fetchone() is None
+    cands = [r["item_id"] for r in conn.execute("SELECT item_id FROM candidates")]
+    assert cands == [cid]
+    row = conn.execute("SELECT enriched_at, ids FROM items WHERE id=?", (cid,)).fetchone()
+    assert row["enriched_at"] is not None
+    id_map = json.loads(row["ids"])
+    assert id_map["tvdb"] == 81189 and id_map["tmdb"] == 1396
+    assert "external_ids" in api.calls[0][2]["append_to_response"]
+
+
+def test_series_without_tvdb_mapping_enriched_under_tmdb(conn, tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path, tmdb={"api_key": "k"})
+    fid = ids.make("series", "tmdb", "1396")
+    db.upsert_item(conn, fid, "series", ids={"tmdb": 1396})
+    mock_api(monkeypatch, [("/tv/1396", {**SERIES_DETAIL, "external_ids": {"tvdb_id": None}})])
+
+    stats = run(conn, cfg)
+
+    assert stats == {"enriched": 1, "merged": 0, "skipped": 0, "errors": 0}
+    row = conn.execute("SELECT * FROM items WHERE id=?", (fid,)).fetchone()
+    assert row["enriched_at"] is not None
+    assert json.loads(row["meta"])["no_tvdb"] is True
+    assert "tvdb" not in json.loads(row["ids"])
 
 
 def test_artist_mbid_musicbrainz_plus_lastfm(conn, tmp_path, monkeypatch):
@@ -289,6 +331,59 @@ def test_api_error_still_sets_enriched_at(conn, tmp_path, monkeypatch):
     row = conn.execute("SELECT enriched_at, meta FROM items WHERE id=?", (iid,)).fetchone()
     assert row["enriched_at"] is not None
     assert "404" in json.loads(row["meta"])["enrich_error"]
+
+
+def test_lookup_miss_is_permanent(conn, tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path, tmdb={"api_key": "k"})
+    fid = ids.make("movie", "imdb", "tt0000000")
+    db.upsert_item(conn, fid, "movie")
+    mock_api(monkeypatch, [("/find/tt0000000", {"movie_results": []})])
+
+    stats = run(conn, cfg)
+
+    assert stats["errors"] == 1
+    row = conn.execute("SELECT enriched_at, meta FROM items WHERE id=?", (fid,)).fetchone()
+    assert row["enriched_at"] is not None
+    assert "no movie for imdb" in json.loads(row["meta"])["enrich_error"]
+
+
+@pytest.mark.parametrize("status", [None, 500, 503, 429, 401, 403])
+def test_transient_failure_leaves_item_queued_for_retry(conn, tmp_path, monkeypatch, status):
+    """Outages, rate limits and bad credentials must not poison the
+    backlog: enriched_at stays NULL and the next run picks the item up."""
+    cfg = make_cfg(tmp_path, tmdb={"api_key": "k"})
+    iid = ids.make("movie", "tmdb", "605")
+    db.upsert_item(conn, iid, "movie", title="Flaky")
+    url = "https://api.themoviedb.org/3/movie/605"
+    mock_api(monkeypatch, [("/movie/605", http.ApiError(url, status, "boom"))])
+
+    stats = run(conn, cfg)
+
+    assert stats == {"enriched": 0, "merged": 0, "skipped": 0, "errors": 1}
+    row = conn.execute("SELECT enriched_at, meta FROM items WHERE id=?", (iid,)).fetchone()
+    assert row["enriched_at"] is None
+    assert "boom" in json.loads(row["meta"])["enrich_error"]
+
+    # service recovered: the same item is retried and enriched
+    mock_api(monkeypatch, [("/movie/605", {**MOVIE_DETAIL, "id": 605, "title": "Flaky"})])
+    stats = run(conn, cfg)
+    assert stats["enriched"] == 1 and stats["errors"] == 0
+    row = conn.execute("SELECT enriched_at FROM items WHERE id=?", (iid,)).fetchone()
+    assert row["enriched_at"] is not None
+
+
+def test_unexpected_exception_is_transient(conn, tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path, tmdb={"api_key": "k"})
+    iid = ids.make("movie", "tmdb", "606")
+    db.upsert_item(conn, iid, "movie", title="Buggy")
+    mock_api(monkeypatch, [("/movie/606", ValueError("surprise"))])
+
+    stats = run(conn, cfg)
+
+    assert stats["errors"] == 1
+    row = conn.execute("SELECT enriched_at, meta FROM items WHERE id=?", (iid,)).fetchone()
+    assert row["enriched_at"] is None
+    assert "surprise" in json.loads(row["meta"])["enrich_error"]
 
 
 def test_referenced_items_first_and_limit(conn, tmp_path, monkeypatch):

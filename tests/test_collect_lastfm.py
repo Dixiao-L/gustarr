@@ -189,6 +189,100 @@ def test_empty_history(conn, cfg):
     assert conn.execute("SELECT COUNT(*) c FROM events").fetchone()["c"] == 0
 
 
+def test_sync_skipped_unless_api_key_and_user(conn, tmp_path):
+    def handler(request):
+        raise AssertionError("unconfigured sync must not touch the network")
+
+    transport = httpx.MockTransport(handler)
+    for section in ({"api_key": "k"}, {"user": "u"}, {}):
+        partial = C._build({"core": {"data_dir": str(tmp_path)}, "lastfm": section})
+        stats = lastfm.sync(conn, partial, transport=transport)
+        assert stats == {"skipped": "lastfm not fully configured"}
+    assert conn.execute("SELECT COUNT(*) c FROM events").fetchone()["c"] == 0
+
+
+def test_same_second_scrobbles_of_different_tracks_both_count(conn, cfg):
+    def two_at(uts, box):
+        return {box: {
+            "track": [
+                rt("Radiohead", RH_MBID, "Airbag", "", "OK Computer", uts),
+                rt("Radiohead", RH_MBID, "Paranoid Android", PA_MBID, "OK Computer", uts),
+            ],
+            "@attr": {"page": "1", "totalPages": "1", "total": "2"},
+        }}
+
+    def handler(request):
+        p = dict(request.url.params)
+        if p["method"] == "user.getrecenttracks":
+            if int(p.get("from", 0)) > UTS_NEW:
+                return httpx.Response(200, json=RT_EMPTY)
+            return httpx.Response(200, json=two_at(UTS_NEW, "recenttracks"))
+        return httpx.Response(200, json=two_at(UTS_LOVE, "lovedtracks"))
+
+    transport = httpx.MockTransport(handler)
+    stats = lastfm.sync(conn, cfg, transport=transport)
+    assert stats["scrobbles"] == 2 and stats["loved"] == 2
+
+    # both tracks' plays survive on the artist item, discriminated by dedup
+    by_kind: dict[str, set[str]] = {}
+    for e in conn.execute("SELECT kind, dedup FROM events WHERE item_id=?",
+                          (f"artist:mbid:{RH_MBID}",)):
+        by_kind.setdefault(e["kind"], set()).add(e["dedup"])
+    expected = {"track:lastfm:radiohead\x1fairbag", f"track:mbid:{PA_MBID}"}
+    assert by_kind["scrobble"] == expected
+    assert by_kind["loved"] == expected
+
+    # a full re-walk of the identical rows stays idempotent
+    before = all_events(conn)
+    stats2 = lastfm.sync(conn, cfg, full=True, transport=transport)
+    assert stats2["scrobbles"] == 0 and stats2["loved"] == 0
+    assert all_events(conn) == before
+
+
+def test_mbid_scrobble_merges_existing_name_keyed_artist(conn, cfg):
+    def one_track_page(*rows):
+        return {"recenttracks": {
+            "track": list(rows),
+            "@attr": {"page": "1", "totalPages": "1", "total": str(len(rows))},
+        }}
+
+    old_row = rt("Radiohead", "", "Karma Police", "", "OK Computer", UTS_OLD)
+    new_row = rt("Radiohead", RH_MBID, "Paranoid Android", PA_MBID, "OK Computer", UTS_NEW)
+    phase = {"page": one_track_page(old_row)}
+
+    def handler(request):
+        p = dict(request.url.params)
+        if p["method"] == "user.getrecenttracks":
+            if int(p.get("from", 0)) > UTS_NEW:
+                return httpx.Response(200, json=RT_EMPTY)
+            return httpx.Response(200, json=phase["page"])
+        return httpx.Response(200, json=LOVED_EMPTY)
+
+    transport = httpx.MockTransport(handler)
+    fallback, canonical = "artist:lastfm:radiohead", f"artist:mbid:{RH_MBID}"
+
+    lastfm.sync(conn, cfg, transport=transport)  # mbid-less row mints the fallback
+    assert conn.execute("SELECT 1 FROM items WHERE id=?", (fallback,)).fetchone()
+
+    # a later row carrying the mbid folds the fallback into the mbid item
+    phase["page"] = one_track_page(new_row)
+    lastfm.sync(conn, cfg, transport=transport)
+    assert conn.execute("SELECT 1 FROM items WHERE id=?", (fallback,)).fetchone() is None
+    assert db.canonical_id(conn, fallback) == canonical
+    moved = conn.execute(
+        "SELECT ts FROM events WHERE item_id=? AND kind='scrobble'", (canonical,)).fetchall()
+    assert len(moved) == 2  # the fallback's event moved onto the mbid item
+
+    # full re-walk re-mints the name-keyed id; the alias redirects it, so
+    # nothing is resurrected and no event duplicates
+    phase["page"] = one_track_page(new_row, old_row)
+    before = all_events(conn)
+    stats = lastfm.sync(conn, cfg, full=True, transport=transport)
+    assert stats["scrobbles"] == 0
+    assert conn.execute("SELECT 1 FROM items WHERE id=?", (fallback,)).fetchone() is None
+    assert all_events(conn) == before
+
+
 def test_page_cap_warns(conn, cfg, monkeypatch):
     monkeypatch.setattr(lastfm, "MAX_PAGES", 2)
     huge = {"recenttracks": {

@@ -18,7 +18,10 @@ RADIOHEAD = "artist:mbid:a74b1b7f"
 
 @pytest.fixture
 def web(tmp_path):
-    cfg = C._build({"core": {"data_dir": str(tmp_path)}})
+    # TestClient sends Host: testserver, which the Host guard would 403;
+    # allowlist it through config rather than hardcoding it in prod code.
+    cfg = C._build({"core": {"data_dir": str(tmp_path)},
+                    "web": {"allowed_hosts": ["testserver"]}})
     conn = db.connect(cfg.db_path)
     db.upsert_item(conn, MATRIX, "movie", "The Matrix", 1999,
                    {"tmdb": 603}, {"genres": ["Action", "Science Fiction"]})
@@ -126,3 +129,53 @@ def test_index_served(web):
     assert resp.headers["content-type"].startswith("text/html")
     assert "gustarr" in resp.text
     assert "/api/recs" in resp.text
+
+
+def test_foreign_host_rejected(web):
+    client, cfg, movie_rec, _ = web
+    assert client.get("/api/recs", headers={"Host": "evil.example.com"}).status_code == 403
+    resp = client.post(f"/api/recs/{movie_rec}/approve",
+                       headers={"Host": "attacker.rebind.net"})
+    assert resp.status_code == 403
+    (row,) = _fetch(cfg, "SELECT status FROM recommendations WHERE id=?", movie_rec)
+    assert row["status"] == "proposed"
+
+
+def test_cross_origin_post_rejected(web):
+    client, cfg, movie_rec, _ = web
+    resp = client.post(f"/api/recs/{movie_rec}/approve",
+                       headers={"Origin": "https://evil.example.com"})
+    assert resp.status_code == 403
+    (row,) = _fetch(cfg, "SELECT status FROM recommendations WHERE id=?", movie_rec)
+    assert row["status"] == "proposed"
+    events = _fetch(cfg, "SELECT 1 FROM events WHERE item_id=? AND kind='approve'", MATRIX)
+    assert events == []
+
+
+def test_no_origin_and_allowlisted_origin_posts_allowed(web):
+    client, _, movie_rec, artist_rec = web
+    # CLI clients and same-origin navigations send no Origin header.
+    assert client.post(f"/api/recs/{artist_rec}/reject").status_code == 200
+    # Same-origin fetch from the served UI carries an allowlisted Origin.
+    resp = client.post(f"/api/recs/{movie_rec}/approve",
+                       headers={"Origin": "http://localhost:8790"})
+    assert resp.status_code == 200
+
+
+def test_configured_allowed_hosts_honored(tmp_path):
+    cfg = C._build({"core": {"data_dir": str(tmp_path)},
+                    "web": {"allowed_hosts": ["gustarr.pit21.net"]}})
+    client = TestClient(create_app(cfg))
+    ok = {"Host": "gustarr.pit21.net"}
+    assert client.get("/api/recs", headers=ok).status_code == 200
+    # Host matching is port-insensitive.
+    assert client.get("/api/recs", headers={"Host": "gustarr.pit21.net:8790"}).status_code == 200
+    # Default localhost aliases stay allowed alongside configured hosts.
+    assert client.get("/api/recs", headers={"Host": "127.0.0.1:8790"}).status_code == 200
+    assert client.get("/api/recs", headers={"Host": "localhost"}).status_code == 200
+    # TestClient's default Host (testserver) is not allowlisted here.
+    assert client.get("/api/recs").status_code == 403
+    resp = client.post("/api/recs/1/approve",
+                       headers={"Host": "gustarr.pit21.net",
+                                "Origin": "https://gustarr.pit21.net"})
+    assert resp.status_code == 409  # passed the guard; no such rec

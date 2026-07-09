@@ -11,7 +11,7 @@ import httpx
 import pytest
 
 from gustarr import config as C
-from gustarr import db, http
+from gustarr import db, http, signals
 from gustarr.actuate import apply as apply_mod
 from gustarr.actuate import arr_client, jellyfin_collections
 from gustarr.config import ArrConfig
@@ -29,6 +29,8 @@ class FakeArr:
         self.next_tag_id = 1
         self.posted = []
         self.fail_add = None  # (status_code, body_text)
+        # Retry-After: 0 keeps http.py's 5xx retry loop sleepless in tests
+        self.fail_headers = {"Retry-After": "0"}
 
     def handle(self, request: httpx.Request, path: str) -> httpx.Response:
         if request.headers.get("X-Api-Key") != self.api_key:
@@ -57,7 +59,7 @@ class FakeArr:
         if path in ("movie", "series", "artist") and request.method == "POST":
             if self.fail_add:
                 status, text = self.fail_add
-                return httpx.Response(status, text=text)
+                return httpx.Response(status, text=text, headers=self.fail_headers)
             body = json.loads(request.content)
             self.posted.append(body)
             return httpx.Response(201, json={"id": 100 + len(self.posted), **body})
@@ -113,11 +115,14 @@ class FakeNet:
             "lk", [{"id": 20, "name": "Standard"}], [{"path": "/music"}],
             metadata_profiles=[{"id": 30, "name": "Standard"}])
         self.jellyfin = FakeJellyfin()
+        self.down = set()  # hosts raising transport errors
         self.log = []  # (method, host, path)
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         host = request.url.host
         self.log.append((request.method, host, request.url.path))
+        if host in self.down:
+            raise httpx.ConnectError("connection refused")
         if host == "radarr.test":
             return self.radarr.handle(request, request.url.path.removeprefix("/api/v3/"))
         if host == "sonarr.test":
@@ -135,6 +140,8 @@ class FakeNet:
 @pytest.fixture
 def net(monkeypatch):
     monkeypatch.setattr(http, "HOST_DELAYS", {})
+    # no-op the retry backoff so transport-error tests stay fast
+    monkeypatch.setattr(http.time, "sleep", lambda _s: None)
     fake = FakeNet()
     transport = httpx.MockTransport(fake.handler)
     orig = http.request_json
@@ -218,8 +225,12 @@ def test_music_weekly_cap_respected(conn, tmp_path, net):
     assert rec_row(conn, r2)["status"] == "proposed"
     assert rec_row(conn, r3)["status"] == "proposed"
     events = conn.execute(
-        "SELECT kind, source FROM events WHERE item_id='artist:mbid:mb1'").fetchall()
-    assert [(e["kind"], e["source"]) for e in events] == [("library_add", "gustarr")]
+        "SELECT ts, kind, weight, source FROM events WHERE item_id='artist:mbid:mb1'").fetchall()
+    # audit trail only: gustarr's own add must not read as user praise
+    assert [(e["kind"], e["weight"], e["source"]) for e in events] == \
+        [("auto_add", 0.0, "gustarr")]
+    assert "auto_add" not in signals.WEIGHTS
+    assert signals.aggregate_label([(e["ts"], e["kind"], e["weight"]) for e in events]) == 0.0
 
 
 def test_music_queue_mode_leaves_proposed(conn, tmp_path, net):
@@ -229,6 +240,77 @@ def test_music_queue_mode_leaves_proposed(conn, tmp_path, net):
     assert stats["music_added"] == 0
     assert net.lidarr.posted == []
     assert rec_row(conn, r1)["status"] == "proposed"
+
+
+def test_approved_artist_added_in_queue_mode(conn, tmp_path, net):
+    # explicit approval is consent: actuated even when music_mode='queue'
+    cfg = make_cfg(tmp_path, music_mode="queue")
+    rid = add_rec(conn, "artist:mbid:mb1", "artist", "Artist 1", {"mbid": "mb1"},
+                  status="approved")
+    # queue already wrote the approve event when the user approved
+    db.add_event(conn, db.now(), "artist:mbid:mb1", "approve", 1.0, "user", {"rec_id": rid})
+
+    stats = apply_mod.run(conn, cfg)
+
+    assert stats["music_added"] == 1
+    assert net.lidarr.posted[0]["foreignArtistId"] == "mb1"
+    row = rec_row(conn, rid)
+    assert row["status"] == "added"
+    assert row["acted_at"]
+    # no extra taste event: the approve written at approval time is enough
+    kinds = [e["kind"] for e in conn.execute(
+        "SELECT kind FROM events WHERE item_id='artist:mbid:mb1'")]
+    assert kinds == ["approve"]
+
+
+def test_approved_artist_exempt_from_weekly_budget(conn, tmp_path, net):
+    cfg = make_cfg(tmp_path, music_max_artists_per_week=0)
+    rid = add_rec(conn, "artist:mbid:mb1", "artist", "Artist 1", {"mbid": "mb1"},
+                  status="approved")
+    prop = add_rec(conn, "artist:mbid:mb2", "artist", "Artist 2", {"mbid": "mb2"}, score=0.9)
+    stats = apply_mod.run(conn, cfg)
+    assert stats["music_budget"] == 0
+    assert stats["music_added"] == 1  # the approval, not the proposal
+    assert rec_row(conn, rid)["status"] == "added"
+    assert rec_row(conn, prop)["status"] == "proposed"
+
+
+def test_approved_artist_without_mbid_marked_failed(conn, tmp_path, net):
+    cfg = make_cfg(tmp_path, music_mode="queue")
+    rid = add_rec(conn, "artist:lastfm:someband", "artist", "Some Band", {},
+                  status="approved")
+    stats = apply_mod.run(conn, cfg)
+    assert net.lidarr.posted == []
+    assert any("mbid" in e for e in stats["errors"])
+    assert rec_row(conn, rid)["status"] == "failed"
+
+
+def test_approved_artist_survives_lidarr_outage(conn, tmp_path, net):
+    cfg = make_cfg(tmp_path, music_mode="queue")
+    net.lidarr.fail_add = (503, "service unavailable")
+    rid = add_rec(conn, "artist:mbid:mb1", "artist", "Artist 1", {"mbid": "mb1"},
+                  status="approved")
+    stats = apply_mod.run(conn, cfg)
+    assert stats["music_added"] == 0
+    assert any("Artist 1" in e for e in stats["errors"])
+    row = rec_row(conn, rid)
+    assert row["status"] == "approved"  # retryable, not terminally failed
+    assert json.loads(row["why"])["attempts"] == 1
+    # arr back up: the same approval lands on the next apply
+    net.lidarr.fail_add = None
+    stats = apply_mod.run(conn, cfg)
+    assert stats["music_added"] == 1
+    assert rec_row(conn, rid)["status"] == "added"
+
+
+def test_approved_artist_4xx_marked_failed(conn, tmp_path, net):
+    cfg = make_cfg(tmp_path, music_mode="queue")
+    net.lidarr.fail_add = (400, "Invalid foreignArtistId")
+    rid = add_rec(conn, "artist:mbid:bogus", "artist", "Bogus", {"mbid": "bogus"},
+                  status="approved")
+    stats = apply_mod.run(conn, cfg)
+    assert stats["music_added"] == 0
+    assert rec_row(conn, rid)["status"] == "failed"
 
 
 def test_music_skips_artists_without_mbid(conn, tmp_path, net):
@@ -310,6 +392,49 @@ def test_series_with_only_tmdb_id_marked_failed(conn, tmp_path, net):
     assert rec_row(conn, rid)["status"] == "failed"
 
 
+def test_approved_video_survives_arr_outage(conn, tmp_path, net):
+    cfg = make_cfg(tmp_path)
+    net.radarr.fail_add = (503, "service unavailable")
+    rid = add_rec(conn, "movie:tmdb:603", "movie", "The Matrix", {"tmdb": 603},
+                  status="approved")
+    stats = apply_mod.run(conn, cfg)
+    assert stats["video_added"] == 0
+    assert stats["video_failed"] == 0
+    assert any("The Matrix" in e for e in stats["errors"])
+    row = rec_row(conn, rid)
+    assert row["status"] == "approved"  # retryable, not terminally failed
+    assert json.loads(row["why"])["attempts"] == 1
+    # arr back up: the approval lands on the next apply
+    net.radarr.fail_add = None
+    stats = apply_mod.run(conn, cfg)
+    assert stats["video_added"] == 1
+    assert rec_row(conn, rid)["status"] == "added"
+
+
+def test_approved_video_survives_connect_error(conn, tmp_path, net):
+    cfg = make_cfg(tmp_path)
+    net.down.add("radarr.test")
+    rid = add_rec(conn, "movie:tmdb:603", "movie", "The Matrix", {"tmdb": 603},
+                  status="approved")
+    stats = apply_mod.run(conn, cfg)
+    assert stats["video_failed"] == 0
+    assert rec_row(conn, rid)["status"] == "approved"
+    net.down.clear()
+    stats = apply_mod.run(conn, cfg)
+    assert stats["video_added"] == 1
+    assert rec_row(conn, rid)["status"] == "added"
+
+
+def test_approved_video_4xx_marked_failed(conn, tmp_path, net):
+    cfg = make_cfg(tmp_path)
+    net.radarr.fail_add = (400, '[{"errorMessage": "TMDb id required"}]')
+    rid = add_rec(conn, "movie:tmdb:603", "movie", "The Matrix", {"tmdb": 603},
+                  status="approved")
+    stats = apply_mod.run(conn, cfg)
+    assert stats["video_failed"] == 1
+    assert rec_row(conn, rid)["status"] == "failed"
+
+
 def test_radarr_already_exists_is_success(conn, tmp_path, net):
     cfg = make_cfg(tmp_path)
     net.radarr.fail_add = (400, '[{"errorMessage": "This movie has already been added"}]')
@@ -319,6 +444,100 @@ def test_radarr_already_exists_is_success(conn, tmp_path, net):
     assert stats["video_added"] == 1
     assert stats["errors"] == []
     assert rec_row(conn, rid)["status"] == "added"
+
+
+def test_exists_validator_error_code_is_success(conn, tmp_path, net):
+    cfg = make_cfg(tmp_path)
+    net.sonarr.fail_add = (
+        400, '[{"errorCode": "SeriesExistsValidator", "errorMessage": "whatever"}]')
+    rid = add_rec(conn, "series:tvdb:81189", "series", "Breaking Bad", {"tvdb": 81189},
+                  status="approved")
+    stats = apply_mod.run(conn, cfg)
+    assert stats["video_added"] == 1
+    assert rec_row(conn, rid)["status"] == "added"
+
+
+def test_path_conflict_400_is_not_a_duplicate(conn, tmp_path, net):
+    # "already" alone must not read as success: this 400 is a real failure
+    cfg = make_cfg(tmp_path)
+    net.radarr.fail_add = (
+        400, '[{"propertyName": "Path", "errorCode": "MoviePathValidator",'
+        ' "errorMessage": "Path is already configured for an existing movie"}]')
+    rid = add_rec(conn, "movie:tmdb:603", "movie", "The Matrix", {"tmdb": 603},
+                  status="approved")
+    stats = apply_mod.run(conn, cfg)
+    assert stats["video_added"] == 0
+    assert stats["video_failed"] == 1
+    assert any("Path is already configured" in e for e in stats["errors"])
+    assert rec_row(conn, rid)["status"] == "failed"
+
+
+# ── video auto mode ──────────────────────────────────────────────────
+
+
+def test_video_auto_mode_adds_proposed_within_cap(conn, tmp_path, net):
+    cfg = make_cfg(tmp_path, video_mode="auto", video_queue_max_pending=2)
+    top = add_rec(conn, "movie:tmdb:1", "movie", "M1", {"tmdb": 1}, score=0.9)
+    mid = add_rec(conn, "series:tvdb:2", "series", "S2", {"tvdb": 2}, score=0.8)
+    low = add_rec(conn, "movie:tmdb:3", "movie", "M3", {"tmdb": 3}, score=0.2)
+
+    stats = apply_mod.run(conn, cfg)
+
+    assert stats["video_added"] == 2
+    assert [b["tmdbId"] for b in net.radarr.posted] == [1]
+    assert [b["tvdbId"] for b in net.sonarr.posted] == [2]
+    assert rec_row(conn, top)["status"] == "auto_added"
+    assert rec_row(conn, mid)["status"] == "auto_added"
+    assert rec_row(conn, low)["status"] == "proposed"  # over the per-run cap
+    # audit event only, invisible to training
+    events = conn.execute(
+        "SELECT kind, weight, source FROM events WHERE item_id='movie:tmdb:1'").fetchall()
+    assert [(e["kind"], e["weight"], e["source"]) for e in events] == \
+        [("auto_add", 0.0, "gustarr")]
+
+
+def test_video_auto_mode_prefers_approved_and_skips_idless(conn, tmp_path, net):
+    cfg = make_cfg(tmp_path, video_mode="auto", video_queue_max_pending=1)
+    approved = add_rec(conn, "movie:tmdb:10", "movie", "Approved", {"tmdb": 10},
+                       status="approved", score=0.1)
+    # tvdb-less series must not burn the single auto slot
+    idless = add_rec(conn, "series:tmdb:11", "series", "No tvdb", {"tmdb": 11}, score=0.9)
+    auto = add_rec(conn, "movie:tmdb:12", "movie", "Auto", {"tmdb": 12}, score=0.5)
+
+    stats = apply_mod.run(conn, cfg)
+
+    assert stats["video_added"] == 2
+    assert rec_row(conn, approved)["status"] == "added"
+    assert rec_row(conn, auto)["status"] == "auto_added"
+    assert rec_row(conn, idless)["status"] == "proposed"
+
+
+def test_video_queue_mode_ignores_proposed(conn, tmp_path, net):
+    cfg = make_cfg(tmp_path)  # video_mode defaults to queue
+    rid = add_rec(conn, "movie:tmdb:1", "movie", "M1", {"tmdb": 1}, score=0.9)
+    stats = apply_mod.run(conn, cfg)
+    assert stats["video_added"] == 0
+    assert net.radarr.posted == []
+    assert rec_row(conn, rid)["status"] == "proposed"
+
+
+# ── crash safety ─────────────────────────────────────────────────────
+
+
+def test_successful_adds_committed_immediately(conn, tmp_path, net):
+    # an arr add is irreversible: its record must survive the caller
+    # never reaching conn.commit() (crash later in the run)
+    cfg = make_cfg(tmp_path)
+    rid = add_rec(conn, "movie:tmdb:603", "movie", "The Matrix", {"tmdb": 603},
+                  status="approved")
+    apply_mod.run(conn, cfg)
+    other = db.connect(tmp_path / "t.db")
+    try:
+        row = other.execute(
+            "SELECT status FROM recommendations WHERE id=?", (rid,)).fetchone()
+        assert row["status"] == "added"
+    finally:
+        other.close()
 
 
 def test_video_queue_overflow_expires_lowest_scores(conn, tmp_path, net):
@@ -393,10 +612,22 @@ def test_root_folder_prefers_configured_else_first(net):
     client = arr_client.RadarrClient(
         ArrConfig(url="http://radarr.test", api_key="rk", root_folder="/movies/"))
     assert client.root_folder_path() == "/movies"
+    # empty setting: first folder is the sensible default
+    client = arr_client.RadarrClient(
+        ArrConfig(url="http://radarr.test", api_key="rk", root_folder=""))
+    assert client.root_folder_path() == "/other"
+
+
+def test_root_folder_explicit_mismatch_raises(net):
+    # an explicit setting must never silently fall back to another disk
     net.radarr.roots = [{"path": "/other"}]
     client = arr_client.RadarrClient(
         ArrConfig(url="http://radarr.test", api_key="rk", root_folder="/missing"))
-    assert client.root_folder_path() == "/other"
+    with pytest.raises(arr_client.ArrError) as exc:
+        client.root_folder_path()
+    msg = str(exc.value)
+    assert "/missing" in msg
+    assert "/other" in msg
 
 
 # ── jellyfin collections ─────────────────────────────────────────────

@@ -2,17 +2,21 @@
 
 No auth by design: gustarr is single-user and binds 127.0.0.1 by default
 (``[web] bind``, see cli.py); any wider exposure happens intranet-only
-behind Traefik, which owns TLS and access control.
+behind Traefik, which owns TLS and access control. A Host/Origin guard
+still runs on every request (see ``guard`` below) because a localhost
+bind alone does not stop the user's own browser: extra hostnames (e.g.
+the Traefik one) go in ``[web] allowed_hosts``.
 """
 
 from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Awaitable, Callable, Iterator
+from urllib.parse import urlsplit
 
-from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from .. import db, queue
 from ..config import Config
@@ -20,8 +24,43 @@ from ..config import Config
 _INDEX = Path(__file__).parent / "static" / "index.html"
 
 
+def _hostname(value: str) -> str | None:
+    """Lowercased host from a Host header, Origin, or bind string; port-insensitive."""
+    try:
+        # urlsplit needs '//' to treat scheme-less values ("127.0.0.1:8790") as netloc.
+        return urlsplit(value if "//" in value else f"//{value}").hostname
+    except ValueError:
+        return None
+
+
+def _allowed_hosts(cfg: Config) -> set[str]:
+    allowed = {"127.0.0.1", "localhost"}
+    for entry in [cfg.web.get("bind", "127.0.0.1:8790"), *cfg.web.get("allowed_hosts", [])]:
+        host = _hostname(str(entry))
+        if host:
+            allowed.add(host)
+    return allowed
+
+
 def create_app(cfg: Config) -> FastAPI:
     app = FastAPI(title="gustarr", docs_url=None, redoc_url=None)
+    allowed = _allowed_hosts(cfg)
+
+    @app.middleware("http")
+    async def guard(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        # The 127.0.0.1 bind doesn't stop the user's own browser acting as a
+        # confused deputy: a foreign Host header means DNS rebinding, and a
+        # cross-site page can fire Origin-carrying simple POSTs at localhost.
+        if _hostname(request.headers.get("host", "")) not in allowed:
+            return JSONResponse({"detail": "unrecognized Host header"}, status_code=403)
+        origin = request.headers.get("origin")
+        # Absent Origin = same-origin navigation or CLI client; allowed.
+        if request.method not in ("GET", "HEAD", "OPTIONS") and origin is not None:
+            if _hostname(origin) not in allowed:
+                return JSONResponse({"detail": "cross-origin request rejected"}, status_code=403)
+        return await call_next(request)
 
     def get_conn() -> Iterator[sqlite3.Connection]:
         # One connection per request: same-machine SQLite opens are cheap,

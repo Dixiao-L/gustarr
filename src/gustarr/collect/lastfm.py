@@ -56,8 +56,22 @@ def _walk(
         page += 1
 
 
+def _merge_name_twin(conn: sqlite3.Connection, artist_name: str, mbid_id: str) -> None:
+    """Fold a previously minted artist:lastfm:<name> item into the mbid
+    item the moment Last.fm itself pairs the name with an mbid — its own
+    assertion beats enrich's fuzzy MusicBrainz name search."""
+    try:
+        fallback_id = ids.make("artist", "lastfm", artist_name)
+    except ValueError:
+        return
+    if fallback_id != mbid_id and conn.execute(
+            "SELECT 1 FROM items WHERE id=?", (fallback_id,)).fetchone():
+        db.merge_item(conn, fallback_id, mbid_id)
+
+
 def _upsert_pair(conn: sqlite3.Connection, t: dict) -> tuple[str, str]:
-    """Mint/refresh artist + track items for one API row; returns their ids.
+    """Mint/refresh artist + track items for one API row; returns their
+    effective ids (merge-resolved, so never a merged-away fallback).
 
     Raises ValueError (from ids.make) when the row has no usable names/mbids.
     """
@@ -71,6 +85,10 @@ def _upsert_pair(conn: sqlite3.Connection, t: dict) -> tuple[str, str]:
         artist_id = ids.make("artist", "lastfm", artist_name)
     db.upsert_item(conn, artist_id, "artist", title=artist_name,
                    ids={"mbid": artist_mbid} if artist_mbid else None)
+    if artist_mbid:
+        _merge_name_twin(conn, artist_name, artist_id)
+    # follow-up writes must land on the live row, not a merged fallback
+    artist_id = db.canonical_id(conn, artist_id)
 
     track_name = t.get("name") or ""
     track_mbid = t.get("mbid") or ""
@@ -84,7 +102,7 @@ def _upsert_pair(conn: sqlite3.Connection, t: dict) -> tuple[str, str]:
         meta["album"] = album_name
     db.upsert_item(conn, track_id, "track", title=track_name,
                    ids={"mbid": track_mbid} if track_mbid else None, meta=meta)
-    return track_id, artist_id
+    return db.canonical_id(conn, track_id), artist_id
 
 
 def sync(
@@ -93,7 +111,11 @@ def sync(
     full: bool = False,
     transport: httpx.BaseTransport | None = None,
 ) -> dict[str, Any]:
-    api_key, user = cfg.lastfm["api_key"], cfg.lastfm["user"]
+    # api_key alone is a legitimate config (enrich/candidates use it
+    # without a user), so skip instead of KeyError-ing the pipeline.
+    api_key, user = cfg.lastfm.get("api_key"), cfg.lastfm.get("user")
+    if not (api_key and user):
+        return {"skipped": "lastfm not fully configured"}
     stats: dict[str, Any] = {"scrobbles": 0, "loved": 0, "items": 0, "pages": 0}
     seen_items: set[str] = set()
     base = {"api_key": api_key, "user": user, "format": "json", "limit": PAGE_LIMIT}
@@ -117,7 +139,10 @@ def sync(
         ts = _iso(uts)
         if db.add_event(conn, ts, track_id, "scrobble", WEIGHTS["scrobble"], "lastfm"):
             stats["scrobbles"] += 1
-        db.add_event(conn, ts, artist_id, "scrobble", WEIGHTS["scrobble"], "lastfm")
+        # dedup=track_id: two different tracks scrobbled the same second
+        # must both count on the artist item; re-syncs still collide.
+        db.add_event(conn, ts, artist_id, "scrobble", WEIGHTS["scrobble"], "lastfm",
+                     dedup=track_id)
         seen_items.update((track_id, artist_id))
         max_uts = max(max_uts, uts)
 
@@ -132,7 +157,8 @@ def sync(
         ts = _iso(uts)
         if db.add_event(conn, ts, track_id, "loved", WEIGHTS["loved"], "lastfm"):
             stats["loved"] += 1
-        db.add_event(conn, ts, artist_id, "loved", WEIGHTS["loved"], "lastfm")
+        db.add_event(conn, ts, artist_id, "loved", WEIGHTS["loved"], "lastfm",
+                     dedup=track_id)
         seen_items.update((track_id, artist_id))
 
     if max_uts:
