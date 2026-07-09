@@ -28,9 +28,10 @@ TOP_GENRES = 5
 # just balloon the enrich/embed backlog without improving picks.
 MAX_NEW_PER_SOURCE = 200
 
-# Anything already decided on (queued, added by apply) or ever rejected
-# must never re-enter the pool.
-BLOCKED_REC_STATUSES = ("proposed", "approved", "auto_added", "added")
+# Anything already decided on (queued, added by apply, or terminally
+# failed to actuate) or ever rejected must never re-enter the pool —
+# 'failed' is terminal, so re-proposing it would just re-fail in apply.
+BLOCKED_REC_STATUSES = ("proposed", "approved", "auto_added", "added", "failed")
 
 
 def run(conn: sqlite3.Connection, cfg: Config, domain: str | None = None) -> dict[str, Any]:
@@ -71,6 +72,10 @@ class _Pool:
     def add(self, item_id: str, domain: str, title: str | None, year: int | None,
             ids_d: dict[str, Any], meta: dict[str, Any], source: str,
             seed_id: str | None, score: float | None) -> None:
+        # A merged-away fallback id must land on its canonical row, or the
+        # candidates FK insert fails (upsert_item redirects the items write
+        # but this raw insert would still use the stale id).
+        item_id = db.canonical_id(self.conn, item_id)
         if item_id in self.excluded:
             self.stats["skipped"] += 1
             return
@@ -102,11 +107,24 @@ class _Pool:
 def _excluded_ids(conn: sqlite3.Connection) -> set[str]:
     marks = ",".join("?" * len(BLOCKED_REC_STATUSES))
     q = (
+        "SELECT x.item_id, i.domain, i.ids FROM ("
         "SELECT item_id FROM library"
         f" UNION SELECT item_id FROM recommendations WHERE status IN ({marks})"
-        " UNION SELECT item_id FROM events WHERE kind='reject'"
+        " UNION SELECT item_id FROM events WHERE kind='reject') x"
+        " LEFT JOIN items i ON i.id = x.item_id"
     )
-    return {r["item_id"] for r in conn.execute(q, BLOCKED_REC_STATUSES)}
+    excluded: set[str] = set()
+    for r in conn.execute(q, BLOCKED_REC_STATUSES):
+        excluded.add(r["item_id"])
+        if r["domain"] is None:
+            continue
+        # An excluded item is often known under several namespaces (a Sonarr
+        # library row is series:tvdb:<id> while TMDb mints series:tmdb:<id>),
+        # so block every alternate id derivable from its ids JSON as well.
+        for ns, key in json.loads(r["ids"]).items():
+            if key:
+                excluded.add(ids.make(r["domain"], ns, str(key)))
+    return excluded
 
 
 # ── seed selection ───────────────────────────────────────────────────
@@ -274,8 +292,18 @@ def _lastfm_similar(conn: sqlite3.Connection, api_key: str, seed_ids: list[str],
             if not name:
                 continue
             mb = a.get("mbid") or None
-            item_id = (ids.make("artist", "mbid", mb) if mb
-                       else ids.make("artist", "lastfm", name))
+            if mb:
+                item_id = ids.make("artist", "mbid", mb)
+                fallback = ids.make("artist", "lastfm", name)
+                # Last.fm asserting name↔mbid identity beats the fuzzy
+                # MusicBrainz search enrich relies on: fold any name-keyed
+                # twin (scrobbles often omit the mbid) into the canonical
+                # item so one artist never lives on as two ids.
+                db.merge_item(conn, fallback, item_id)
+                if fallback in pool.excluded:
+                    pool.excluded.add(item_id)
+            else:
+                item_id = ids.make("artist", "lastfm", name)
             try:
                 score = float(a.get("match") or 0.0)
             except (TypeError, ValueError):

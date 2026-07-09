@@ -23,12 +23,16 @@ HOST_DELAYS = {
     "api.themoviedb.org": 0.05,
 }
 
+# A proxy can send Retry-After: 86400; honoring it verbatim stalls the whole
+# single-process pipeline, so clamp it near the 8s exponential-backoff ceiling.
+RETRY_AFTER_CAP = 60.0
+
 _last_call: dict[str, float] = {}
 
 
 class ApiError(Exception):
     def __init__(self, url: str, status: int | None, detail: str = ""):
-        self.url, self.status = url, status
+        self.url, self.status, self.detail = url, status, detail
         super().__init__(f"{status or 'ERR'} {url} {detail}".strip())
 
 
@@ -64,14 +68,16 @@ def request_json(
                     method, url, params=params, json=json_body, headers=merged_headers)
             except httpx.TransportError as exc:
                 last_exc = exc
-                time.sleep(min(2**attempt, 8))
+                if attempt < retries:
+                    time.sleep(min(2**attempt, 8))
                 continue
             if resp.status_code == 429 or resp.status_code >= 500:
                 retry_after = resp.headers.get("Retry-After")
-                wait = float(retry_after) if retry_after and retry_after.isdigit() \
-                    else min(2**attempt, 8)
-                last_exc = ApiError(url, resp.status_code)
-                time.sleep(wait)
+                wait = min(float(retry_after), RETRY_AFTER_CAP) \
+                    if retry_after and retry_after.isdigit() else min(2**attempt, 8)
+                last_exc = ApiError(url, resp.status_code, resp.text[:200])
+                if attempt < retries:
+                    time.sleep(wait)
                 continue
             if resp.status_code >= 400:
                 raise ApiError(url, resp.status_code, resp.text[:200])

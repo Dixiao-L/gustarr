@@ -362,3 +362,99 @@ def test_rank_centroid_fallback_artist(tmp_path):
     why = json.loads(conn.execute(
         "SELECT why FROM recommendations WHERE item_id='artist:mbid:a1'").fetchone()["why"])
     assert why["neighbors"] == [] and why["sources"] == ["lastfm_similar"]
+
+
+def test_rank_rescores_open_proposals_with_current_scorer(tmp_path):
+    """Frozen scores from earlier runs/scorers are re-scored on the current
+    model's scale so apply's cross-row comparisons compare like with like."""
+    conn = db.connect(tmp_path / "t.db")
+    cfg = make_cfg(tmp_path)
+    model = cfg.model.embed_model
+    ts = db.now()
+
+    # Open proposal from an old centroid-era run with an inflated frozen score.
+    db.upsert_item(conn, "movie:tmdb:old", "movie", title="Old")
+    put_vec(conn, "movie:tmdb:old", unit(0.5 * axis(0) + float(np.sqrt(0.75)) * axis(1)), model)
+    old_why = json.dumps({"sources": ["tmdb_similar"], "exploration": False})
+    conn.execute(
+        "INSERT INTO recommendations (run_id, ts, domain, item_id, score, why, status)"
+        " VALUES ('oldrun', ?, 'movie', 'movie:tmdb:old', 0.99, ?, 'proposed')", (ts, old_why))
+    # Open proposal without an embedding: keeps its old score.
+    db.upsert_item(conn, "movie:tmdb:noemb", "movie", title="NoEmb")
+    conn.execute(
+        "INSERT INTO recommendations (run_id, ts, domain, item_id, score, status)"
+        " VALUES ('oldrun', ?, 'movie', 'movie:tmdb:noemb', 0.42, 'proposed')", (ts,))
+    # Approved rec: not touched by the re-score (only 'proposed' rows are).
+    db.upsert_item(conn, "movie:tmdb:appr", "movie", title="Appr")
+    put_vec(conn, "movie:tmdb:appr", axis(0), model)
+    conn.execute(
+        "INSERT INTO recommendations (run_id, ts, domain, item_id, score, status)"
+        " VALUES ('oldrun', ?, 'movie', 'movie:tmdb:appr', 0.91, 'approved')", (ts,))
+
+    db.upsert_item(conn, "movie:tmdb:new", "movie", title="New")
+    put_vec(conn, "movie:tmdb:new", axis(0), model)
+    add_candidate(conn, "movie:tmdb:new")
+    db.set_state(conn, "model:movie", json.dumps({
+        "w": b64(4.0 * axis(0)), "b": -1.0, "dim": DIM, "embed_model": model,
+        "trained_at": ts, "n_pos": 10, "n_neg": 3, "n_weak": 20}))
+
+    stats = rank_mod.run(conn, cfg, top=5)
+    assert stats["rescored"] == 1
+    rows = {r["item_id"]: r for r in conn.execute("SELECT * FROM recommendations")}
+
+    old = rows["movie:tmdb:old"]
+    # sigmoid(4*0.5 - 1), the current head's base score — not the frozen 0.99.
+    assert old["score"] == pytest.approx(1.0 / (1.0 + np.exp(-1.0)), abs=1e-3)
+    assert old["status"] == "proposed" and old["run_id"] == "oldrun"
+    assert old["why"] == old_why  # why untouched
+    assert rows["movie:tmdb:noemb"]["score"] == 0.42
+    assert rows["movie:tmdb:appr"]["score"] == 0.91
+    # New proposal scored by the same head (+ one-source bonus): comparable.
+    new_score = rows["movie:tmdb:new"]["score"]
+    assert new_score == pytest.approx(1.0 / (1.0 + np.exp(-3.0)) + 0.03, abs=1e-3)
+    assert old["score"] < new_score  # frozen 0.99 would have outranked it
+
+
+def test_rank_ignores_head_from_other_embed_model(tmp_path):
+    """A head trained in a different embedding space (same dim) must be
+    treated as absent so the current-model centroid takes over."""
+    conn = db.connect(tmp_path / "t.db")
+    cfg = make_cfg(tmp_path)
+    model = cfg.model.embed_model
+    for name, v in {"a1": axis(0), "a2": axis(1)}.items():
+        iid = f"artist:mbid:{name}"
+        db.upsert_item(conn, iid, "artist", title=name)
+        put_vec(conn, iid, v, model)
+        add_candidate(conn, iid, source="lastfm_similar")
+    # Stale head points at axis(1): if it were used, a2 would win big.
+    db.set_state(conn, "model:artist", json.dumps({
+        "w": b64(4.0 * axis(1)), "b": -1.0, "dim": DIM, "embed_model": "other/embedder",
+        "trained_at": db.now(), "n_pos": 8, "n_neg": 0, "n_weak": 16}))
+    db.set_state(conn, "centroid:artist", json.dumps({
+        "pos": b64(axis(0)), "neg": None, "dim": DIM, "embed_model": model,
+        "exemplars": []}))
+
+    stats = rank_mod.run(conn, cfg)
+    assert stats["stale_state"] == 1
+    assert stats["proposed"] == 2
+    scores = {r["item_id"]: r["score"] for r in conn.execute(
+        "SELECT item_id, score FROM recommendations WHERE domain='artist'")}
+    # Centroid (cos+1)/2 mapping + one-source bonus, not the stale head's sigmoid.
+    assert abs(scores["artist:mbid:a1"] - 1.03) < 0.02
+    assert abs(scores["artist:mbid:a2"] - 0.53) < 0.02
+
+
+def test_rank_skips_domain_when_all_state_is_stale(tmp_path):
+    conn = db.connect(tmp_path / "t.db")
+    cfg = make_cfg(tmp_path)
+    db.upsert_item(conn, "artist:mbid:a1", "artist", title="a1")
+    put_vec(conn, "artist:mbid:a1", axis(0), cfg.model.embed_model)
+    add_candidate(conn, "artist:mbid:a1", source="lastfm_similar")
+    db.set_state(conn, "centroid:artist", json.dumps({
+        "pos": b64(axis(0)), "neg": None, "dim": DIM, "embed_model": "other/embedder",
+        "exemplars": []}))
+
+    stats = rank_mod.run(conn, cfg)
+    assert stats["stale_state"] == 1
+    assert stats["proposed"] == 0
+    assert conn.execute("SELECT COUNT(*) AS n FROM recommendations").fetchone()["n"] == 0

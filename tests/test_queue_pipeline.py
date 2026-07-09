@@ -262,6 +262,19 @@ def test_unconfigured_sync_stages_skipped(conn, tmp_path, monkeypatch):
     assert stats["errors"] == []
 
 
+def test_lastfm_api_key_only_skips_sync_stage(conn, tmp_path, monkeypatch):
+    # api_key without user serves enrich/candidates but cannot sync —
+    # the stage must skip, not run (and error) every night
+    calls = fake_stages(monkeypatch)
+    partial = C._build({"core": {"data_dir": str(tmp_path)},
+                        "lastfm": {"api_key": "lk"}})
+    stats = pipeline.run_recipe(conn, partial, "nightly")
+
+    assert stats["sync_lastfm"] == "skipped"
+    assert "sync_lastfm" not in [c[0] for c in calls]
+    assert stats["errors"] == []
+
+
 def test_stage_error_is_isolated_and_still_committed(conn, cfg, monkeypatch):
     calls = fake_stages(monkeypatch, fail={"embed"})
     spy = CommitSpy(conn)

@@ -163,7 +163,7 @@ def upsert_item(
             (item_id, domain, title, year, json.dumps(ids or {}), json.dumps(meta or {}),
              ts if enriched else None, ts, ts),
         )
-        return
+        return item_id
     merged_ids = {**json.loads(row["ids"]), **(ids or {})}
     merged_meta = {**json.loads(row["meta"]), **(meta or {})}
     conn.execute(
@@ -173,6 +173,7 @@ def upsert_item(
         (title, year, json.dumps(merged_ids), json.dumps(merged_meta),
          enriched, ts, ts, item_id),
     )
+    return item_id
 
 
 def merge_item(conn: sqlite3.Connection, fallback_id: str, canonical_id: str) -> None:

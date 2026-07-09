@@ -22,14 +22,17 @@
           # >=13.0.3); nixpkgs still defaults cudaPackages to 12.9 and
           # refuses to evaluate. Any >=525 driver runs CUDA-13 userspace,
           # so this is a metadata unblock, not a compatibility gamble.
-          config.cudaVersion = "13.0";
+          overlays = [ (final: _prev: { cudaPackages = final.cudaPackages_13; }) ];
           config.allowUnfreePredicate = pkg:
             let n = lib.getName pkg; in
             # torch-bin evaluates under pname "torch" (nixpkgs shares the
             # name across source/bin variants); its license is
             # bsd3+issl+unfreeRedistributable purely from the bundled
             # NVIDIA userspace.
-            builtins.elem n [ "torch" "torch-bin" "triton" "triton-bin" ]
+            builtins.elem n [
+              "torch" "torch-bin" "triton" "triton-bin"
+              "cudnn" "nccl" "cutensor" "cusparselt"
+            ]
             || lib.hasPrefix "cuda" n
             || lib.hasPrefix "libcu" n
             || lib.hasPrefix "libnv" n
@@ -41,6 +44,12 @@
           python = pkgs.python312.override {
             packageOverrides = _self: super: {
               torch = super.torch-bin;
+              # Anything downstream (sentence-transformers → transformers)
+              # that reaches for the source torchvision/torchaudio would
+              # inherit attrs torch-bin doesn't expose (cudaSupport) and
+              # trigger an hours-long source build besides.
+              torchvision = super.torchvision-bin;
+              torchaudio = super.torchaudio-bin;
             };
           };
         in

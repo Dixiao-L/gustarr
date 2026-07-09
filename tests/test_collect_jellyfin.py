@@ -193,6 +193,110 @@ def test_progress_deltas_emit_incrementally(tmp_path, monkeypatch):
     assert stats3["series_plays"] == stats3["series_completes"] == stats3["scrobbles"] == 0
 
 
+def test_same_second_tracks_by_one_artist_both_scrobble(tmp_path):
+    # marking an album played stamps every track with the same LastPlayedDate;
+    # the track-id dedup keeps the artist rollup from swallowing all but one
+    conn = db.connect(tmp_path / "t.db")
+    state = server_state()
+    same_ts = "2024-06-03T09:00:00.0000000Z"
+    state["audio"] = [
+        {"Id": "t1", "Type": "Audio", "Name": "Paranoid Android", "Album": "OK Computer",
+         "ArtistItems": [{"Id": "a1", "Name": "Radiohead"}],
+         "UserData": {"PlayCount": 1, "LastPlayedDate": same_ts}},
+        {"Id": "t3", "Type": "Audio", "Name": "Karma Police", "Album": "OK Computer",
+         "ArtistItems": [{"Id": "a1", "Name": "Radiohead"}],
+         "UserData": {"PlayCount": 1, "LastPlayedDate": same_ts}},
+    ]
+    stats = jellyfin.sync(conn, make_cfg(tmp_path), transport=make_transport(state))
+    assert stats["scrobbles"] == 2
+    rows = conn.execute(
+        "SELECT dedup, weight FROM events WHERE item_id=? AND kind='scrobble'",
+        (ARTIST_MBID,)).fetchall()
+    assert {r["dedup"] for r in rows} == {"t1", "t3"}
+    assert sum(r["weight"] for r in rows) == pytest.approx(2 * WEIGHTS["scrobble"])
+    # both cursors advanced, so the re-sync stays a noop
+    stats2 = jellyfin.sync(conn, make_cfg(tmp_path), transport=make_transport(state))
+    assert stats2["scrobbles"] == 0
+
+
+def test_cursor_holds_when_duplicate_key_blocks_scrobble(tmp_path):
+    conn = db.connect(tmp_path / "t.db")
+    cfg = make_cfg(tmp_path)
+    state = server_state()
+    jellyfin.sync(conn, cfg, transport=make_transport(state))
+    # PlayCount rises but the server never updates LastPlayedDate: the insert
+    # collides with the stored row, so the cursor must not swallow the plays
+    state["audio"][0]["UserData"]["PlayCount"] = 9
+    stats = jellyfin.sync(conn, cfg, transport=make_transport(state))
+    assert stats["scrobbles"] == 0
+    assert db.get_state(conn, "jellyfin:track_plays:t1") == "7"
+    # once the ts finally moves, the pending delta lands intact
+    state["audio"][0]["UserData"]["LastPlayedDate"] = "2024-06-20T10:00:00.0000000Z"
+    stats = jellyfin.sync(conn, cfg, transport=make_transport(state))
+    assert stats["scrobbles"] == 1
+    row = conn.execute(
+        "SELECT weight, meta FROM events WHERE ts='2024-06-20T10:00:00Z'").fetchone()
+    assert row["weight"] == pytest.approx(2 * WEIGHTS["scrobble"])
+    assert json.loads(row["meta"])["delta"] == 2
+    assert db.get_state(conn, "jellyfin:track_plays:t1") == "9"
+
+
+def test_merged_fallback_artist_is_not_resurrected(tmp_path, monkeypatch):
+    conn = db.connect(tmp_path / "t.db")
+    cfg = make_cfg(tmp_path)
+    state = server_state()
+    # favorited, never played: the flag ts falls back to db.now(), which
+    # drifts between syncs — exactly the case that used to duplicate forever
+    state["library"][4]["UserData"] = {"IsFavorite": True}
+    transport = make_transport(state)
+    jellyfin.sync(conn, cfg, transport=transport)
+    canon = "artist:mbid:9578c268-fe14-4ec7-a390-85aa71d38afa"
+    db.merge_item(conn, ARTIST_LASTFM, canon)
+
+    monkeypatch.setattr(jellyfin.db, "now", lambda: "2099-01-01T00:00:00Z")
+    stats = jellyfin.sync(conn, cfg, transport=transport)
+    assert stats["favorites"] == 0 and stats["scrobbles"] == 0
+    dead = conn.execute("SELECT COUNT(*) c FROM items WHERE id=?", (ARTIST_LASTFM,)).fetchone()
+    assert dead["c"] == 0
+    orphans = conn.execute(
+        "SELECT COUNT(*) c FROM events WHERE item_id=?", (ARTIST_LASTFM,)).fetchone()
+    assert orphans["c"] == 0
+    kinds = {r["kind"]: r["c"] for r in conn.execute(
+        "SELECT kind, COUNT(*) c FROM events WHERE item_id=? GROUP BY kind", (canon,))}
+    assert kinds == {"favorite": 1, "scrobble": 1}
+    # the re-sync still refreshed the canonical row's metadata
+    row = conn.execute("SELECT title FROM items WHERE id=?", (canon,)).fetchone()
+    assert row["title"] == "Boards of Canada"
+
+
+def test_series_cursors_follow_merged_id(tmp_path, monkeypatch):
+    conn = db.connect(tmp_path / "t.db")
+    cfg = make_cfg(tmp_path)
+    state = server_state()
+    transport = make_transport(state)
+    jellyfin.sync(conn, cfg, transport=transport)
+    db.merge_item(conn, "series:tvdb:371980", "series:tmdb:999")
+
+    # unchanged progress after the merge must not re-emit play/complete
+    monkeypatch.setattr(jellyfin.db, "now", lambda: "2099-01-01T00:00:00Z")
+    stats = jellyfin.sync(conn, cfg, transport=transport)
+    assert stats["series_plays"] == 0 and stats["series_completes"] == 0
+    orphans = conn.execute(
+        "SELECT COUNT(*) c FROM events WHERE item_id='series:tvdb:371980'").fetchone()
+    assert orphans["c"] == 0
+
+    # new progress lands on the canonical id under the migrated cursor keys
+    state["episodes"] += [{"Id": "e4", "Type": "Episode", "SeriesId": "s1"},
+                          {"Id": "e5", "Type": "Episode", "SeriesId": "s1"}]
+    monkeypatch.setattr(jellyfin.db, "now", lambda: "2099-01-02T00:00:00Z")
+    stats = jellyfin.sync(conn, cfg, transport=transport)
+    assert stats["series_plays"] == 1 and stats["series_completes"] == 1
+    kinds = sorted(r["kind"] for r in conn.execute(
+        "SELECT kind FROM events WHERE item_id='series:tmdb:999' AND ts LIKE '2099-01-02%'"))
+    assert kinds == ["complete", "play"]
+    assert db.get_state(conn, "jellyfin:series_played:series:tmdb:999") == "5"
+
+
 def test_missing_user_errors_clearly(tmp_path):
     conn = db.connect(tmp_path / "t.db")
     cfg = make_cfg(tmp_path, user="nobody")

@@ -96,6 +96,45 @@ def _base_scores(
     return None
 
 
+def _rescore_open(
+    conn: sqlite3.Connection,
+    domain: str,
+    model_name: str,
+    head: dict | None,
+    centroid: dict | None,
+) -> int:
+    """Put still-open proposals on the current scorer's scale.
+
+    Frozen scores from earlier runs are not comparable to fresh ones
+    (head sigmoid vs centroid (s+1)/2, plus drift across retrains), yet
+    apply ranks the whole open queue numerically for the weekly budget
+    and overflow expiry. Base score only: the source/ext bonus is
+    normalised against a single run's pool, so it has no comparable
+    value here. Items without embeddings keep their old score."""
+    rows = conn.execute(
+        "SELECT id, item_id FROM recommendations WHERE domain=? AND status='proposed'",
+        (domain,),
+    ).fetchall()
+    if not rows:
+        return 0
+    vecs = {
+        item_id: np.frombuffer(blob, dtype=np.float16).astype(np.float32)
+        for item_id, _dim, blob in db.iter_embeddings(
+            conn, model_name, [r["item_id"] for r in rows])
+    }
+    scorable = [r for r in rows if r["item_id"] in vecs]
+    if not scorable:
+        return 0
+    x = np.stack([vecs[r["item_id"]] for r in scorable])
+    base = _base_scores(x, _unit_rows(x), head, centroid)
+    if base is None:
+        return 0
+    conn.executemany(
+        "UPDATE recommendations SET score=? WHERE id=?",
+        [(float(s), r["id"]) for r, s in zip(scorable, base)])
+    return len(scorable)
+
+
 def _select(
     scores: np.ndarray, xn: np.ndarray, slots: int, lam: float, explore_frac: float,
 ) -> tuple[list[int], set[int]]:
@@ -138,7 +177,9 @@ def run(conn: sqlite3.Connection, cfg: Config, top: int = 20) -> dict:
     now_dt = datetime.now(timezone.utc)
     run_id = now_dt.strftime("%Y%m%d%H%M%S")
     ts = db.now()
-    stats: dict = {"proposed": 0, "expired": 0, "unembedded": 0}
+    stats: dict = {
+        "proposed": 0, "expired": 0, "unembedded": 0, "rescored": 0, "stale_state": 0,
+    }
 
     domains = [r["domain"] for r in conn.execute(
         "SELECT DISTINCT i.domain FROM candidates c JOIN items i ON i.id = c.item_id"
@@ -146,8 +187,17 @@ def run(conn: sqlite3.Connection, cfg: Config, top: int = 20) -> dict:
     for domain in domains:
         head = _state_json(conn, f"model:{domain}")
         centroid = _state_json(conn, f"centroid:{domain}")
+        # State trained in another embedding space scores garbage even when
+        # the dims coincide — treat it as absent until train refits.
+        if head is not None and head.get("embed_model") != model_name:
+            head = None
+            stats["stale_state"] += 1
+        if centroid is not None and centroid.get("embed_model") != model_name:
+            centroid = None
+            stats["stale_state"] += 1
         if head is None and centroid is None:
             continue
+        stats["rescored"] += _rescore_open(conn, domain, model_name, head, centroid)
         info = _pool(conn, domain)
         if not info:
             continue

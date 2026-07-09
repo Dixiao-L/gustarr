@@ -8,7 +8,7 @@ import pytest
 
 from gustarr import config as C
 from gustarr import db, http, ids
-from gustarr.candidates import run
+from gustarr.candidates import _excluded_ids, run
 
 TMDB = "https://api.themoviedb.org/3"
 
@@ -278,3 +278,132 @@ def test_unconfigured_apis_do_nothing(conn, tmp_path, router):
     seed_movie(conn, 603, "The Matrix")
     stats = run(conn, bare)
     assert stats["new"] == {} and router.calls == []
+
+
+def test_failed_rec_never_reenters_pool(conn, cfg, router):
+    # 'failed' is terminal (un-actuatable add): re-proposing would just
+    # re-fail in apply, so the item must be blocked at insert time.
+    seed_movie(conn, 603, "The Matrix")
+    failed = ids.make("movie", "tmdb", "700")
+    db.upsert_item(conn, failed, "movie", title="M700")
+    conn.execute(
+        "INSERT INTO recommendations (run_id, ts, domain, item_id, score, status)"
+        " VALUES ('r1', ?, 'movie', ?, 0.5, 'failed')", (iso(2), failed))
+    router.route("/movie/603/recommendations", {"results": [movie_result(700)]})
+    router.route("/movie/603/similar", {"results": []})
+
+    stats = run(conn, cfg, domain="movie")
+
+    assert candidate_rows(conn) == {}
+    assert stats["skipped"] == 1
+
+
+def test_excluded_ids_cover_alternate_namespaces(conn):
+    owned = ids.make("series", "tvdb", "81189")
+    db.upsert_item(conn, owned, "series", title="Breaking Bad",
+                   ids={"tvdb": 81189, "tmdb": 1396})
+    conn.execute("INSERT INTO library (item_id, arr) VALUES (?, 'sonarr')", (owned,))
+    rejected = ids.make("movie", "tmdb", "603")
+    db.upsert_item(conn, rejected, "movie", title="The Matrix",
+                   ids={"tmdb": 603, "imdb": "tt0133093"})
+    db.add_event(conn, iso(1), rejected, "reject", -1.0, "user")
+
+    excluded = _excluded_ids(conn)
+
+    assert {owned, ids.make("series", "tmdb", "1396"),
+            rejected, ids.make("movie", "imdb", "tt0133093")} <= excluded
+
+
+def test_owned_series_excluded_across_namespaces(conn, cfg, router):
+    # Sonarr keys series by tvdb; TMDb mints tmdb ids — an owned show must
+    # not slip back into the pool under the other namespace.
+    seed = ids.make("series", "tvdb", "1")
+    db.upsert_item(conn, seed, "series", title="Seed", ids={"tvdb": 1, "tmdb": 500})
+    db.add_event(conn, iso(1), seed, "complete", 0.8, "jellyfin")
+    owned = ids.make("series", "tvdb", "81189")
+    db.upsert_item(conn, owned, "series", title="Breaking Bad",
+                   ids={"tvdb": 81189, "tmdb": 1396})
+    conn.execute("INSERT INTO library (item_id, arr) VALUES (?, 'sonarr')", (owned,))
+    router.route("/tv/500/recommendations", {"results": [
+        {"id": 1396, "name": "Breaking Bad", "first_air_date": "2008-01-20",
+         "vote_average": 8.9},
+        {"id": 60059, "name": "Better Call Saul", "first_air_date": "2015-02-08",
+         "vote_average": 8.6},
+    ]})
+
+    stats = run(conn, cfg, domain="series")
+
+    rows = candidate_rows(conn)
+    assert (ids.make("series", "tmdb", "60059"), "tmdb_similar") in rows
+    assert not any(k[0] == ids.make("series", "tmdb", "1396") for k in rows)
+    assert stats["skipped"] == 1
+
+
+def test_lastfm_mbid_merges_name_keyed_twin(conn, cfg, router):
+    mb = "5b11f4ce-a62d-471e-81fc-a69a8278c7da"
+    seed = ids.make("artist", "mbid", mb)
+    db.upsert_item(conn, seed, "artist", title="Nirvana", ids={"mbid": mb})
+    db.add_event(conn, iso(1), seed, "loved", 1.0, "lastfm")
+    # scrobbles minted a name-keyed twin before any mbid was known
+    twin = ids.make("artist", "lastfm", "Hole")
+    db.upsert_item(conn, twin, "artist", title="Hole")
+    db.add_event(conn, iso(2), twin, "scrobble", 0.3, "lastfm")
+
+    router.route("lastfm:artist.getsimilar", {"similarartists": {"artist": [
+        {"name": "Hole", "mbid": "abc-123", "match": "0.87"}]}})
+    run(conn, cfg, domain="artist")
+
+    canon = ids.make("artist", "mbid", "abc-123")
+    assert conn.execute("SELECT 1 FROM items WHERE id=?", (twin,)).fetchone() is None
+    assert db.canonical_id(conn, twin) == canon
+    ev = conn.execute("SELECT item_id FROM events WHERE kind='scrobble'").fetchone()
+    assert ev["item_id"] == canon
+    rows = candidate_rows(conn)
+    assert (canon, "lastfm_similar") in rows
+    assert not any(k[0] == twin for k in rows)
+
+
+def test_candidate_insert_follows_alias(conn, cfg, router):
+    mb = "5b11f4ce-a62d-471e-81fc-a69a8278c7da"
+    seed = ids.make("artist", "mbid", mb)
+    db.upsert_item(conn, seed, "artist", title="Nirvana", ids={"mbid": mb})
+    db.add_event(conn, iso(1), seed, "loved", 1.0, "lastfm")
+    # enrich previously merged the name-keyed item away; a similar-artist
+    # entry without mbid re-mints the fallback id, which must redirect to
+    # the canonical row instead of FK-failing on the candidates insert.
+    fallback = ids.make("artist", "lastfm", "Bush")
+    canon = ids.make("artist", "mbid", "xyz-1")
+    db.upsert_item(conn, fallback, "artist", title="Bush")
+    db.merge_item(conn, fallback, canon)
+
+    router.route("lastfm:artist.getsimilar", {"similarartists": {"artist": [
+        {"name": "Bush", "mbid": "", "match": "0.5"}]}})
+    stats = run(conn, cfg, domain="artist")
+
+    rows = candidate_rows(conn)
+    assert (canon, "lastfm_similar") in rows
+    assert not any(k[0] == fallback for k in rows)
+    assert stats["new"] == {"lastfm_similar": 1}
+
+
+def test_rejected_artist_stays_excluded_when_mbid_appears(conn, cfg, router):
+    mb = "5b11f4ce-a62d-471e-81fc-a69a8278c7da"
+    seed = ids.make("artist", "mbid", mb)
+    db.upsert_item(conn, seed, "artist", title="Nirvana", ids={"mbid": mb})
+    db.add_event(conn, iso(1), seed, "loved", 1.0, "lastfm")
+    rejected = ids.make("artist", "lastfm", "Nickelback")
+    db.upsert_item(conn, rejected, "artist", title="Nickelback")
+    db.add_event(conn, iso(2), rejected, "reject", -1.0, "user")
+
+    # the reject lives on the name-keyed id; the freshly revealed mbid
+    # must not smuggle the artist back into the pool post-merge
+    router.route("lastfm:artist.getsimilar", {"similarartists": {"artist": [
+        {"name": "Nickelback", "mbid": "nb-1", "match": "0.4"}]}})
+    stats = run(conn, cfg, domain="artist")
+
+    assert candidate_rows(conn) == {}
+    assert stats["skipped"] == 1
+    canon = ids.make("artist", "mbid", "nb-1")
+    assert db.canonical_id(conn, rejected) == canon
+    ev = conn.execute("SELECT item_id FROM events WHERE kind='reject'").fetchone()
+    assert ev["item_id"] == canon

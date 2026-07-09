@@ -21,7 +21,9 @@ STAGES: dict[str, tuple[str, str, Callable[[Config], bool] | None]] = {
     "sync_arr": ("gustarr.collect.arr", "sync",
                  lambda cfg: bool(cfg.sonarr or cfg.radarr or cfg.lidarr)),
     "sync_jellyfin": ("gustarr.collect.jellyfin", "sync", lambda cfg: bool(cfg.jellyfin)),
-    "sync_lastfm": ("gustarr.collect.lastfm", "sync", lambda cfg: bool(cfg.lastfm)),
+    # lastfm sync needs a user; api_key alone still serves enrich/candidates
+    "sync_lastfm": ("gustarr.collect.lastfm", "sync",
+                    lambda cfg: bool(cfg.lastfm.get("user"))),
     "sync_listenbrainz": ("gustarr.collect.listenbrainz", "sync",
                           lambda cfg: bool(cfg.listenbrainz)),
     "enrich": ("gustarr.enrich", "run", None),

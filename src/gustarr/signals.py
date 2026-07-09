@@ -52,8 +52,12 @@ def recency_factor(ts_iso: str, ref: datetime | None = None) -> float:
 def aggregate_label(rows: list[tuple[str, str, float]]) -> float:
     """rows: (ts, kind, weight) for one item → label in [-1, 1].
 
-    Log-scaled kinds are counted (with recency-weighted count), others
-    take the recency-weighted max so one strong old signal survives.
+    The stored per-event weight is authoritative (db.py documents it as
+    "the label contribution"): collectors may batch intensity into it,
+    e.g. jellyfin writes one scrobble event with weight = base * delta.
+    Log-scaled kinds recover the listen count as weight/base (so a 5x
+    event counts as 5 recency-weighted listens); others take the
+    recency-weighted stored weight so one strong old signal survives.
     """
     by_kind: dict[str, list[tuple[str, float]]] = {}
     for ts, kind, weight in rows:
@@ -65,12 +69,16 @@ def aggregate_label(rows: list[tuple[str, str, float]]) -> float:
         if base is None:
             continue
         if kind in LOG_SCALED_KINDS:
-            effective_count = sum(recency_factor(ts) for ts, _ in entries)
+            if base <= 0:  # log scaling assumes accumulating positives
+                continue
+            effective_count = sum(
+                recency_factor(ts) * max(0.0, w / base) for ts, w in entries
+            )
             total += base * math.log1p(effective_count) / math.log(2)
         else:
-            strongest = max(base * recency_factor(ts) for ts, _ in entries)
+            strongest = max(w * recency_factor(ts) for ts, w in entries)
             # negative kinds: max() of negatives → use min for them
             if base < 0:
-                strongest = min(base * recency_factor(ts) for ts, _ in entries)
+                strongest = min(w * recency_factor(ts) for ts, w in entries)
             total += strongest
     return max(-1.0, min(1.0, total))
