@@ -18,6 +18,11 @@
       mkPkgs = system:
         import nixpkgs {
           inherit system;
+          # torch-bin 2.12 wheels are built against CUDA 13 (cuda-bindings
+          # >=13.0.3); nixpkgs still defaults cudaPackages to 12.9 and
+          # refuses to evaluate. Any >=525 driver runs CUDA-13 userspace,
+          # so this is a metadata unblock, not a compatibility gamble.
+          config.cudaVersion = "13.0";
           config.allowUnfreePredicate = pkg:
             let n = lib.getName pkg; in
             # torch-bin evaluates under pname "torch" (nixpkgs shares the
