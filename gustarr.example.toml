@@ -1,0 +1,59 @@
+# gustarr configuration. Secrets use env:VAR — resolved from the process
+# environment (systemd EnvironmentFile=, agenix, direnv...), so this file
+# is safe to commit.
+
+[core]
+data_dir = "/var/lib/gustarr"
+# db_path defaults to <data_dir>/gustarr.db
+
+[jellyfin]
+url = "http://127.0.0.1:8096"
+api_key = "env:JELLYFIN_API_KEY"
+user = "your-jellyfin-username"
+
+[lastfm]
+api_key = "env:LASTFM_API_KEY"
+user = "your-lastfm-username"
+
+[listenbrainz]
+user = "your-listenbrainz-username"
+# token only needed if you want gustarr to submit anything; reads are public
+# token = "env:LISTENBRAINZ_TOKEN"
+
+[tmdb]
+api_key = "env:TMDB_API_KEY"
+
+[sonarr]
+url = "http://127.0.0.1:8989"
+api_key = "env:SONARR_API_KEY"
+quality_profile = "HD-1080p"
+root_folder = "/media/data/tv"
+
+[radarr]
+url = "http://127.0.0.1:7878"
+api_key = "env:RADARR_API_KEY"
+quality_profile = "HD-1080p"
+root_folder = "/media/data/movies"
+
+[lidarr]
+url = "http://127.0.0.1:8686"
+api_key = "env:LIDARR_API_KEY"
+quality_profile = "Standard"
+root_folder = "/media/data/music"
+
+[autonomy]
+music_mode = "auto"    # auto-add music within the caps below
+video_mode = "queue"   # movies/TV wait for approve/reject
+music_max_artists_per_week = 3
+music_max_albums_per_week = 10
+video_queue_max_pending = 20
+proposal_ttl_days = 30
+
+[model]
+embed_model = "BAAI/bge-m3"
+device = "cuda"        # cpu works, just slower
+exploration_frac = 0.15
+diversity_lambda = 0.3
+
+[web]
+bind = "127.0.0.1:8790"
