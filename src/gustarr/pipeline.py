@@ -34,9 +34,13 @@ STAGES: dict[str, tuple[str, str, Callable[[Config], bool] | None]] = {
     "apply": ("gustarr.actuate.apply", "run", None),
 }
 
+# apply runs nightly too: an explicit approval should land in the *arr
+# within hours, not "next Saturday". Auto-add budgets are unaffected —
+# _apply_music counts what was already acted this ISO week, so a nightly
+# cadence spends the same weekly allowance, just sooner.
 NIGHTLY = ["sync_arr", "sync_jellyfin", "sync_lastfm", "sync_listenbrainz",
-           "enrich", "candidates", "embed", "train", "rank"]
-WEEKLY = [*NIGHTLY, "apply"]
+           "enrich", "candidates", "embed", "train", "rank", "apply"]
+WEEKLY = NIGHTLY
 RECIPES = {"nightly": NIGHTLY, "weekly": WEEKLY}
 
 # Enrich is the only stage whose first run can be unbounded (a fresh
