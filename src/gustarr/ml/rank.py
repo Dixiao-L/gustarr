@@ -265,7 +265,18 @@ def run(conn: sqlite3.Connection, cfg: Config, top: int = 20) -> dict:
             cent_sims = xn @ _unit(_vec(centroid["pos"]))
 
         slots = min(top, ARTIST_TOP) if domain == "artist" else top
+        if domain in ("movie", "series"):
+            # Respect the video queue cap here rather than letting apply
+            # mass-expire the overflow later — proposing 80 and trimming
+            # to the cap churned 180 enriched items in one night.
+            open_video = conn.execute(
+                "SELECT COUNT(*) FROM recommendations"
+                " WHERE status='proposed' AND domain IN ('movie','series')"
+            ).fetchone()[0]
+            slots = max(0, min(slots, cfg.autonomy.video_queue_max_pending - open_video))
         slots = min(slots, len(ids))
+        if slots == 0:
+            continue
         picked, explored = _select(scores, xn, slots, lam, explore_frac, seren_idx, cent_sims)
 
         exemplars = (centroid or {}).get("exemplars") or []

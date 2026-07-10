@@ -56,11 +56,23 @@ class FakeArr:
             tvdb = request.url.params["term"].split(":", 1)[1]
             return httpx.Response(
                 200, json=[{"title": f"Series {tvdb}", "tvdbId": int(tvdb), "year": 2005}])
+        if path == "artist/lookup":
+            mbid = request.url.params["term"].split(":", 1)[1]
+            return httpx.Response(
+                200, json=[{"artistName": f"Artist {mbid}", "foreignArtistId": mbid}])
         if path in ("movie", "series", "artist") and request.method == "POST":
             if self.fail_add:
                 status, text = self.fail_add
                 return httpx.Response(status, text=text, headers=self.fail_headers)
             body = json.loads(request.content)
+            # Mirror Lidarr's server-side validation: a bare id without the
+            # lookup resource 400s in production ("'Artist Name' must not
+            # be empty") — the earlier lenient mock hid exactly that bug.
+            if path == "artist" and not body.get("artistName"):
+                return httpx.Response(400, json=[{
+                    "propertyName": "ArtistName",
+                    "errorMessage": "'Artist Name' must not be empty.",
+                    "errorCode": "NotEmptyValidator"}])
             self.posted.append(body)
             return httpx.Response(201, json={"id": 100 + len(self.posted), **body})
         return httpx.Response(404, text=f"unhandled arr {request.method} {path}")
