@@ -127,6 +127,11 @@ in
 
     systemd.services.gustarr-nightly = lib.mkIf cfg.nightly.enable {
       description = "gustarr nightly pipeline (learn + rank)";
+      # A mid-run pipeline can span 30+ min; letting activation restart
+      # it makes switch-to-configuration wait past deploy-rs's confirm
+      # window and roll back healthy deploys. New config applies at the
+      # next timer fire.
+      restartIfChanged = false;
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
       environment = gpuEnv // cfg.extraEnvironment;
@@ -149,6 +154,7 @@ in
 
     systemd.services.gustarr-weekly = lib.mkIf cfg.weekly.enable {
       description = "gustarr weekly pipeline (learn + rank + apply)";
+      restartIfChanged = false;
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
       environment = gpuEnv // cfg.extraEnvironment;
