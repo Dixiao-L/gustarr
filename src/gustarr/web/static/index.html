@@ -3,88 +3,311 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>gustarr</title>
+<meta name="color-scheme" content="light dark">
+<title>Gustarr</title>
 <style>
   :root {
-    --bg: #f5f5f7; --card: #ffffff; --text: #1d1d1f; --muted: #71717a;
-    --line: #e4e4e7; --accent: #e8590c;
+    --bg: #f7f7f8; --surface: #ffffff; --text: #18181b; --muted: #6b7280;
+    --line: #e4e4e7; --line-strong: #d4d4d8;
+    --accent: #0f766e; --accent-hover: #115e59; --on-accent: #ffffff;
+    --accent-text: #0f766e; --accent-soft: rgba(15, 118, 110, .09);
+    --danger: #b91c1c; --danger-soft: rgba(185, 28, 28, .08);
+    --shadow: 0 1px 2px rgba(0, 0, 0, .04), 0 1px 3px rgba(0, 0, 0, .06);
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #141416; --card: #1e1e21; --text: #ececf0; --muted: #9d9da6;
-      --line: #2e2e33; --accent: #ff7a2e;
+      --bg: #101013; --surface: #18181c; --text: #f4f4f5; --muted: #a1a1aa;
+      --line: #26262b; --line-strong: #3f3f46;
+      --accent: #14b8a6; --accent-hover: #2dd4bf; --on-accent: #042f2a;
+      --accent-text: #4fd8c6; --accent-soft: rgba(45, 212, 191, .10);
+      --danger: #f87171; --danger-soft: rgba(248, 113, 113, .10);
+      --shadow: 0 1px 3px rgba(0, 0, 0, .4);
     }
   }
   * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
   body {
-    margin: 0; background: var(--bg); color: var(--text); line-height: 1.5;
-    font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
-      "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC",
-      "Noto Sans JP", sans-serif;
+    margin: 0; background: var(--bg); color: var(--text);
+    font-size: 14px; line-height: 1.5;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans",
+      "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
   }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .icon {
+    width: 16px; height: 16px; flex: none;
+    fill: none; stroke: currentColor; stroke-width: 1.5;
+    stroke-linecap: round; stroke-linejoin: round;
+  }
+
+  /* ── header ─────────────────────────────────────────────────── */
   header {
-    position: sticky; top: 0; z-index: 2; display: flex; align-items: center;
-    gap: 16px; flex-wrap: wrap; padding: 12px 20px;
-    background: var(--card); border-bottom: 1px solid var(--line);
+    position: sticky; top: 0; z-index: 10;
+    background: var(--surface); border-bottom: 1px solid var(--line);
   }
-  header h1 { margin: 0; font-size: 18px; letter-spacing: .02em; }
-  .chips { display: flex; gap: 8px; flex-wrap: wrap; }
+  .bar {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 12px 20px 8px;
+  }
+  .brand { display: inline-flex; align-items: center; gap: 8px; text-decoration: none; }
+  .logo { width: 22px; height: 22px; color: var(--accent); }
+  .logo rect { fill: currentColor; }
+  .wordmark { font-size: 16px; font-weight: 650; letter-spacing: -.01em; color: var(--text); }
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; margin-left: auto; }
   .chip {
-    font-size: 12px; color: var(--muted); background: var(--bg);
-    border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px;
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 12px; color: var(--muted);
+    border: 1px solid var(--line); border-radius: 999px; padding: 3px 10px;
   }
-  .chip b { color: var(--text); font-weight: 600; }
-  main { max-width: 1100px; margin: 0 auto; padding: 20px; }
-  h2.domain {
-    font-size: 13px; text-transform: uppercase; letter-spacing: .08em;
-    color: var(--muted); margin: 24px 0 10px;
+  .chip .icon { width: 13px; height: 13px; }
+  .chip b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+
+  nav { padding: 0 20px; overflow-x: auto; }
+  [role="tablist"] { display: flex; gap: 4px; }
+  .tab {
+    display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+    font: inherit; font-size: 13px; font-weight: 500; color: var(--muted);
+    background: none; border: none; border-bottom: 2px solid transparent;
+    padding: 8px 10px 9px; margin-bottom: -1px; cursor: pointer;
   }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+  .tab .icon { width: 15px; height: 15px; }
+  .tab:hover { color: var(--text); }
+  .tab[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
+  .tab .count {
+    font-size: 11px; font-variant-numeric: tabular-nums; color: var(--muted);
+    background: var(--bg); border: 1px solid var(--line);
+    border-radius: 999px; padding: 0 7px; line-height: 16px;
+  }
+  .tab[aria-selected="true"] .count { color: var(--accent-text); border-color: transparent;
+    background: var(--accent-soft); }
+
+  /* ── layout ─────────────────────────────────────────────────── */
+  main { max-width: 1200px; margin: 0 auto; padding: 24px 20px 48px; }
+  .banner {
+    display: flex; align-items: center; gap: 12px; margin-bottom: 16px;
+    background: var(--danger-soft); border: 1px solid var(--danger);
+    color: var(--danger); border-radius: 10px; padding: 10px 14px; font-size: 13px;
+  }
+  .banner[hidden] { display: none; }
+  .banner button { margin-left: auto; }
+  .grid {
+    display: grid; gap: 16px;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  }
+  .empty {
+    display: flex; flex-direction: column; align-items: center; gap: 12px;
+    padding: 72px 16px; color: var(--muted); text-align: center; font-size: 14px;
+  }
+  .empty .icon { width: 32px; height: 32px; opacity: .6; }
+
+  /* ── cards ──────────────────────────────────────────────────── */
   .card {
-    background: var(--card); border: 1px solid var(--line); border-radius: 12px;
-    padding: 14px 16px; display: flex; flex-direction: column; gap: 8px;
+    display: flex; flex-direction: column; overflow: hidden;
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 10px; box-shadow: var(--shadow);
+    transition: opacity .25s ease, transform .25s ease;
   }
-  .card.busy { opacity: .5; pointer-events: none; }
-  .title { font-weight: 600; font-size: 15px; }
-  .year { color: var(--muted); font-weight: 400; }
-  .genres { font-size: 12px; color: var(--muted); }
-  .score { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
-  .bar { flex: 1; height: 4px; border-radius: 2px; background: var(--line); overflow: hidden; }
-  .bar i { display: block; height: 100%; background: var(--accent); }
-  .actions { display: flex; gap: 8px; margin-top: 2px; }
-  button {
-    font: inherit; font-size: 13px; border-radius: 8px; padding: 5px 14px;
-    cursor: pointer; border: 1px solid var(--line); background: transparent; color: var(--text);
+  .card.leave { opacity: 0; transform: scale(.96) translateY(4px); }
+  .card.busy { opacity: .55; pointer-events: none; }
+  .poster { position: relative; aspect-ratio: 2 / 3; background: var(--bg); }
+  .poster img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .mono {
+    width: 100%; height: 100%; display: flex; align-items: center; justify-content: center;
+    background-size: cover;
   }
-  button:hover { border-color: var(--accent); }
-  button.approve { background: var(--accent); border-color: var(--accent); color: #fff; }
-  button.why { margin-left: auto; border: none; color: var(--muted); padding: 5px 4px; }
-  button.why:hover { color: var(--accent); }
-  .whytext {
-    display: none; font-size: 12.5px; color: var(--muted); white-space: pre-wrap;
-    background: var(--bg); border-radius: 8px; padding: 8px 10px;
+  .mono .initials {
+    font-size: 44px; font-weight: 650; letter-spacing: .02em;
+    color: rgba(255, 255, 255, .92); text-shadow: 0 1px 2px rgba(0, 0, 0, .15);
   }
-  .card.open .whytext { display: block; }
-  .empty { color: var(--muted); text-align: center; padding: 48px 0; }
-  .error { color: var(--accent); font-size: 12px; }
-  .error:empty { display: none; }
+  .mono .wm {
+    position: absolute; right: 10px; bottom: 10px; width: 44px; height: 44px;
+    color: #ffffff; opacity: .18; stroke-width: 1.25;
+  }
+  .body { display: flex; flex-direction: column; gap: 8px; padding: 12px; flex: 1; }
+  .title { margin: 0; font-size: 14px; font-weight: 600; line-height: 1.35; }
+  .meta {
+    margin: 0; font-size: 13px; color: var(--muted);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .score { display: flex; align-items: center; gap: 8px; }
+  .score .track {
+    flex: 1; height: 4px; border-radius: 2px; background: var(--line); overflow: hidden;
+  }
+  .score .fill { display: block; height: 100%; border-radius: 2px; background: var(--accent); }
+  .score .num {
+    font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums;
+    min-width: 2.6em; text-align: right;
+  }
+  .badges { display: flex; gap: 6px; flex-wrap: wrap; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 4px;
+    font-size: 12px; border-radius: 999px; padding: 2px 8px;
+    color: var(--accent-text); background: var(--accent-soft);
+  }
+  .badge .icon { width: 12px; height: 12px; }
+  .badge.bad { color: var(--danger); background: var(--danger-soft); }
+  .badge.dim { color: var(--muted); background: var(--bg); border: 1px solid var(--line); }
+
+  .why {
+    background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+    padding: 8px 10px; font-size: 12.5px; display: flex; flex-direction: column; gap: 6px;
+  }
+  .why[hidden] { display: none; }
+  .overview {
+    margin: 0; color: var(--muted); display: -webkit-box; -webkit-line-clamp: 4;
+    -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .nbs, .tags { display: flex; gap: 4px; flex-wrap: wrap; }
+  .nb {
+    display: inline-flex; align-items: baseline; gap: 4px; font-size: 12px;
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 999px; padding: 2px 8px;
+  }
+  .nb .sim { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .tag {
+    font-size: 11px; color: var(--muted); background: var(--surface);
+    border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px;
+    font-family: ui-monospace, monospace;
+  }
+  .seeds { margin: 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+  .whytext { margin: 0; color: var(--muted); white-space: pre-wrap; }
+
+  .actions { display: flex; gap: 8px; margin-top: auto; }
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    font: inherit; font-size: 13px; font-weight: 500;
+    color: var(--text); background: var(--surface);
+    border: 1px solid var(--line-strong); border-radius: 8px;
+    padding: 5px 12px; cursor: pointer; flex: 1;
+  }
+  .btn .icon { width: 15px; height: 15px; }
+  .btn:hover:not(:disabled) { background: var(--bg); }
+  .btn.approve { color: var(--on-accent); background: var(--accent); border-color: var(--accent); }
+  .btn.approve:hover:not(:disabled) { background: var(--accent-hover);
+    border-color: var(--accent-hover); }
+  .btn:disabled { opacity: .45; cursor: default; }
+  .iconbtn {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 30px; flex: none; color: var(--muted); background: none;
+    border: 1px solid transparent; border-radius: 8px; padding: 0; cursor: pointer;
+  }
+  .iconbtn:hover { color: var(--text); background: var(--bg); }
+  .iconbtn[aria-expanded="true"] { color: var(--accent-text); background: var(--accent-soft); }
+
+  /* ── skeletons / toasts ─────────────────────────────────────── */
+  .skeleton .poster, .skeleton .line { animation: pulse 1.4s ease-in-out infinite; }
+  .skeleton .line { height: 12px; border-radius: 4px; background: var(--line); }
+  .skeleton .w80 { width: 80%; } .skeleton .w60 { width: 60%; } .skeleton .w40 { width: 40%; }
+  @keyframes pulse { 50% { opacity: .45; } }
+
+  #toasts {
+    position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
+    display: flex; flex-direction: column; gap: 8px; z-index: 20; align-items: center;
+  }
+  .toast {
+    display: flex; align-items: center; gap: 8px; font-size: 13px;
+    background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
+    box-shadow: var(--shadow); padding: 8px 14px; animation: rise .2s ease;
+  }
+  .toast .icon { width: 15px; height: 15px; color: var(--accent-text); }
+  .toast.error .icon { color: var(--danger); }
+  @keyframes rise { from { opacity: 0; transform: translateY(6px); } }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+  }
 </style>
 </head>
 <body>
+
+<svg hidden aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></symbol>
+    <symbol id="i-info" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="8.75"/><path d="M12 11.25v5M12 8.25v.01"/>
+    </symbol>
+    <symbol id="i-compass" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="8.75"/><path d="M15 9l-1.8 4.2L9 15l1.8-4.2z"/>
+    </symbol>
+    <symbol id="i-sparkle" viewBox="0 0 24 24">
+      <path d="M12 4.5l1.9 5.6 5.6 1.9-5.6 1.9-1.9 5.6-1.9-5.6-5.6-1.9 5.6-1.9z"/>
+    </symbol>
+    <symbol id="i-film" viewBox="0 0 24 24">
+      <rect x="3.5" y="5.5" width="17" height="13" rx="2"/>
+      <path d="M7.5 5.5v13M16.5 5.5v13M3.5 9.5h4M3.5 14.5h4M16.5 9.5h4M16.5 14.5h4"/>
+    </symbol>
+    <symbol id="i-tv" viewBox="0 0 24 24">
+      <rect x="3.5" y="7" width="17" height="11.5" rx="2"/><path d="M8.5 3.5L12 7l3.5-3.5"/>
+    </symbol>
+    <symbol id="i-music" viewBox="0 0 24 24">
+      <path d="M9 17.5V6.8l9-2v10.7"/>
+      <circle cx="6.75" cy="17.5" r="2.25"/><circle cx="15.75" cy="15.5" r="2.25"/>
+    </symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="8.75"/><path d="M12 7.5V12l3 2"/>
+    </symbol>
+    <symbol id="i-chart" viewBox="0 0 24 24">
+      <path d="M4.5 4.5v15h15M8.5 15.5v-4M12.5 15.5v-7M16.5 15.5v-2.5"/>
+    </symbol>
+  </defs>
+</svg>
+
 <header>
-  <h1>gustarr</h1>
-  <div id="stats" class="chips"></div>
+  <div class="bar">
+    <a class="brand" href="/">
+      <svg class="logo" viewBox="0 0 24 24" aria-hidden="true">
+        <rect x="4" y="13" width="4" height="7" rx="2" opacity=".4"/>
+        <rect x="10" y="9" width="4" height="11" rx="2" opacity=".7"/>
+        <rect x="16" y="4" width="4" height="16" rx="2"/>
+      </svg>
+      <span class="wordmark">Gustarr</span>
+    </a>
+    <div id="chips" class="chips"></div>
+  </div>
+  <nav><div id="tabs" role="tablist" aria-label="Queue filters"></div></nav>
 </header>
+
 <main>
-  <div id="queue"><p class="empty">Loading…</p></div>
+  <div id="banner" class="banner" role="alert" hidden>
+    <span id="banner-text"></span>
+    <button id="retry" class="btn">Retry</button>
+  </div>
+  <div id="panel" role="tabpanel" aria-labelledby="tab-all"></div>
 </main>
+
+<div id="toasts" aria-live="polite"></div>
+
 <script>
 (function () {
   'use strict';
-  const DOMAIN_ORDER = ['movie', 'series', 'artist', 'album', 'track'];
+
+  const TMDB = 'https://image.tmdb.org/t/p/w342';
+  const MUSIC = new Set(['artist', 'album', 'track']);
+  const TABS = [
+    { id: 'all', label: 'All' },
+    { id: 'movie', label: 'Movies', icon: 'film' },
+    { id: 'series', label: 'Series', icon: 'tv' },
+    { id: 'music', label: 'Music', icon: 'music' },
+    { id: 'history', label: 'History', icon: 'clock' },
+  ];
+  const STATUS_LABEL = {
+    approved: 'Approved', rejected: 'Rejected', added: 'Added',
+    auto_added: 'Auto-Added', expired: 'Expired', failed: 'Failed',
+  };
+  const state = { rows: [], stats: null, tab: 'all', loaded: false };
+  const $ = id => document.getElementById(id);
 
   const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g,
-    c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+    c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const icon = name =>
+    `<svg class="icon" aria-hidden="true"><use href="#i-${name}"/></svg>`;
+  const clamp01 = n => Math.max(0, Math.min(1, Number(n) || 0));
+  const simFmt = n => {
+    const t = Number(n).toFixed(2);
+    return t.startsWith('0.') ? t.slice(1) : t;
+  };
+  const reducedMotion = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
 
   async function getJSON(url) {
     const r = await fetch(url);
@@ -98,122 +321,313 @@
     return Array.isArray(g) ? g.filter(Boolean) : [];
   }
 
-  function card(r) {
+  function hueOf(s) {
+    let h = 0;
+    for (const c of String(s)) h = (h * 31 + c.codePointAt(0)) >>> 0;
+    return h % 360;
+  }
+
+  function initialsOf(title) {
+    const words = String(title || '').trim().split(/\s+/).filter(Boolean);
+    if (!words.length) return '?';
+    const take = w => { const m = w.match(/[\p{L}\p{N}]/u); return m ? m[0] : w[0]; };
+    return words.slice(0, 2).map(take).join('').toUpperCase();
+  }
+
+  const domainIcon = d => d === 'movie' ? 'film' : d === 'series' ? 'tv' : 'music';
+
+  /* ── header chips + tab counts ─────────────────────────────── */
+
+  function chip(ic, label, value) {
+    return `<span class="chip">${icon(ic)}${esc(label)} <b>${esc(value)}</b></span>`;
+  }
+
+  function updateCounts() {
+    const open = state.rows.filter(r => r.status === 'proposed');
+    const acted = state.rows.filter(r => r.status !== 'proposed');
+    const weekAgo = Date.now() - 7 * 864e5;
+    const approvedWeek = acted.filter(r =>
+      (r.status === 'approved' || r.status === 'added') &&
+      r.acted_at && Date.parse(r.acted_at) >= weekAgo).length;
+    const parts = [chip('clock', 'Open queue', open.length),
+                   chip('check', 'Approved this week', approvedWeek)];
+    const div = state.stats && state.stats.diversity;
+    if (div && typeof div.genre_entropy_recs === 'number')
+      parts.push(chip('chart', 'Genre entropy', div.genre_entropy_recs.toFixed(2)));
+    $('chips').innerHTML = parts.join('');
+
+    const counts = {
+      all: open.length,
+      movie: open.filter(r => r.domain === 'movie').length,
+      series: open.filter(r => r.domain === 'series').length,
+      music: open.filter(r => MUSIC.has(r.domain)).length,
+      history: acted.length,
+    };
+    for (const t of TABS) {
+      const pill = $('tab-' + t.id).querySelector('.count');
+      pill.textContent = counts[t.id];
+      pill.hidden = false;
+    }
+  }
+
+  /* ── tabs ──────────────────────────────────────────────────── */
+
+  function renderTabs() {
+    $('tabs').innerHTML = TABS.map(t =>
+      `<button class="tab" role="tab" id="tab-${t.id}" data-tab="${t.id}"
+        aria-selected="${t.id === state.tab}" tabindex="${t.id === state.tab ? 0 : -1}">
+        ${t.icon ? icon(t.icon) : ''}<span>${t.label}</span><span class="count" hidden></span>
+      </button>`).join('');
+    $('tabs').addEventListener('click', e => {
+      const b = e.target.closest('[role="tab"]');
+      if (b) selectTab(b.dataset.tab);
+    });
+    $('tabs').addEventListener('keydown', e => {
+      const step = { ArrowRight: 1, ArrowLeft: -1, Home: 0, End: 0 };
+      if (!(e.key in step)) return;
+      e.preventDefault();
+      const ids = TABS.map(t => t.id);
+      let i = ids.indexOf(state.tab);
+      if (e.key === 'Home') i = 0;
+      else if (e.key === 'End') i = ids.length - 1;
+      else i = (i + step[e.key] + ids.length) % ids.length;
+      selectTab(ids[i]);
+      $('tab-' + ids[i]).focus();
+    });
+  }
+
+  function selectTab(id) {
+    state.tab = id;
+    for (const t of TABS) {
+      const b = $('tab-' + t.id);
+      b.setAttribute('aria-selected', String(t.id === id));
+      b.tabIndex = t.id === id ? 0 : -1;
+    }
+    $('panel').setAttribute('aria-labelledby', 'tab-' + id);
+    if (state.loaded) renderPanel();
+  }
+
+  /* ── cards ─────────────────────────────────────────────────── */
+
+  function monogramHTML(r) {
+    const h = hueOf(r.title || r.item_id);
+    const bg = `linear-gradient(160deg, hsl(${h} 40% 48%), hsl(${(h + 42) % 360} 45% 30%))`;
+    return `<div class="mono" style="background-image:${bg}">
+      <span class="initials">${esc(initialsOf(r.title || r.item_id))}</span>
+      <svg class="icon wm" aria-hidden="true"><use href="#i-${domainIcon(r.domain)}"/></svg>
+    </div>`;
+  }
+
+  function posterHTML(r) {
+    if (r.poster_path && r.domain !== 'artist')
+      return `<div class="poster"><img loading="lazy" decoding="async" alt=""
+        src="${TMDB}${esc(r.poster_path)}"></div>`;
+    return `<div class="poster">${monogramHTML(r)}</div>`;
+  }
+
+  function badgesHTML(r, history) {
+    const w = r.why || {};
+    const b = [];
+    if (w.exploration) b.push(`<span class="badge">${icon('compass')}Exploration</span>`);
+    if (w.serendipity) b.push(`<span class="badge">${icon('sparkle')}Serendipity</span>`);
+    if (history) {
+      const cls = r.status === 'rejected' ? 'bad'
+        : (r.status === 'expired' || r.status === 'failed') ? 'dim' : '';
+      b.push(`<span class="badge ${cls}">${esc(STATUS_LABEL[r.status] || r.status)}</span>`);
+      if (r.acted_at)
+        b.push(`<span class="badge dim">${icon('clock')}${esc(String(r.acted_at).slice(0, 10))}
+          </span>`);
+    }
+    return b.length ? `<div class="badges">${b.join('')}</div>` : '';
+  }
+
+  // Structured "why" from the row when neighbor titles are resolved; null
+  // means the /why text endpoint (which resolves titles server-side) is needed.
+  function structuredWhy(r) {
+    const w = r.why || {};
+    const nbs = w.neighbors || w.neighbours || [];
+    const resolved = nbs.length > 0 &&
+      nbs.every(n => n && !Array.isArray(n) && n.title);
+    if (nbs.length && !resolved) return null;
+    const sources = w.sources || [];
+    const seeds = w.seeds || [];
+    if (!resolved && !sources.length && !seeds.length) return null;
+    const parts = [];
+    if (resolved) parts.push('<div class="nbs">' + nbs.map(n =>
+      `<span class="nb">Because you liked ${esc(n.title)}${typeof n.sim === 'number'
+        ? ` <span class="sim">· ${simFmt(n.sim)}</span>` : ''}</span>`).join('') + '</div>');
+    if (sources.length) parts.push('<div class="tags">' +
+      sources.map(s => `<span class="tag">${esc(s)}</span>`).join('') + '</div>');
+    if (seeds.length)
+      parts.push(`<p class="seeds">Seeded by ${esc(seeds.join(', '))}</p>`);
+    return parts.join('');
+  }
+
+  async function toggleWhy(el, r) {
+    const box = el.querySelector('.why');
+    const btn = el.querySelector('.whybtn');
+    const show = box.hidden;
+    box.hidden = !show;
+    btn.setAttribute('aria-expanded', String(show));
+    if (!show || box.dataset.loaded) return;
+    box.dataset.loaded = '1';
+    const head = r.overview ? `<p class="overview">${esc(r.overview)}</p>` : '';
+    const local = structuredWhy(r);
+    if (local !== null) { box.innerHTML = head + local; return; }
+    box.innerHTML = head + '<p class="whytext">Loading…</p>';
+    const out = box.querySelector('.whytext');
+    try { out.textContent = (await getJSON(`/api/recs/${r.id}/why`)).text; }
+    catch (e) { out.textContent = 'Could not load explanation: ' + (e.message || e); }
+  }
+
+  function cardEl(r, history) {
     const el = document.createElement('article');
     el.className = 'card';
-    el.id = 'rec-' + r.id;
     const score = Number(r.score) || 0;
-    const pct = Math.round(100 * Math.max(0, Math.min(1, score)));
     const genres = genresOf(r);
-    el.innerHTML =
-      '<div class="title">' + esc(r.title || r.item_id) +
-      (r.year ? ' <span class="year">(' + esc(r.year) + ')</span>' : '') + '</div>' +
-      (genres.length ? '<div class="genres">' + esc(genres.join(' · ')) + '</div>' : '') +
-      '<div class="score"><span class="bar"><i style="width:' + pct + '%"></i></span>' +
-      '<span>' + score.toFixed(2) + '</span></div>' +
-      '<div class="whytext"></div>' +
-      '<div class="actions">' +
-      '<button class="approve">Approve</button>' +
-      '<button class="reject">Reject</button>' +
-      '<button class="why">why?</button>' +
-      '</div>' +
-      '<div class="error"></div>';
-    el.querySelector('.approve').addEventListener('click', () => act(el, r.id, 'approve'));
-    el.querySelector('.reject').addEventListener('click', () => act(el, r.id, 'reject'));
-    el.querySelector('.why').addEventListener('click', () => toggleWhy(el, r.id));
+    const meta = [r.year, genres.join(', ')].filter(Boolean).join(' · ');
+    el.innerHTML = `
+      ${posterHTML(r)}
+      <div class="body">
+        <h3 class="title">${esc(r.title || r.item_id)}</h3>
+        ${meta ? `<p class="meta" title="${esc(meta)}">${esc(meta)}</p>` : ''}
+        <div class="score">
+          <span class="track"><span class="fill"
+            style="width:${Math.round(100 * clamp01(score))}%"></span></span>
+          <span class="num">${score.toFixed(2)}</span>
+        </div>
+        ${badgesHTML(r, history)}
+        <div class="why" hidden></div>
+        <div class="actions">
+          <button class="btn approve" ${history ? 'disabled' : ''}>
+            ${icon('check')}Approve</button>
+          <button class="btn reject" ${history ? 'disabled' : ''}>
+            ${icon('x')}Reject</button>
+          <button class="iconbtn whybtn" aria-expanded="false"
+            aria-label="Why this recommendation">${icon('info')}</button>
+        </div>
+      </div>`;
+    const img = el.querySelector('.poster img');
+    if (img) img.addEventListener('error', () => {
+      img.closest('.poster').innerHTML = monogramHTML(r);
+    }, { once: true });
+    if (!history) {
+      el.querySelector('.approve').addEventListener('click', () => act(el, r, 'approve'));
+      el.querySelector('.reject').addEventListener('click', () => act(el, r, 'reject'));
+    }
+    el.querySelector('.whybtn').addEventListener('click', () => toggleWhy(el, r));
     return el;
   }
 
-  async function act(el, id, action) {
-    el.classList.add('busy');
-    el.querySelector('.error').textContent = '';
-    try {
-      const r = await fetch('/api/recs/' + id + '/' + action, {method: 'POST'});
-      if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + await r.text());
-      const section = el.closest('section');
+  /* ── actions ───────────────────────────────────────────────── */
+
+  function toast(msg, kind) {
+    const t = document.createElement('div');
+    t.className = 'toast' + (kind === 'error' ? ' error' : '');
+    t.innerHTML = icon(kind === 'error' ? 'x' : 'check');
+    t.appendChild(document.createTextNode(msg));
+    $('toasts').appendChild(t);
+    setTimeout(() => t.remove(), 4000);
+  }
+
+  function removeCard(el) {
+    let gone = false;
+    const grid = el.parentElement;
+    const done = () => {
+      if (gone) return;
+      gone = true;
       el.remove();
-      if (section) {
-        const left = section.querySelectorAll('.card').length;
-        if (!left) section.remove();
-        else section.querySelector('h2').textContent = section.dataset.domain + ' · ' + left;
+      if (grid && !grid.querySelector('.card')) renderPanel();
+    };
+    if (reducedMotion()) { done(); return; }
+    el.classList.add('leave');
+    el.addEventListener('transitionend', done, { once: true });
+    setTimeout(done, 350);
+  }
+
+  async function act(el, r, action) {
+    el.classList.add('busy');
+    try {
+      const resp = await fetch(`/api/recs/${r.id}/${action}`, { method: 'POST' });
+      if (!resp.ok) {
+        let detail = '';
+        try { detail = (await resp.json()).detail || ''; } catch (e) { /* non-json body */ }
+        throw new Error(detail || 'HTTP ' + resp.status);
       }
-      if (!document.querySelector('#queue .card')) showEmpty();
-      loadStats();
+      r.status = action === 'approve' ? 'approved' : 'rejected';
+      r.acted_at = new Date().toISOString().slice(0, 19) + 'Z';
+      toast(`${action === 'approve' ? 'Approved' : 'Rejected'} · ${r.title || r.item_id}`);
+      removeCard(el);
+      updateCounts();
     } catch (e) {
       el.classList.remove('busy');
-      el.querySelector('.error').textContent = String(e.message || e);
+      toast(`Could not ${action} · ${e.message || e}`, 'error');
     }
   }
 
-  async function toggleWhy(el, id) {
-    if (el.classList.contains('open')) { el.classList.remove('open'); return; }
-    el.classList.add('open');
-    const box = el.querySelector('.whytext');
-    if (!box.textContent) {
-      box.textContent = '…';
-      try { box.textContent = (await getJSON('/api/recs/' + id + '/why')).text; }
-      catch (e) { box.textContent = 'failed to load: ' + (e.message || e); }
-    }
+  /* ── panel ─────────────────────────────────────────────────── */
+
+  function rowsFor(tab) {
+    if (tab === 'history')
+      return state.rows.filter(r => r.status !== 'proposed').slice().sort((a, b) =>
+        String(b.acted_at || b.ts || '').localeCompare(String(a.acted_at || a.ts || '')));
+    const open = state.rows.filter(r => r.status === 'proposed');
+    if (tab === 'all') return open;
+    if (tab === 'music') return open.filter(r => MUSIC.has(r.domain));
+    return open.filter(r => r.domain === tab);
   }
 
-  function chip(label, value) {
-    return '<span class="chip">' + esc(label) + ' <b>' + esc(value) + '</b></span>';
-  }
-
-  async function loadStats() {
-    try {
-      const s = await getJSON('/api/stats');
-      const parts = [];
-      const q = s.recs_by_status || s.queue || {};
-      for (const k of Object.keys(q)) if (typeof q[k] === 'number') parts.push(chip(k, q[k]));
-      const t = s.tables || s;
-      for (const k of ['items', 'events', 'candidates'])
-        if (typeof t[k] === 'number') parts.push(chip(k, t[k]));
-      document.getElementById('stats').innerHTML = parts.join('');
-    } catch (e) { /* the stats strip is decorative — never block the queue on it */ }
-  }
-
-  function showEmpty() {
-    document.getElementById('queue').innerHTML =
-      '<p class="empty">Queue is empty — nothing awaiting review.</p>';
-  }
-
-  async function loadRecs() {
-    const root = document.getElementById('queue');
-    let recs;
-    try { recs = await getJSON('/api/recs?status=proposed'); }
-    catch (e) {
-      root.innerHTML = '<p class="empty">Failed to load queue: ' + esc(e.message || e) + '</p>';
+  function renderPanel() {
+    const panel = $('panel');
+    const rows = rowsFor(state.tab);
+    if (!rows.length) {
+      const history = state.tab === 'history';
+      panel.innerHTML = `<div class="empty">
+        ${icon(history ? 'clock' : 'sparkle')}
+        <p>${history ? 'No history yet — approvals and rejections will land here.'
+                     : 'No open proposals — the nightly run refills this queue.'}</p>
+      </div>`;
       return;
     }
-    if (!recs.length) { showEmpty(); return; }
-    const byDomain = new Map();
-    for (const r of recs) {
-      if (!byDomain.has(r.domain)) byDomain.set(r.domain, []);
-      byDomain.get(r.domain).push(r);
-    }
-    const domains = [...byDomain.keys()].sort((a, b) => {
-      const ia = DOMAIN_ORDER.indexOf(a), ib = DOMAIN_ORDER.indexOf(b);
-      return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
-    });
-    root.innerHTML = '';
-    for (const d of domains) {
-      const section = document.createElement('section');
-      section.dataset.domain = d;
-      const h = document.createElement('h2');
-      h.className = 'domain';
-      h.textContent = d + ' · ' + byDomain.get(d).length;
-      const grid = document.createElement('div');
-      grid.className = 'grid';
-      for (const r of byDomain.get(d)) grid.appendChild(card(r));
-      section.appendChild(h);
-      section.appendChild(grid);
-      root.appendChild(section);
+    const grid = document.createElement('div');
+    grid.className = 'grid';
+    for (const r of rows) grid.appendChild(cardEl(r, state.tab === 'history'));
+    panel.replaceChildren(grid);
+  }
+
+  function showSkeletons() {
+    const one = `<div class="card skeleton"><div class="poster"></div>
+      <div class="body"><div class="line w80"></div><div class="line w60"></div>
+      <div class="line w40"></div></div></div>`;
+    $('panel').innerHTML = `<div class="grid">${one.repeat(8)}</div>`;
+  }
+
+  /* ── boot ──────────────────────────────────────────────────── */
+
+  async function load() {
+    $('banner').hidden = true;
+    showSkeletons();
+    try {
+      const [rows, stats] = await Promise.all([
+        getJSON('/api/recs?status=all'),
+        getJSON('/api/stats').catch(() => null), // chips are decorative
+      ]);
+      state.rows = rows;
+      state.stats = stats;
+      state.loaded = true;
+      updateCounts();
+      renderPanel();
+    } catch (e) {
+      $('panel').innerHTML = '';
+      $('banner-text').textContent =
+        'Could not reach the Gustarr API — ' + (e.message || e);
+      $('banner').hidden = false;
     }
   }
 
-  loadStats();
-  loadRecs();
+  renderTabs();
+  $('retry').addEventListener('click', load);
+  load();
 })();
 </script>
 </body>

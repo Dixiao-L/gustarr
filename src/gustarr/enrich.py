@@ -138,6 +138,8 @@ def _movie(conn, cfg, item_id, ids_map, eff, stats) -> None:
         "vote_average": data.get("vote_average"),
         "runtime": data.get("runtime"),
     }
+    if data.get("poster_path"):
+        meta["poster_path"] = data["poster_path"]
     db.upsert_item(conn, item_id, "movie", title=data.get("title"),
                    year=_year(data.get("release_date")), ids={**ids_map, "tmdb": tmdb_id},
                    meta=meta, enriched=True)
@@ -185,6 +187,8 @@ def _series(conn, cfg, item_id, ids_map, eff, stats) -> None:
         "popularity": data.get("popularity"),
         "number_of_seasons": data.get("number_of_seasons"),
     }
+    if data.get("poster_path"):
+        meta["poster_path"] = data["poster_path"]
     if not tvdb_id:
         meta["no_tvdb"] = True  # un-addable in Sonarr; apply reports why
     db.upsert_item(conn, item_id, "series", title=data.get("name"),

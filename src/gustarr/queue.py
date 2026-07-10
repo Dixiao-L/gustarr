@@ -46,6 +46,7 @@ def list_recs(
     rows: list[dict[str, Any]] = []
     for r in conn.execute(sql, params):
         meta = json.loads(r["meta"])
+        overview = meta.get("overview")
         rows.append({
             "id": r["id"],
             "domain": r["domain"],
@@ -54,6 +55,8 @@ def list_recs(
             "year": r["year"],
             "ids": json.loads(r["ids"]),
             "genres": meta.get("genres") or [],
+            "poster_path": meta.get("poster_path"),
+            "overview": overview[:220] if overview else None,
             "score": r["score"],
             "why": json.loads(r["why"] or "{}"),
             "status": r["status"],

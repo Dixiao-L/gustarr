@@ -198,7 +198,9 @@ def _tmdb_result(domain: str, r: dict[str, Any]) -> tuple | None:
     if r.get("popularity") is not None:
         meta["popularity"] = r["popularity"]
     if r.get("overview"):
-        meta["overview"] = r["overview"]
+        meta["overview"] = r["overview"][:300]
+    if r.get("poster_path"):
+        meta["poster_path"] = r["poster_path"]
     item_id = ids.make(domain, "tmdb", str(tid))
     return item_id, title, year, {"tmdb": tid}, meta, r.get("vote_average")
 
