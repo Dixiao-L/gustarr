@@ -249,7 +249,13 @@ def run(ctx: Ctx, recipe: str, dry_run: bool) -> None:
 
     stats = run_recipe(ctx.conn, ctx.cfg, recipe, dry_run=dry_run)
     click.echo(json.dumps(stats))
-    if stats.get("errors"):
+    # Partial stage errors are operational normal (an unconfigured or
+    # flaky source shouldn't flip the systemd unit red nightly — that
+    # noise once made deploy-rs roll back a healthy deploy). They stay
+    # visible in the stats JSON, journal and telegraf; the unit fails
+    # only when nothing ran to completion.
+    executed = [k for k, v in stats.items() if k != "errors" and v != "skipped"]
+    if stats.get("errors") and len(stats["errors"]) == len(executed):
         sys.exit(1)
 
 
