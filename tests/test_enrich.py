@@ -23,6 +23,7 @@ MOVIE_DETAIL = {
     "popularity": 81.5,
     "vote_average": 8.2,
     "runtime": 136,
+    "poster_path": "/matrix.jpg",
 }
 
 SERIES_DETAIL = {
@@ -36,6 +37,7 @@ SERIES_DETAIL = {
     "original_language": "en",
     "popularity": 300.0,
     "number_of_seasons": 5,
+    "poster_path": "/bb.jpg",
 }
 
 MB_ARTIST = {
@@ -121,6 +123,7 @@ def test_movie_tmdb_detail(conn, tmp_path, monkeypatch):
     assert meta["keywords"] == ["cyberpunk", "dystopia"]
     assert meta["runtime"] == 136
     assert meta["original_language"] == "en"
+    assert meta["poster_path"] == "/matrix.jpg"
 
 
 def test_movie_imdb_find_merges_and_repoints_events(conn, tmp_path, monkeypatch):
@@ -167,6 +170,7 @@ def test_series_tvdb_find_then_detail(conn, tmp_path, monkeypatch):
     meta = json.loads(row["meta"])
     assert meta["keywords"] == ["drug cartel"]
     assert meta["number_of_seasons"] == 5
+    assert meta["poster_path"] == "/bb.jpg"
     assert "no_tvdb" not in meta
 
 
@@ -193,6 +197,19 @@ def test_series_tmdb_keyed_resolves_tvdb_and_merges(conn, tmp_path, monkeypatch)
     id_map = json.loads(row["ids"])
     assert id_map["tvdb"] == 81189 and id_map["tmdb"] == 1396
     assert "external_ids" in api.calls[0][2]["append_to_response"]
+
+
+def test_null_poster_path_never_stored(conn, tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path, tmdb={"api_key": "k"})
+    iid = ids.make("movie", "tmdb", "603")
+    db.upsert_item(conn, iid, "movie", ids={"tmdb": 603})
+    mock_api(monkeypatch, [("/movie/603", {**MOVIE_DETAIL, "poster_path": None})])
+
+    stats = run(conn, cfg)
+
+    assert stats["enriched"] == 1
+    meta = json.loads(conn.execute("SELECT meta FROM items WHERE id=?", (iid,)).fetchone()["meta"])
+    assert "poster_path" not in meta
 
 
 def test_series_without_tvdb_mapping_enriched_under_tmdb(conn, tmp_path, monkeypatch):

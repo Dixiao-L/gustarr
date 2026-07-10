@@ -34,9 +34,11 @@ def cfg(tmp_path):
 
 
 def add_rec(conn, item_id, domain="movie", title=None, year=None, score=0.5,
-            why=None, status="proposed", genres=None):
-    db.upsert_item(conn, item_id, domain, title, year,
-                   meta={"genres": genres} if genres else None)
+            why=None, status="proposed", genres=None, meta=None):
+    item_meta = dict(meta or {})
+    if genres:
+        item_meta["genres"] = genres
+    db.upsert_item(conn, item_id, domain, title, year, meta=item_meta or None)
     cur = conn.execute(
         "INSERT INTO recommendations (run_id, ts, domain, item_id, score, why, status)"
         " VALUES ('r1', ?, ?, ?, ?, ?, ?)",
@@ -59,6 +61,19 @@ def test_list_recs_default_open_queue_score_desc(conn):
     assert rows[0]["why"] == {"sources": ["tmdb_similar"]}  # parsed, not a json string
     assert rows[1]["genres"] == ["Drama"]
     assert all(r["status"] == "proposed" for r in rows)
+
+
+def test_list_recs_surfaces_poster_and_truncated_overview(conn):
+    rich = add_rec(conn, "movie:tmdb:10", title="Rich", score=0.9,
+                   meta={"poster_path": "/p10.jpg", "overview": "o" * 500})
+    bare = add_rec(conn, "movie:tmdb:11", title="Bare", score=0.1)
+
+    rows = {r["id"]: r for r in queue.list_recs(conn)}
+    assert rows[rich]["poster_path"] == "/p10.jpg"
+    assert rows[rich]["overview"] == "o" * 220
+    # pre-poster items must list cleanly, not KeyError
+    assert rows[bare]["poster_path"] is None
+    assert rows[bare]["overview"] is None
 
 
 def test_list_recs_filters(conn):

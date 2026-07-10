@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from gustarr import config as C
 from gustarr import db, http, ids
-from gustarr.candidates import _excluded_ids, run
+from gustarr.candidates import _excluded_ids, _tmdb_result, run
 
 TMDB = "https://api.themoviedb.org/3"
 
@@ -75,7 +76,8 @@ def seed_movie(conn, tmdb_id, title, genres=None, ts=None, year=None):
 
 def movie_result(tmdb_id, vote=7.0):
     return {"id": tmdb_id, "title": f"M{tmdb_id}", "release_date": "2021-06-01",
-            "vote_average": vote, "popularity": 12.3, "overview": f"about {tmdb_id}"}
+            "vote_average": vote, "popularity": 12.3, "overview": f"about {tmdb_id}",
+            "poster_path": f"/p{tmdb_id}.jpg"}
 
 
 def candidate_rows(conn):
@@ -125,7 +127,10 @@ def test_movie_similar_discover_and_exclusions(conn, cfg, router):
 
     item = conn.execute("SELECT * FROM items WHERE id=?", (m200,)).fetchone()
     assert item["title"] == "M200" and item["year"] == 2021
-    assert '"popularity"' in item["meta"] and '"overview"' in item["meta"]
+    meta = json.loads(item["meta"])
+    assert meta["popularity"] == 12.3
+    assert meta["overview"] == "about 200"
+    assert meta["poster_path"] == "/p200.jpg"
 
     bubble = [p for u, p in router.calls
               if "/discover/movie" in u and p["sort_by"] == "popularity.desc"]
@@ -239,6 +244,20 @@ def test_artist_lastfm_similar(conn, cfg, router):
     assert stats["skipped"] == 1
 
 
+def test_tmdb_result_truncates_overview_and_skips_missing_art():
+    full = _tmdb_result("movie", {"id": 42, "title": "M42", "release_date": "2020-01-01",
+                                  "overview": "x" * 400, "poster_path": "/p42.jpg",
+                                  "vote_average": 7.0})
+    assert full is not None
+    meta = full[4]
+    assert meta["overview"] == "x" * 300  # capped so items.meta stays lean
+    assert meta["poster_path"] == "/p42.jpg"
+
+    bare = _tmdb_result("movie", {"id": 43, "title": "M43", "poster_path": None})
+    assert bare is not None
+    assert "poster_path" not in bare[4] and "overview" not in bare[4]
+
+
 def test_series_seeds_resolve_tmdb_id(conn, cfg, router):
     s1 = ids.make("series", "tvdb", "81189")
     db.upsert_item(conn, s1, "series", title="Breaking Bad",
@@ -251,7 +270,8 @@ def test_series_seeds_resolve_tmdb_id(conn, cfg, router):
 
     router.route("/tv/1396/recommendations", {"results": [
         {"id": 60059, "name": "Better Call Saul", "first_air_date": "2015-02-08",
-         "vote_average": 8.6, "popularity": 45.0, "overview": "spinoff"}]})
+         "vote_average": 8.6, "popularity": 45.0, "overview": "spinoff",
+         "poster_path": "/bcs.jpg"}]})
     router.route("/genre/tv/list", {"genres": [{"id": 18, "name": "Drama"}]})
 
     def discover(params):
@@ -271,6 +291,8 @@ def test_series_seeds_resolve_tmdb_id(conn, cfg, router):
     assert (ids.make("series", "tmdb", "1399"), "tmdb_discover") in rows
     item = conn.execute("SELECT * FROM items WHERE id=?", (bcs,)).fetchone()
     assert item["title"] == "Better Call Saul" and item["year"] == 2015
+    meta = json.loads(item["meta"])
+    assert meta["poster_path"] == "/bcs.jpg" and meta["overview"] == "spinoff"
     assert not any("/tv/999" in u for u, _ in router.calls)
     # tv decade probe uses first_air_date; no positive years -> tie
     # resolves to the earliest decade

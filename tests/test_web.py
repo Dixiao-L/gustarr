@@ -127,8 +127,14 @@ def test_index_served(web):
     resp = client.get("/")
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/html")
-    assert "gustarr" in resp.text
+    assert "Gustarr" in resp.text
     assert "/api/recs" in resp.text
+    for symbol in ("i-check", "i-x", "i-info", "i-compass", "i-sparkle",
+                   "i-film", "i-tv", "i-music", "i-clock", "i-chart"):
+        assert f'id="{symbol}"' in resp.text
+    for label in ("All", "Movies", "Series", "Music", "History"):
+        assert label in resp.text
+    assert "aria-selected" in resp.text
 
 
 def test_foreign_host_rejected(web):
