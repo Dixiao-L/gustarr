@@ -369,7 +369,7 @@ def test_nightly_runs_stages_in_order_and_commits_each(conn, cfg, monkeypatch):
     assert stats["errors"] == []
     for name in pipeline.NIGHTLY:
         assert stats[name] == {"n": 1}
-    assert "apply" not in stats
+    assert stats["apply"] == {"n": 1}  # approvals land nightly now
     assert spy.commits == len(pipeline.NIGHTLY)
 
 
@@ -380,7 +380,7 @@ def test_unconfigured_sync_stages_skipped(conn, tmp_path, monkeypatch):
 
     for stage in ("sync_arr", "sync_jellyfin", "sync_lastfm", "sync_listenbrainz"):
         assert stats[stage] == "skipped"
-    assert [c[0] for c in calls] == ["enrich", "candidates", "embed", "train", "rank"]
+    assert [c[0] for c in calls] == ["enrich", "candidates", "embed", "train", "rank", "apply"]
     assert stats["errors"] == []
 
 
