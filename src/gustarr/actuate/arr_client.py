@@ -185,8 +185,16 @@ class LidarrClient(ArrClient):
         return self._metadata_profile_id
 
     def add_artist(self, mbid: str) -> dict[str, Any]:
+        # Lidarr's POST /artist validates ArtistName etc., which a bare
+        # foreignArtistId can't satisfy — the add body must be the full
+        # lookup resource, mirroring the Radarr/Sonarr flows. (Learned in
+        # production: every add 400'd with "'Artist Name' must not be
+        # empty" while the lenient test mock accepted the bare payload.)
+        found = self._get("artist/lookup", params={"term": f"lidarr:{mbid}"}) or []
+        if not found:
+            raise ArrError(f"lidarr lookup found nothing for mbid {mbid}")
         body = {
-            "foreignArtistId": mbid,
+            **found[0],
             "qualityProfileId": self.quality_profile_id(),
             "metadataProfileId": self.metadata_profile_id(),
             "rootFolderPath": self.root_folder_path(),

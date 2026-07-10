@@ -581,3 +581,28 @@ def test_rank_skips_domain_when_all_state_is_stale(tmp_path):
     assert stats["stale_state"] == 1
     assert stats["proposed"] == 0
     assert conn.execute("SELECT COUNT(*) AS n FROM recommendations").fetchone()["n"] == 0
+
+
+def test_rank_respects_video_queue_cap(tmp_path):
+    """Rank must stop proposing video items at the cap instead of letting
+    apply mass-expire the overflow (churned 180 enriched items once)."""
+    conn = db.connect(tmp_path / "t.db")
+    cfg = make_cfg(tmp_path)
+    cfg.autonomy.video_queue_max_pending = 1
+    model = cfg.model.embed_model
+    for i in range(4):
+        iid = f"movie:tmdb:c{i}"
+        db.upsert_item(conn, iid, "movie", title=f"C{i}")
+        put_vec(conn, iid, axis(i), model)
+        add_candidate(conn, iid)
+    # one open movie proposal occupies the whole video budget
+    db.upsert_item(conn, "movie:tmdb:open1", "movie", title="Open")
+    conn.execute(
+        "INSERT INTO recommendations (run_id, ts, domain, item_id, score, why, status)"
+        " VALUES ('r0', '2026-07-10T00:00:00Z', 'movie', 'movie:tmdb:open1', 0.5, '{}',"
+        " 'proposed')")
+    rank_mod.run(conn, cfg, top=5)
+    open_video = conn.execute(
+        "SELECT COUNT(*) FROM recommendations WHERE domain IN ('movie','series')"
+        " AND status='proposed'").fetchone()[0]
+    assert open_video == 1  # cap already spent; nothing new proposed
