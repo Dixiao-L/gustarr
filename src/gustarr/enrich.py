@@ -43,12 +43,21 @@ def run(
     sql = (
         "SELECT * FROM items WHERE enriched_at IS NULL"
         + (" AND domain=?" if domain else "")
-        + " ORDER BY (EXISTS(SELECT 1 FROM candidates c WHERE c.item_id = items.id)"
+        # Rankable domains first: a first sync can mint 10k+ tracks, and
+        # artists/movies/series are what train/rank actually consume.
+        + " ORDER BY CASE WHEN domain IN ('artist','movie','series') THEN 0 ELSE 1 END,"
+        " (EXISTS(SELECT 1 FROM candidates c WHERE c.item_id = items.id)"
         "   OR EXISTS(SELECT 1 FROM events e WHERE e.item_id = items.id)) DESC,"
         " updated_at DESC LIMIT ?"
     )
     args = ([domain] if domain else []) + [-1 if limit is None else limit]
+    processed = 0
     for row in conn.execute(sql, args).fetchall():
+        # MusicBrainz politeness makes long runs span hours; commit as we
+        # go so a timeout/restart never rolls back finished work.
+        processed += 1
+        if processed % 50 == 0:
+            conn.commit()
         cur = conn.execute("SELECT enriched_at FROM items WHERE id=?", (row["id"],)).fetchone()
         if cur is None or cur["enriched_at"] is not None:
             continue  # merged away or already handled earlier this run
@@ -89,7 +98,7 @@ def _enrich_one(
     elif domain == "artist":
         _artist(conn, cfg, item_id, row["title"], ids_map, eff, stats)
     else:  # album | track
-        _release_or_recording(conn, item_id, domain, ids_map, stats)
+        _release_or_recording(conn, item_id, domain, row["title"], ids_map, stats)
 
 
 # ── movies / series (TMDb) ───────────────────────────────────────────
@@ -270,11 +279,14 @@ def _clean_bio(summary: str) -> str:
 # ── albums / tracks (MusicBrainz) ────────────────────────────────────
 
 
-def _release_or_recording(conn, item_id, domain, ids_map, stats) -> None:
+def _release_or_recording(conn, item_id, domain, title, ids_map, stats) -> None:
     mbid = ids_map.get("mbid")
-    if not mbid:
-        # Name-keyed tracks/albums feed artist aggregation, not ranking —
-        # not worth an MB search each; just close them out.
+    if not mbid or title:
+        # Tracks/albums feed artist aggregation, not ranking, and the
+        # collectors already deliver their titles. An MB lookup per track
+        # at the mandatory 1.1s spacing turns a first Last.fm sync (10k+
+        # tracks) into hours of grind for metadata nothing consumes —
+        # only title-less mbid items are worth the round-trip.
         db.upsert_item(conn, item_id, domain, enriched=True)
         stats["skipped"] += 1
         return

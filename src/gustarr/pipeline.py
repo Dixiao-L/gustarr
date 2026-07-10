@@ -39,6 +39,12 @@ NIGHTLY = ["sync_arr", "sync_jellyfin", "sync_lastfm", "sync_listenbrainz",
 WEEKLY = [*NIGHTLY, "apply"]
 RECIPES = {"nightly": NIGHTLY, "weekly": WEEKLY}
 
+# Enrich is the only stage whose first run can be unbounded (a fresh
+# Last.fm sync mints thousands of items, MusicBrainz enforces 1.1s per
+# request). Bound it per run — the queue is priority-ordered (rankable
+# domains, signal-bearing items first) so successive nights converge.
+ENRICH_BATCH_LIMIT = 1500
+
 
 def run_recipe(
     conn: sqlite3.Connection,
@@ -56,7 +62,8 @@ def run_recipe(
         if configured is not None and not configured(cfg):
             stats[name] = "skipped"
             continue
-        kwargs = {"dry_run": dry_run} if name == "apply" else {}
+        kwargs = {"dry_run": dry_run} if name == "apply" \
+            else {"limit": ENRICH_BATCH_LIMIT} if name == "enrich" else {}
         try:
             func = getattr(importlib.import_module(module_path), func_name)
             stats[name] = func(conn, cfg, **kwargs)

@@ -403,7 +403,11 @@ def test_weekly_appends_apply_and_threads_dry_run(conn, cfg, monkeypatch):
 
     assert [c[0] for c in calls] == pipeline.WEEKLY
     assert calls[-1] == ("apply", {"dry_run": True})
-    assert all(kw == {} for _, kw in calls[:-1])  # dry_run only reaches apply
+    # dry_run only reaches apply; enrich alone carries its batch bound
+    assert all(
+        kw == ({"limit": pipeline.ENRICH_BATCH_LIMIT} if name == "enrich" else {})
+        for name, kw in calls[:-1]
+    )
     assert stats["apply"] == {"n": 1}
 
 
