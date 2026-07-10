@@ -76,6 +76,17 @@ def test_list_recs_surfaces_poster_and_truncated_overview(conn):
     assert rows[bare]["overview"] is None
 
 
+def test_list_recs_surfaces_trailer_and_tolerates_absence(conn):
+    with_clip = add_rec(conn, "movie:tmdb:12", title="Clip", score=0.8,
+                        meta={"trailer": "yt-abc123"})
+    without = add_rec(conn, "movie:tmdb:13", title="NoClip", score=0.2)
+
+    rows = {r["id"]: r for r in queue.list_recs(conn)}
+    assert rows[with_clip]["trailer"] == "yt-abc123"
+    # pre-trailer items (enriched before videos were fetched) must list cleanly
+    assert rows[without]["trailer"] is None
+
+
 def test_list_recs_filters(conn):
     add_rec(conn, "movie:tmdb:1", title="M", score=0.4)
     add_rec(conn, "series:tvdb:2", domain="series", title="S", score=0.6)
