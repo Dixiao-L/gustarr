@@ -57,6 +57,7 @@ def list_recs(
             "genres": meta.get("genres") or [],
             "poster_path": meta.get("poster_path"),
             "overview": overview[:220] if overview else None,
+            "trailer": meta.get("trailer"),
             "score": r["score"],
             "why": json.loads(r["why"] or "{}"),
             "status": r["status"],

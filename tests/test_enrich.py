@@ -24,6 +24,10 @@ MOVIE_DETAIL = {
     "vote_average": 8.2,
     "runtime": 136,
     "poster_path": "/matrix.jpg",
+    "videos": {"results": [
+        {"site": "YouTube", "type": "Teaser", "official": True, "key": "mx-teaser"},
+        {"site": "YouTube", "type": "Trailer", "official": True, "key": "mx-trailer"},
+    ]},
 }
 
 SERIES_DETAIL = {
@@ -38,6 +42,10 @@ SERIES_DETAIL = {
     "popularity": 300.0,
     "number_of_seasons": 5,
     "poster_path": "/bb.jpg",
+    "videos": {"results": [
+        {"site": "Vimeo", "type": "Trailer", "official": True, "key": "vim-1"},
+        {"site": "YouTube", "type": "Trailer", "official": True, "key": "bb-trailer"},
+    ]},
 }
 
 MB_ARTIST = {
@@ -110,7 +118,7 @@ def test_movie_tmdb_detail(conn, tmp_path, monkeypatch):
     cfg = make_cfg(tmp_path, tmdb={"api_key": "k"})
     iid = ids.make("movie", "tmdb", "603")
     db.upsert_item(conn, iid, "movie", title="The Matrix", ids={"tmdb": 603})
-    mock_api(monkeypatch, [("/movie/603", MOVIE_DETAIL)])
+    api = mock_api(monkeypatch, [("/movie/603", MOVIE_DETAIL)])
 
     stats = run(conn, cfg)
 
@@ -124,6 +132,8 @@ def test_movie_tmdb_detail(conn, tmp_path, monkeypatch):
     assert meta["runtime"] == 136
     assert meta["original_language"] == "en"
     assert meta["poster_path"] == "/matrix.jpg"
+    assert meta["trailer"] == "mx-trailer"
+    assert api.calls[0][2]["append_to_response"] == "keywords,videos"
 
 
 def test_movie_imdb_find_merges_and_repoints_events(conn, tmp_path, monkeypatch):
@@ -154,7 +164,7 @@ def test_series_tvdb_find_then_detail(conn, tmp_path, monkeypatch):
     cfg = make_cfg(tmp_path, tmdb={"api_key": "k"})
     iid = ids.make("series", "tvdb", "81189")
     db.upsert_item(conn, iid, "series")
-    mock_api(monkeypatch, [
+    api = mock_api(monkeypatch, [
         ("/find/81189", {"tv_results": [{"id": 1396}]}),
         ("/tv/1396", SERIES_DETAIL),
     ])
@@ -171,7 +181,9 @@ def test_series_tvdb_find_then_detail(conn, tmp_path, monkeypatch):
     assert meta["keywords"] == ["drug cartel"]
     assert meta["number_of_seasons"] == 5
     assert meta["poster_path"] == "/bb.jpg"
+    assert meta["trailer"] == "bb-trailer"  # the Vimeo trailer must be skipped
     assert "no_tvdb" not in meta
+    assert api.calls[1][2]["append_to_response"] == "keywords,external_ids,videos"
 
 
 def test_series_tmdb_keyed_resolves_tvdb_and_merges(conn, tmp_path, monkeypatch):
@@ -210,6 +222,63 @@ def test_null_poster_path_never_stored(conn, tmp_path, monkeypatch):
     assert stats["enriched"] == 1
     meta = json.loads(conn.execute("SELECT meta FROM items WHERE id=?", (iid,)).fetchone()["meta"])
     assert "poster_path" not in meta
+
+
+def _movie_meta(conn, iid):
+    return json.loads(conn.execute("SELECT meta FROM items WHERE id=?", (iid,)).fetchone()["meta"])
+
+
+def test_trailer_official_beats_fan_trailer_and_teaser(conn, tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path, tmdb={"api_key": "k"})
+    iid = ids.make("movie", "tmdb", "603")
+    db.upsert_item(conn, iid, "movie", ids={"tmdb": 603})
+    videos = {"results": [
+        {"site": "YouTube", "type": "Teaser", "official": True, "key": "tz"},
+        {"site": "YouTube", "type": "Trailer", "official": False, "key": "fan"},
+        {"site": "YouTube", "type": "Trailer", "official": True, "key": "off"},
+    ]}
+    mock_api(monkeypatch, [("/movie/603", {**MOVIE_DETAIL, "videos": videos})])
+
+    stats = run(conn, cfg)
+
+    assert stats["enriched"] == 1 and stats["errors"] == 0
+    assert _movie_meta(conn, iid)["trailer"] == "off"
+
+
+def test_trailer_skips_non_youtube_and_falls_back_to_teaser(conn, tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path, tmdb={"api_key": "k"})
+    iid = ids.make("movie", "tmdb", "603")
+    db.upsert_item(conn, iid, "movie", ids={"tmdb": 603})
+    videos = {"results": [
+        {"site": "Vimeo", "type": "Trailer", "official": True, "key": "vim"},
+        {"site": "YouTube", "type": "Teaser", "official": False, "key": "tz"},
+    ]}
+    mock_api(monkeypatch, [("/movie/603", {**MOVIE_DETAIL, "videos": videos})])
+
+    stats = run(conn, cfg)
+
+    assert stats["enriched"] == 1 and stats["errors"] == 0
+    assert _movie_meta(conn, iid)["trailer"] == "tz"
+
+
+def test_no_usable_video_means_no_trailer_key(conn, tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path, tmdb={"api_key": "k"})
+    plain = ids.make("movie", "tmdb", "603")
+    vimeo_only = ids.make("movie", "tmdb", "604")
+    db.upsert_item(conn, plain, "movie", ids={"tmdb": 603})
+    db.upsert_item(conn, vimeo_only, "movie", ids={"tmdb": 604})
+    no_videos = {k: v for k, v in MOVIE_DETAIL.items() if k != "videos"}
+    mock_api(monkeypatch, [
+        ("/movie/603", no_videos),
+        ("/movie/604", {**MOVIE_DETAIL, "id": 604, "videos": {"results": [
+            {"site": "Vimeo", "type": "Trailer", "official": True, "key": "vim"}]}}),
+    ])
+
+    stats = run(conn, cfg)
+
+    assert stats["enriched"] == 2 and stats["errors"] == 0
+    assert "trailer" not in _movie_meta(conn, plain)
+    assert "trailer" not in _movie_meta(conn, vimeo_only)
 
 
 def test_series_without_tvdb_mapping_enriched_under_tmdb(conn, tmp_path, monkeypatch):

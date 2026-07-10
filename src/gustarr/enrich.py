@@ -127,7 +127,8 @@ def _movie(conn, cfg, item_id, ids_map, eff, stats) -> None:
             item_id = eff["id"] = canonical
     data = http.get_json(
         f"{TMDB}/movie/{tmdb_id}",
-        params={"api_key": api_key, "append_to_response": "keywords", "language": "en-US"})
+        params={"api_key": api_key, "append_to_response": "keywords,videos",
+                "language": "en-US"})
     kw = data.get("keywords") or {}
     meta = {
         "genres": [g["name"] for g in data.get("genres") or []],
@@ -140,6 +141,9 @@ def _movie(conn, cfg, item_id, ids_map, eff, stats) -> None:
     }
     if data.get("poster_path"):
         meta["poster_path"] = data["poster_path"]
+    trailer = _trailer_key(data)
+    if trailer:
+        meta["trailer"] = trailer
     db.upsert_item(conn, item_id, "movie", title=data.get("title"),
                    year=_year(data.get("release_date")), ids={**ids_map, "tmdb": tmdb_id},
                    meta=meta, enriched=True)
@@ -164,7 +168,7 @@ def _series(conn, cfg, item_id, ids_map, eff, stats) -> None:
         tmdb_id = results[0]["id"]
     data = http.get_json(
         f"{TMDB}/tv/{tmdb_id}",
-        params={"api_key": api_key, "append_to_response": "keywords,external_ids",
+        params={"api_key": api_key, "append_to_response": "keywords,external_ids,videos",
                 "language": "en-US"})
     # Sonarr can only add by tvdb id, so tmdb-keyed candidates must
     # upgrade to the canonical tvdb namespace (mirrors _movie's
@@ -189,12 +193,29 @@ def _series(conn, cfg, item_id, ids_map, eff, stats) -> None:
     }
     if data.get("poster_path"):
         meta["poster_path"] = data["poster_path"]
+    trailer = _trailer_key(data)
+    if trailer:
+        meta["trailer"] = trailer
     if not tvdb_id:
         meta["no_tvdb"] = True  # un-addable in Sonarr; apply reports why
     db.upsert_item(conn, item_id, "series", title=data.get("name"),
                    year=_year(data.get("first_air_date")), ids={**ids_map, "tmdb": tmdb_id},
                    meta=meta, enriched=True)
     stats["enriched"] += 1
+
+
+def _trailer_key(data: dict[str, Any]) -> str | None:
+    """Best embeddable clip: official Trailer > any Trailer > Teaser; YouTube only,
+    since that's the only site the UI can embed by key."""
+    vids = [v for v in (data.get("videos") or {}).get("results") or []
+            if isinstance(v, dict) and v.get("site") == "YouTube" and v.get("key")]
+    for want in (lambda v: v.get("official") and v.get("type") == "Trailer",
+                 lambda v: v.get("type") == "Trailer",
+                 lambda v: v.get("type") == "Teaser"):
+        for v in vids:
+            if want(v):
+                return v["key"]
+    return None
 
 
 # ── artists (MusicBrainz + Last.fm) ──────────────────────────────────

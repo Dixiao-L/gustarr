@@ -130,11 +130,15 @@ def test_index_served(web):
     assert "Gustarr" in resp.text
     assert "/api/recs" in resp.text
     for symbol in ("i-check", "i-x", "i-info", "i-compass", "i-sparkle",
-                   "i-film", "i-tv", "i-music", "i-clock", "i-chart"):
+                   "i-film", "i-tv", "i-music", "i-clock", "i-chart",
+                   "i-play", "i-external"):
         assert f'id="{symbol}"' in resp.text
     for label in ("All", "Movies", "Series", "Music", "History"):
         assert label in resp.text
     assert "aria-selected" in resp.text
+    # Trailer/preview affordances ship as static strings in the page script.
+    assert "youtube.com/watch" in resp.text
+    assert "itunes.apple.com/search" in resp.text
 
 
 def test_foreign_host_rejected(web):

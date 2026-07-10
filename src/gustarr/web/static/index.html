@@ -148,11 +148,11 @@
   .badge.bad { color: var(--danger); background: var(--danger-soft); }
   .badge.dim { color: var(--muted); background: var(--bg); border: 1px solid var(--line); }
 
-  .why {
+  .why, .preview {
     background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
     padding: 8px 10px; font-size: 12.5px; display: flex; flex-direction: column; gap: 6px;
   }
-  .why[hidden] { display: none; }
+  .why[hidden], .preview[hidden] { display: none; }
   .overview {
     margin: 0; color: var(--muted); display: -webkit-box; -webkit-line-clamp: 4;
     -webkit-box-orient: vertical; overflow: hidden;
@@ -172,16 +172,32 @@
   .seeds { margin: 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
   .whytext { margin: 0; color: var(--muted); white-space: pre-wrap; }
 
+  .trk { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .trk .tname {
+    font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .preview audio { width: 100%; height: 32px; display: block; }
+  .ytlink {
+    display: inline-flex; align-items: center; gap: 6px; align-self: flex-start;
+    font-size: 12px; color: var(--muted); text-decoration: none;
+  }
+  .ytlink:hover { color: var(--accent-text); }
+  .ytlink .icon { width: 13px; height: 13px; }
+
   .actions { display: flex; gap: 8px; margin-top: auto; }
+  .actions.foot { margin-top: 0; }
   .btn {
     display: inline-flex; align-items: center; justify-content: center; gap: 6px;
     font: inherit; font-size: 13px; font-weight: 500;
     color: var(--text); background: var(--surface);
     border: 1px solid var(--line-strong); border-radius: 8px;
-    padding: 5px 12px; cursor: pointer; flex: 1;
+    padding: 5px 12px; cursor: pointer; flex: 1; text-decoration: none;
   }
   .btn .icon { width: 15px; height: 15px; }
   .btn:hover:not(:disabled) { background: var(--bg); }
+  .btn.sample[aria-expanded="true"] {
+    color: var(--accent-text); background: var(--accent-soft); border-color: transparent;
+  }
   .btn.approve { color: var(--on-accent); background: var(--accent); border-color: var(--accent); }
   .btn.approve:hover:not(:disabled) { background: var(--accent-hover);
     border-color: var(--accent-hover); }
@@ -249,6 +265,13 @@
     </symbol>
     <symbol id="i-chart" viewBox="0 0 24 24">
       <path d="M4.5 4.5v15h15M8.5 15.5v-4M12.5 15.5v-7M16.5 15.5v-2.5"/>
+    </symbol>
+    <symbol id="i-play" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="8.75"/><path d="M10.5 9.25L14.75 12l-4.25 2.75z"/>
+    </symbol>
+    <symbol id="i-external" viewBox="0 0 24 24">
+      <path d="M18.5 13.5v4a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2h4"/>
+      <path d="M14 4.5h5.5V10M19.5 4.5l-8 8"/>
     </symbol>
   </defs>
 </svg>
@@ -480,12 +503,64 @@
     catch (e) { out.textContent = 'Could not load explanation: ' + (e.message || e); }
   }
 
+  /* ── sampling (trailer / audio preview) ────────────────────── */
+  // Available even in History: sampling is harmless post-verdict,
+  // unlike approve/reject, which stay disabled there.
+
+  function sampleHTML(r) {
+    if (r.trailer && (r.domain === 'movie' || r.domain === 'series'))
+      return `<a class="btn sample" target="_blank" rel="noopener"
+        href="https://www.youtube.com/watch?v=${esc(encodeURIComponent(r.trailer))}">
+        ${icon('play')}Trailer</a>`;
+    if (r.domain === 'artist')
+      return `<button class="btn sample previewbtn" aria-expanded="false">
+        ${icon('play')}Preview</button>`;
+    return '';
+  }
+
+  const ytSearchHTML = name => `<a class="ytlink" target="_blank" rel="noopener"
+    href="https://www.youtube.com/results?search_query=${esc(encodeURIComponent(name))}">
+    ${icon('external')}Search on YouTube</a>`;
+
+  function pauseOthers(current) {
+    for (const a of document.querySelectorAll('audio'))
+      if (a !== current) a.pause();
+  }
+
+  async function togglePreview(el, r) {
+    const box = el.querySelector('.preview');
+    const btn = el.querySelector('.previewbtn');
+    const show = box.hidden;
+    box.hidden = !show;
+    btn.setAttribute('aria-expanded', String(show));
+    if (!show) { for (const a of box.querySelectorAll('audio')) a.pause(); return; }
+    if (box.dataset.loaded) return;
+    box.dataset.loaded = '1'; // cache per card, including the fallback state
+    const name = r.title || r.item_id;
+    box.innerHTML = '<div class="skeleton"><div class="line w60"></div></div>';
+    let tracks = [];
+    // Keyless, CORS-open endpoint; any failure falls back to a YouTube search link.
+    try {
+      const data = await getJSON('https://itunes.apple.com/search?term=' +
+        encodeURIComponent(name) + '&entity=song&limit=3&country=US');
+      tracks = (data.results || []).filter(t => t && t.previewUrl).slice(0, 3);
+    } catch (e) { /* fallback below */ }
+    if (!tracks.length) { box.innerHTML = ytSearchHTML(name); return; }
+    box.innerHTML = tracks.map(t => `<div class="trk">
+      <span class="tname" title="${esc(t.trackName)}">${esc(t.trackName)}</span>
+      <audio controls preload="none" src="${esc(t.previewUrl)}"></audio>
+    </div>`).join('');
+    for (const a of box.querySelectorAll('audio'))
+      a.addEventListener('play', () => pauseOthers(a));
+  }
+
   function cardEl(r, history) {
     const el = document.createElement('article');
     el.className = 'card';
     const score = Number(r.score) || 0;
     const genres = genresOf(r);
     const meta = [r.year, genres.join(', ')].filter(Boolean).join(' · ');
+    const sample = sampleHTML(r);
     el.innerHTML = `
       ${posterHTML(r)}
       <div class="body">
@@ -498,6 +573,7 @@
         </div>
         ${badgesHTML(r, history)}
         <div class="why" hidden></div>
+        ${r.domain === 'artist' ? '<div class="preview" hidden></div>' : ''}
         <div class="actions">
           <button class="btn approve" ${history ? 'disabled' : ''}>
             ${icon('check')}Approve</button>
@@ -506,6 +582,7 @@
           <button class="iconbtn whybtn" aria-expanded="false"
             aria-label="Why this recommendation">${icon('info')}</button>
         </div>
+        ${sample ? `<div class="actions foot">${sample}</div>` : ''}
       </div>`;
     const img = el.querySelector('.poster img');
     if (img) img.addEventListener('error', () => {
@@ -516,6 +593,8 @@
       el.querySelector('.reject').addEventListener('click', () => act(el, r, 'reject'));
     }
     el.querySelector('.whybtn').addEventListener('click', () => toggleWhy(el, r));
+    const pv = el.querySelector('.previewbtn');
+    if (pv) pv.addEventListener('click', () => togglePreview(el, r));
     return el;
   }
 
