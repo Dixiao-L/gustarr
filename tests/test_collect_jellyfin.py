@@ -165,6 +165,9 @@ def test_progress_deltas_emit_incrementally(tmp_path, monkeypatch):
     conn = db.connect(tmp_path / "t.db")
     cfg = make_cfg(tmp_path)
     state = server_state()
+    # incremental count-delta emission is the FALLBACK path (plugin
+    # absent); with PBR active these deltas become cursor maintenance
+    state["pbr_available"] = False
     transport = make_transport(state)
     jellyfin.sync(conn, cfg, transport=transport)
 
@@ -223,6 +226,9 @@ def test_cursor_holds_when_duplicate_key_blocks_scrobble(tmp_path):
     conn = db.connect(tmp_path / "t.db")
     cfg = make_cfg(tmp_path)
     state = server_state()
+    # incremental count-delta emission is the FALLBACK path (plugin
+    # absent); with PBR active these deltas become cursor maintenance
+    state["pbr_available"] = False
     jellyfin.sync(conn, cfg, transport=make_transport(state))
     # PlayCount rises but the server never updates LastPlayedDate: the insert
     # collides with the stored row, so the cursor must not swallow the plays
@@ -273,6 +279,9 @@ def test_series_cursors_follow_merged_id(tmp_path, monkeypatch):
     conn = db.connect(tmp_path / "t.db")
     cfg = make_cfg(tmp_path)
     state = server_state()
+    # incremental count-delta emission is the FALLBACK path (plugin
+    # absent); with PBR active these deltas become cursor maintenance
+    state["pbr_available"] = False
     transport = make_transport(state)
     jellyfin.sync(conn, cfg, transport=transport)
     db.merge_item(conn, "series:tvdb:371980", "series:tmdb:999")
@@ -311,3 +320,47 @@ def test_playback_reporting_absent_is_skipped(tmp_path):
     stats = jellyfin.sync(conn, make_cfg(tmp_path), transport=make_transport(state))
     assert stats["playback_reporting"] == "unavailable"
     assert stats["items"] == 5  # the rest of the sync still ran
+
+
+def test_pbr_rows_become_precise_events(tmp_path):
+    """Playback Reporting rows are the precise history: per-play timestamps,
+    durations, movie completion detection, other-user filtering — while the
+    count-delta paths bootstrap pre-plugin backlog and then go quiet."""
+    conn = db.connect(tmp_path / "t.db")
+    cfg = make_cfg(tmp_path)
+    state = server_state()
+    state["by_id"]["t1"] = state["audio"][0]
+    state["by_id"]["m3"] = {"Id": "m3", "Type": "Movie", "Name": "Heat",
+                            "ProviderIds": {"Tmdb": "949"},
+                            "RunTimeTicks": 9000 * 10_000_000}
+    state["by_id"]["e2"] = {"Id": "e2", "Type": "Episode", "Name": "Ep 2", "SeriesId": "s1"}
+    state["pbr_rows"] = [
+        [1, "2024-06-01 10:00:00", "u1", "t1", "Audio", 240],
+        [2, "2024-06-02 20:00:00", "u1", "m3", "Movie", 8160],   # 8160/9000 >= 0.85
+        [3, "2024-06-03 21:00:00", "u1", "e2", "Episode", 1500],
+        [4, "2024-06-03 22:00:00", "u2", "t1", "Audio", 240],    # other user: ignored
+        [5, "2024-06-04 10:00:00", "u1", "gone", "Movie", 100],  # deleted item: skipped
+    ]
+    stats = jellyfin.sync(conn, cfg, transport=make_transport(state))
+
+    assert stats["pbr_scrobbles"] == 1
+    assert stats["pbr_plays"] == 2       # movie m3 + episode->series
+    assert stats["pbr_completes"] == 1   # m3 by duration
+    rows = {(r["item_id"], r["kind"], r["dedup"]): r
+            for r in conn.execute("SELECT * FROM events WHERE source='jellyfin'")}
+    art = f"artist:mbid:{MBID}"
+    assert rows[(art, "scrobble", "pbr1")]["ts"] == "2024-06-01T10:00:00Z"
+    assert rows[("movie:tmdb:949", "play", "pbr2")]["meta"]
+    assert ("movie:tmdb:949", "complete", "") in rows
+    assert rows[("series:tvdb:371980", "play", "pbr3")]["ts"] == "2024-06-03T21:00:00Z"
+    assert not any(d == "pbr4" for _, _, d in rows)  # guest listen filtered
+    assert not any(d == "pbr5" for _, _, d in rows)  # deleted item skipped
+    # bootstrap: pre-plugin playcounts still emitted once via the count path
+    assert stats["scrobbles"] == 2  # t1 + t2 backlogs
+
+    # steady state: nothing new, and count-deltas stay cursor-only
+    state["audio"][0]["UserData"]["PlayCount"] = 9
+    state["audio"][0]["UserData"]["LastPlayedDate"] = "2024-06-20T10:00:00.0000000Z"
+    stats2 = jellyfin.sync(conn, cfg, transport=make_transport(state))
+    assert stats2["pbr_scrobbles"] == stats2["scrobbles"] == 0
+    assert db.get_state(conn, "jellyfin:track_plays:t1") == "9"
