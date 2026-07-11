@@ -4,7 +4,12 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
+<meta name="description" content="Gustarr approval queue — review, snooze, or approve
+  recommended movies, series, and music.">
+<meta name="theme-color" media="(prefers-color-scheme: light)" content="#ffffff">
+<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#18181c">
 <title>Gustarr</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%3E%3Cg%20fill='%2314b8a6'%3E%3Crect%20x='4'%20y='13'%20width='4'%20height='7'%20rx='2'%20opacity='.4'/%3E%3Crect%20x='10'%20y='9'%20width='4'%20height='11'%20rx='2'%20opacity='.7'/%3E%3Crect%20x='16'%20y='4'%20width='4'%20height='16'%20rx='2'/%3E%3C/g%3E%3C/svg%3E">
 <style>
   :root {
     --bg: #f7f7f8; --surface: #ffffff; --text: #18181b; --muted: #6b7280;
@@ -12,6 +17,7 @@
     --accent: #0f766e; --accent-hover: #115e59; --on-accent: #ffffff;
     --accent-text: #0f766e; --accent-soft: rgba(15, 118, 110, .09);
     --danger: #b91c1c; --danger-soft: rgba(185, 28, 28, .08);
+    --warn: #b45309; --warn-soft: rgba(180, 83, 9, .09);
     --shadow: 0 1px 2px rgba(0, 0, 0, .04), 0 1px 3px rgba(0, 0, 0, .06);
   }
   @media (prefers-color-scheme: dark) {
@@ -21,6 +27,7 @@
       --accent: #14b8a6; --accent-hover: #2dd4bf; --on-accent: #042f2a;
       --accent-text: #4fd8c6; --accent-soft: rgba(45, 212, 191, .10);
       --danger: #f87171; --danger-soft: rgba(248, 113, 113, .10);
+      --warn: #fbbf24; --warn-soft: rgba(251, 191, 36, .10);
       --shadow: 0 1px 3px rgba(0, 0, 0, .4);
     }
   }
@@ -61,6 +68,9 @@
   }
   .chip .icon { width: 13px; height: 13px; }
   .chip b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .hbtns { display: flex; align-items: center; gap: 8px; }
+  .hbtns .btn { flex: none; }
+  .hbtns .iconbtn { height: 30px; }
 
   nav { padding: 0 20px; overflow-x: auto; }
   [role="tablist"] { display: flex; gap: 4px; }
@@ -90,6 +100,8 @@
   }
   .banner[hidden] { display: none; }
   .banner button { margin-left: auto; }
+  .banner.warn { background: var(--warn-soft); border-color: var(--warn);
+    color: var(--warn); padding: 8px 14px; }
   .grid {
     display: grid; gap: 16px;
     grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
@@ -206,6 +218,8 @@
   .btn.approve { color: var(--on-accent); background: var(--accent); border-color: var(--accent); }
   .btn.approve:hover:not(:disabled) { background: var(--accent-hover);
     border-color: var(--accent-hover); }
+  .btn.quiet { color: var(--muted); background: none; border-color: var(--line); }
+  .btn.quiet:hover:not(:disabled) { color: var(--text); background: var(--bg); }
   .btn:disabled { opacity: .45; cursor: default; }
   .iconbtn {
     display: inline-flex; align-items: center; justify-content: center;
@@ -214,6 +228,67 @@
   }
   .iconbtn:hover { color: var(--text); background: var(--bg); }
   .iconbtn[aria-expanded="true"] { color: var(--accent-text); background: var(--accent-soft); }
+
+  /* ── settings dialog ────────────────────────────────────────── */
+  dialog {
+    width: min(420px, calc(100vw - 32px));
+    background: var(--surface); color: var(--text);
+    border: 1px solid var(--line); border-radius: 12px;
+    box-shadow: var(--shadow); padding: 0;
+  }
+  dialog::backdrop { background: rgba(0, 0, 0, .4); }
+  .dlg-head { display: flex; align-items: center; gap: 8px; padding: 14px 16px 10px; }
+  .dlg-head h2 { margin: 0 auto 0 0; font-size: 15px; font-weight: 650; letter-spacing: -.01em; }
+  .dlg-head .iconbtn { height: 30px; }
+  .setting {
+    display: flex; flex-direction: column; gap: 6px;
+    padding: 12px 16px; border-top: 1px solid var(--line);
+  }
+  .setting .row { display: flex; align-items: center; gap: 10px; }
+  .setting .name { margin-right: auto; font-size: 13px; font-weight: 600; }
+  .setting .hint { margin: 0; font-size: 12px; color: var(--muted); }
+  .setting .caption {
+    display: flex; align-items: center; gap: 10px; font-size: 11.5px; color: var(--muted);
+  }
+  .reset {
+    font: inherit; font-size: 11.5px; color: var(--accent-text);
+    background: none; border: none; padding: 0; cursor: pointer;
+  }
+  .reset:hover { text-decoration: underline; }
+  .reset[hidden] { display: none; }
+  .toggle {
+    appearance: none; -webkit-appearance: none; position: relative; flex: none;
+    width: 36px; height: 20px; margin: 0; cursor: pointer;
+    background: var(--line-strong); border: none; border-radius: 999px;
+    transition: background .15s ease;
+  }
+  .toggle::after {
+    content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
+    border-radius: 50%; background: var(--surface); box-shadow: var(--shadow);
+    transition: transform .15s ease;
+  }
+  .toggle:checked { background: var(--accent); }
+  .toggle:checked::after { transform: translateX(16px); }
+  .seg {
+    display: inline-flex; border: 1px solid var(--line-strong);
+    border-radius: 8px; overflow: hidden;
+  }
+  .seg button {
+    font: inherit; font-size: 12.5px; font-weight: 500; color: var(--muted);
+    background: none; border: none; padding: 4px 12px; cursor: pointer;
+  }
+  .seg button + button { border-left: 1px solid var(--line-strong); }
+  .seg button[aria-pressed="true"] { color: var(--accent-text); background: var(--accent-soft); }
+  .setting input[type="number"] {
+    font: inherit; font-size: 13px; color: var(--text); background: var(--surface);
+    border: 1px solid var(--line-strong); border-radius: 8px; padding: 4px 8px; width: 72px;
+  }
+  .setting input[type="range"] { flex: 1; max-width: 160px; margin: 0;
+    accent-color: var(--accent); }
+  .setting .pct {
+    font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums;
+    min-width: 2.8em; text-align: right;
+  }
 
   /* ── skeletons / toasts ─────────────────────────────────────── */
   .skeleton .poster, .skeleton .line { animation: pulse 1.4s ease-in-out infinite; }
@@ -278,6 +353,11 @@
       <path d="M18.5 13.5v4a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2h4"/>
       <path d="M14 4.5h5.5V10M19.5 4.5l-8 8"/>
     </symbol>
+    <symbol id="i-gear" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="3.25"/><circle cx="12" cy="12" r="7"/>
+      <path d="M12 3v2M12 19v2M21 12h-2M5 12H3"/>
+      <path d="M18.4 5.6l-1.5 1.5M7.1 16.9l-1.5 1.5M18.4 18.4l-1.5-1.5M7.1 7.1L5.6 5.6"/>
+    </symbol>
   </defs>
 </svg>
 
@@ -292,11 +372,22 @@
       <span class="wordmark">Gustarr</span>
     </a>
     <div id="chips" class="chips"></div>
+    <div class="hbtns">
+      <button id="run-now" class="btn quiet" type="button">
+        <svg class="icon" aria-hidden="true"><use href="#i-play"/></svg>Run Now</button>
+      <button id="open-settings" class="iconbtn" type="button" aria-label="Settings"
+        aria-haspopup="dialog">
+        <svg class="icon" aria-hidden="true"><use href="#i-gear"/></svg></button>
+    </div>
   </div>
   <nav><div id="tabs" role="tablist" aria-label="Queue filters"></div></nav>
 </header>
 
 <main>
+  <div id="paused" class="banner warn" role="status" hidden>
+    <span>Automation Paused — approvals and auto-adds are on hold</span>
+    <button id="resume" class="btn">Resume</button>
+  </div>
   <div id="banner" class="banner" role="alert" hidden>
     <span id="banner-text"></span>
     <button id="retry" class="btn">Retry</button>
@@ -305,6 +396,15 @@
 </main>
 
 <div id="toasts" aria-live="polite"></div>
+
+<dialog id="settings" aria-labelledby="settings-title">
+  <div class="dlg-head">
+    <h2 id="settings-title">Settings</h2>
+    <button id="settings-close" class="iconbtn" type="button" aria-label="Close settings">
+      <svg class="icon" aria-hidden="true"><use href="#i-x"/></svg></button>
+  </div>
+  <div id="settings-body"></div>
+</dialog>
 
 <script>
 (function () {
@@ -321,9 +421,17 @@
   ];
   const STATUS_LABEL = {
     approved: 'Approved', rejected: 'Rejected', added: 'Added',
-    auto_added: 'Auto-Added', expired: 'Expired', failed: 'Failed',
+    auto_added: 'Auto-Added', expired: 'Expired', failed: 'Failed', snoozed: 'Snoozed',
   };
-  const state = { rows: [], stats: null, tab: 'all', loaded: false };
+  const SETTINGS = [
+    { key: 'paused', label: 'Pause Automation', type: 'toggle' },
+    { key: 'music_mode', label: 'Music Mode', type: 'seg', options: ['auto', 'queue'] },
+    { key: 'music_max_artists_per_week', label: 'Weekly Artist Cap', type: 'number', min: 0 },
+    { key: 'video_queue_max_pending', label: 'Video Queue Depth', type: 'number', min: 1 },
+    { key: 'exploration_frac', label: 'Exploration Fraction', type: 'range',
+      hint: 'Share of each run reserved for outside-your-bubble picks' },
+  ];
+  const state = { rows: [], stats: null, tab: 'all', loaded: false, settings: null };
   const $ = id => document.getElementById(id);
 
   const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g,
@@ -341,6 +449,12 @@
     const r = await fetch(url);
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return r.json();
+  }
+
+  async function errDetail(resp) {
+    let detail = '';
+    try { detail = (await resp.json()).detail || ''; } catch (e) { /* non-json body */ }
+    return detail || 'HTTP ' + resp.status;
   }
 
   function genresOf(r) {
@@ -460,7 +574,8 @@
     if (w.serendipity) b.push(`<span class="badge">${icon('sparkle')}Serendipity</span>`);
     if (history) {
       const cls = r.status === 'rejected' ? 'bad'
-        : (r.status === 'expired' || r.status === 'failed') ? 'dim' : '';
+        : (r.status === 'expired' || r.status === 'failed' || r.status === 'snoozed')
+          ? 'dim' : '';
       b.push(`<span class="badge ${cls}">${esc(STATUS_LABEL[r.status] || r.status)}</span>`);
       if (r.acted_at)
         b.push(`<span class="badge dim">${icon('clock')}${esc(String(r.acted_at).slice(0, 10))}
@@ -565,7 +680,13 @@
     const score = Number(r.score) || 0;
     const genres = genresOf(r);
     const meta = [r.year, genres.join(', ')].filter(Boolean).join(' · ');
+    const foot = [];
+    if (!history)
+      foot.push(`<button class="btn quiet snooze">${icon('clock')}Not Now</button>`);
+    if (history && r.status === 'rejected')
+      foot.push(`<button class="btn forgive">${icon('check')}Forgive</button>`);
     const sample = sampleHTML(r);
+    if (sample) foot.push(sample);
     el.innerHTML = `
       ${posterHTML(r)}
       <div class="body">
@@ -587,7 +708,7 @@
           <button class="iconbtn whybtn" aria-expanded="false"
             aria-label="Why this recommendation">${icon('info')}</button>
         </div>
-        ${sample ? `<div class="actions foot">${sample}</div>` : ''}
+        ${foot.length ? `<div class="actions foot">${foot.join('')}</div>` : ''}
       </div>`;
     const img = el.querySelector('.poster img');
     if (img) {
@@ -598,7 +719,10 @@
     if (!history) {
       el.querySelector('.approve').addEventListener('click', () => act(el, r, 'approve'));
       el.querySelector('.reject').addEventListener('click', () => act(el, r, 'reject'));
+      el.querySelector('.snooze').addEventListener('click', () => act(el, r, 'snooze'));
     }
+    const fg = el.querySelector('.forgive');
+    if (fg) fg.addEventListener('click', () => forgive(el, r));
     el.querySelector('.whybtn').addEventListener('click', () => toggleWhy(el, r));
     const pv = el.querySelector('.previewbtn');
     if (pv) pv.addEventListener('click', () => togglePreview(el, r));
@@ -631,24 +755,214 @@
     setTimeout(done, 350);
   }
 
+  const ACT = {
+    approve: { status: 'approved', toast: r => `Approved · ${r.title || r.item_id}` },
+    reject: { status: 'rejected', toast: r => `Rejected · ${r.title || r.item_id}` },
+    snooze: { status: 'snoozed', toast: () => 'Snoozed for 30 days' },
+  };
+
   async function act(el, r, action) {
     el.classList.add('busy');
     try {
       const resp = await fetch(`/api/recs/${r.id}/${action}`, { method: 'POST' });
-      if (!resp.ok) {
-        let detail = '';
-        try { detail = (await resp.json()).detail || ''; } catch (e) { /* non-json body */ }
-        throw new Error(detail || 'HTTP ' + resp.status);
-      }
-      r.status = action === 'approve' ? 'approved' : 'rejected';
+      if (!resp.ok) throw new Error(await errDetail(resp));
+      r.status = ACT[action].status;
       r.acted_at = new Date().toISOString().slice(0, 19) + 'Z';
-      toast(`${action === 'approve' ? 'Approved' : 'Rejected'} · ${r.title || r.item_id}`);
+      toast(ACT[action].toast(r));
       removeCard(el);
       updateCounts();
     } catch (e) {
       el.classList.remove('busy');
       toast(`Could not ${action} · ${e.message || e}`, 'error');
     }
+  }
+
+  async function forgive(el, r) {
+    el.classList.add('busy');
+    try {
+      const resp = await fetch(`/api/recs/${r.id}/forgive`, { method: 'POST' });
+      if (!resp.ok) throw new Error(await errDetail(resp));
+      r.status = 'expired';
+      r.acted_at = new Date().toISOString().slice(0, 19) + 'Z';
+      toast(`Forgiven · ${r.title || r.item_id}`);
+      el.replaceWith(cardEl(r, true));
+      updateCounts();
+    } catch (e) {
+      el.classList.remove('busy');
+      toast(`Could not forgive · ${e.message || e}`, 'error');
+    }
+  }
+
+  /* ── settings & runtime controls ───────────────────────────── */
+
+  async function putSetting(key, value) {
+    const resp = await fetch('/api/settings/' + key, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ value }),
+    });
+    if (!resp.ok) throw new Error(await errDetail(resp));
+    return resp.json();
+  }
+
+  async function delSetting(key) {
+    const resp = await fetch('/api/settings/' + key, { method: 'DELETE' });
+    if (!resp.ok) throw new Error(await errDetail(resp));
+  }
+
+  const titleCase = s => s.charAt(0).toUpperCase() + s.slice(1);
+
+  function fmtSetting(desc, v) {
+    if (desc.type === 'toggle') return v ? 'On' : 'Off';
+    if (desc.type === 'range') return Math.round(100 * v) + '%';
+    if (desc.type === 'seg') return titleCase(String(v));
+    return String(v);
+  }
+
+  function settingRowHTML(desc) {
+    let control = '';
+    if (desc.type === 'toggle')
+      control = `<input class="toggle" type="checkbox" data-key="${desc.key}"
+        aria-label="${esc(desc.label)}">`;
+    else if (desc.type === 'seg')
+      control = `<div class="seg" role="group" aria-label="${esc(desc.label)}">` +
+        desc.options.map(o => `<button type="button" data-key="${desc.key}"
+          data-value="${esc(o)}" aria-pressed="false">${esc(titleCase(o))}</button>`).join('') +
+        '</div>';
+    else if (desc.type === 'number')
+      control = `<input type="number" data-key="${desc.key}" min="${desc.min}" step="1"
+        aria-label="${esc(desc.label)}">`;
+    else if (desc.type === 'range')
+      control = `<span class="pct"></span><input type="range" data-key="${desc.key}"
+        min="0" max="0.9" step="0.01" aria-label="${esc(desc.label)}">`;
+    return `<div class="setting" data-setting="${desc.key}">
+      <div class="row"><span class="name">${esc(desc.label)}</span>${control}</div>
+      ${desc.hint ? `<p class="hint">${esc(desc.hint)}</p>` : ''}
+      <div class="caption"><span class="def"></span>
+        <button type="button" class="reset" data-reset="${desc.key}" hidden>Reset</button>
+      </div>
+    </div>`;
+  }
+
+  function syncSettingRow(desc) {
+    const s = state.settings && state.settings[desc.key];
+    const row = document.querySelector(`[data-setting="${desc.key}"]`);
+    if (!s || !row) return;
+    if (desc.type === 'toggle') row.querySelector('input').checked = s.value === true;
+    else if (desc.type === 'seg')
+      for (const b of row.querySelectorAll('.seg button'))
+        b.setAttribute('aria-pressed', String(b.dataset.value === s.value));
+    else if (desc.type === 'number') row.querySelector('input').value = s.value;
+    else if (desc.type === 'range') {
+      row.querySelector('input').value = s.value;
+      row.querySelector('.pct').textContent = Math.round(100 * s.value) + '%';
+    }
+    row.querySelector('.def').textContent = 'default: ' + fmtSetting(desc, s.default);
+    row.querySelector('.reset').hidden = !s.overridden;
+  }
+
+  function syncPaused() {
+    const s = state.settings && state.settings.paused;
+    $('paused').hidden = !(s && s.value === true);
+  }
+
+  // Optimistic: the UI flips first; a failed write reverts it with a toast.
+  async function writeSetting(desc, value) {
+    const s = state.settings[desc.key];
+    const prev = { ...s };
+    s.value = value;
+    s.overridden = true;
+    syncSettingRow(desc);
+    syncPaused();
+    try {
+      await putSetting(desc.key, value);
+      return true;
+    } catch (e) {
+      state.settings[desc.key] = prev;
+      syncSettingRow(desc);
+      syncPaused();
+      toast(`Could not update ${desc.label} · ${e.message || e}`, 'error');
+      return false;
+    }
+  }
+
+  async function resetSetting(desc) {
+    const s = state.settings[desc.key];
+    const prev = { ...s };
+    s.value = s.default;
+    s.overridden = false;
+    syncSettingRow(desc);
+    syncPaused();
+    try {
+      await delSetting(desc.key);
+    } catch (e) {
+      state.settings[desc.key] = prev;
+      syncSettingRow(desc);
+      syncPaused();
+      toast(`Could not reset ${desc.label} · ${e.message || e}`, 'error');
+    }
+  }
+
+  async function openSettings() {
+    try { state.settings = await getJSON('/api/settings'); }
+    catch (e) {
+      if (!state.settings) {
+        toast('Could not load settings · ' + (e.message || e), 'error');
+        return;
+      }
+    }
+    $('settings-body').innerHTML = SETTINGS.map(settingRowHTML).join('');
+    for (const desc of SETTINGS) syncSettingRow(desc);
+    syncPaused();
+    $('settings').showModal();
+  }
+
+  function bindSettings() {
+    $('open-settings').addEventListener('click', openSettings);
+    $('settings-close').addEventListener('click', () => $('settings').close());
+    const body = $('settings-body');
+    body.addEventListener('change', e => {
+      const t = e.target;
+      const desc = SETTINGS.find(d => d.key === t.dataset.key);
+      if (!desc || t.tagName !== 'INPUT') return;
+      if (desc.type === 'toggle') writeSetting(desc, t.checked);
+      else if (desc.type === 'number')
+        writeSetting(desc, Math.max(desc.min, Math.round(Number(t.value) || 0)));
+      else if (desc.type === 'range') writeSetting(desc, Number(t.value));
+    });
+    body.addEventListener('input', e => {
+      if (e.target.type !== 'range') return;
+      const pct = e.target.closest('.setting').querySelector('.pct');
+      pct.textContent = Math.round(100 * Number(e.target.value)) + '%';
+    });
+    body.addEventListener('click', e => {
+      const rst = e.target.closest('.reset');
+      if (rst) {
+        const desc = SETTINGS.find(d => d.key === rst.dataset.reset);
+        if (desc) resetSetting(desc);
+        return;
+      }
+      const segBtn = e.target.closest('.seg button');
+      if (!segBtn) return;
+      const desc = SETTINGS.find(d => d.key === segBtn.dataset.key);
+      if (desc && state.settings[desc.key].value !== segBtn.dataset.value)
+        writeSetting(desc, segBtn.dataset.value);
+    });
+    $('resume').addEventListener('click', async () => {
+      const desc = SETTINGS.find(d => d.key === 'paused');
+      if (state.settings && await writeSetting(desc, false)) toast('Automation Resumed');
+    });
+    $('run-now').addEventListener('click', async () => {
+      const b = $('run-now');
+      b.disabled = true;
+      try {
+        const resp = await fetch('/api/run', { method: 'POST' });
+        if (!resp.ok) throw new Error(await errDetail(resp));
+        toast('Pipeline requested — refresh in a few minutes');
+      } catch (e) {
+        toast('Could not request run · ' + (e.message || e), 'error');
+      }
+      b.disabled = false;
+    });
   }
 
   /* ── panel ─────────────────────────────────────────────────── */
@@ -694,14 +1008,17 @@
     $('banner').hidden = true;
     showSkeletons();
     try {
-      const [rows, stats] = await Promise.all([
+      const [rows, stats, runtime] = await Promise.all([
         getJSON('/api/recs?status=all'),
         getJSON('/api/stats').catch(() => null), // chips are decorative
+        getJSON('/api/settings').catch(() => null), // paused banner is best-effort
       ]);
       state.rows = rows;
       state.stats = stats;
+      if (runtime) state.settings = runtime;
       state.loaded = true;
       updateCounts();
+      syncPaused();
       renderPanel();
     } catch (e) {
       $('panel').innerHTML = '';
@@ -712,6 +1029,7 @@
   }
 
   renderTabs();
+  bindSettings();
   $('retry').addEventListener('click', load);
   load();
 })();

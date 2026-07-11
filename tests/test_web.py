@@ -131,7 +131,7 @@ def test_index_served(web):
     assert "/api/recs" in resp.text
     for symbol in ("i-check", "i-x", "i-info", "i-compass", "i-sparkle",
                    "i-film", "i-tv", "i-music", "i-clock", "i-chart",
-                   "i-play", "i-external"):
+                   "i-play", "i-external", "i-gear"):
         assert f'id="{symbol}"' in resp.text
     for label in ("All", "Movies", "Series", "Music", "History"):
         assert label in resp.text
@@ -139,6 +139,133 @@ def test_index_served(web):
     # Trailer/preview affordances ship as static strings in the page script.
     assert "youtube.com/watch" in resp.text
     assert "itunes.apple.com/search" in resp.text
+
+
+def test_index_head_and_controls(web):
+    client, *_ = web
+    text = client.get("/").text
+    # inline SVG favicon, url-encoded (not base64)
+    assert 'rel="icon"' in text
+    assert "data:image/svg+xml," in text
+    assert "base64" not in text
+    assert text.count('name="theme-color"') == 2
+    assert 'media="(prefers-color-scheme: light)"' in text
+    assert 'media="(prefers-color-scheme: dark)"' in text
+    assert 'name="description"' in text
+    for label in ("Run Now", "Settings", "Not Now", "Forgive", "Resume",
+                  "Automation Paused", "Snoozed for 30 days"):
+        assert label in text
+    assert "/api/settings" in text
+    assert "/api/run" in text
+    assert "<dialog" in text
+
+
+def test_settings_get_defaults(web):
+    client, *_ = web
+    resp = client.get("/api/settings")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert set(body) == {"paused", "music_mode", "music_max_artists_per_week",
+                         "video_queue_max_pending", "exploration_frac"}
+    for entry in body.values():
+        assert set(entry) == {"value", "overridden", "default"}
+        assert entry["overridden"] is False
+        assert entry["value"] == entry["default"]
+    assert body["paused"]["value"] is False
+    assert body["music_mode"]["value"] == "auto"
+    assert body["music_max_artists_per_week"]["value"] == 3
+    assert body["video_queue_max_pending"]["value"] == 20
+    assert body["exploration_frac"]["value"] == pytest.approx(0.15)
+
+
+def test_settings_put_overrides_and_delete_clears(web):
+    client, *_ = web
+    resp = client.put("/api/settings/paused", json={"value": True})
+    assert resp.status_code == 200
+    assert resp.json() == {"key": "paused", "value": True}
+    body = client.get("/api/settings").json()
+    assert body["paused"] == {"value": True, "overridden": True, "default": False}
+
+    # values are coerced on the way in ("5" → 5)
+    resp = client.put("/api/settings/music_max_artists_per_week", json={"value": "5"})
+    assert resp.status_code == 200
+    assert resp.json()["value"] == 5
+    body = client.get("/api/settings").json()
+    assert body["music_max_artists_per_week"]["value"] == 5
+    assert body["music_max_artists_per_week"]["default"] == 3
+
+    assert client.delete("/api/settings/paused").status_code == 200
+    body = client.get("/api/settings").json()
+    assert body["paused"] == {"value": False, "overridden": False, "default": False}
+    # clearing an already-clear key is a no-op, not an error
+    assert client.delete("/api/settings/paused").status_code == 200
+
+
+def test_settings_put_invalid_returns_400(web):
+    client, *_ = web
+    assert client.put("/api/settings/music_mode", json={"value": "chaos"}).status_code == 400
+    assert client.put("/api/settings/no_such_key", json={"value": 1}).status_code == 400
+    assert client.put("/api/settings/exploration_frac", json={"value": 2.0}).status_code == 400
+    assert client.put("/api/settings/video_queue_max_pending", json={"value": 0}).status_code == 400
+    assert client.put("/api/settings/paused", json={"nope": True}).status_code == 400
+    assert client.delete("/api/settings/no_such_key").status_code == 400
+    body = client.get("/api/settings").json()
+    assert all(not entry["overridden"] for entry in body.values())
+
+
+def test_snooze_flips_status_without_event(web):
+    client, cfg, movie_rec, _ = web
+    resp = client.post(f"/api/recs/{movie_rec}/snooze")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "snoozed"
+
+    (row,) = _fetch(cfg, "SELECT status, acted_at FROM recommendations WHERE id=?", movie_rec)
+    assert row["status"] == "snoozed"
+    assert row["acted_at"]
+    assert _fetch(cfg, "SELECT 1 FROM events WHERE item_id=?", MATRIX) == []
+    # snoozed is not re-snoozable; and only proposed recs can be snoozed
+    assert client.post(f"/api/recs/{movie_rec}/snooze").status_code == 409
+
+
+def test_snooze_only_from_proposed(web):
+    client, _, _, artist_rec = web
+    assert client.post(f"/api/recs/{artist_rec}/approve").status_code == 200
+    assert client.post(f"/api/recs/{artist_rec}/snooze").status_code == 409
+    assert client.post("/api/recs/99999/snooze").status_code == 409
+
+
+def test_forgive_expires_rec_and_deletes_reject_event(web):
+    client, cfg, _, artist_rec = web
+    assert client.post(f"/api/recs/{artist_rec}/reject").status_code == 200
+    assert len(_fetch(cfg, "SELECT 1 FROM events WHERE item_id=? AND kind='reject'",
+                      RADIOHEAD)) == 1
+
+    resp = client.post(f"/api/recs/{artist_rec}/forgive")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "expired"
+    (row,) = _fetch(cfg, "SELECT status FROM recommendations WHERE id=?", artist_rec)
+    assert row["status"] == "expired"
+    assert _fetch(cfg, "SELECT 1 FROM events WHERE item_id=? AND kind='reject'", RADIOHEAD) == []
+
+
+def test_forgive_requires_rejected(web):
+    client, _, movie_rec, _ = web
+    assert client.post(f"/api/recs/{movie_rec}/forgive").status_code == 409
+    assert client.post(f"/api/recs/{movie_rec}/approve").status_code == 200
+    assert client.post(f"/api/recs/{movie_rec}/forgive").status_code == 409
+    assert client.post("/api/recs/99999/forgive").status_code == 409
+
+
+def test_run_now_touches_sentinel(web):
+    client, cfg, *_ = web
+    sentinel = cfg.data_dir / "run-requested"
+    assert not sentinel.exists()
+    resp = client.post("/api/run")
+    assert resp.status_code == 200
+    assert resp.json() == {"requested": True}
+    assert sentinel.is_file()
+    # re-requesting while a sentinel is pending stays fine (touch is idempotent)
+    assert client.post("/api/run").status_code == 200
 
 
 def test_foreign_host_rejected(web):

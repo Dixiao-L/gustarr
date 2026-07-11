@@ -4,7 +4,9 @@ Explicitly approved recommendations are actuated in every mode — an
 approve is consent. On top of that, 'auto' mode adds proposed recs on
 its own: music inside a weekly cap, video capped per run. The caps, TTL
 expiry and dry_run all live here so every irreversible step is
-inspectable in one place.
+inspectable in one place. Modes and caps go through settings.get so a
+runtime override (state) beats the TOML; a 'paused' override stops the
+whole stage before any HTTP or store write.
 """
 
 from __future__ import annotations
@@ -14,7 +16,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from .. import db, http
+from .. import db, http, settings
 from ..config import Config
 from . import jellyfin_collections
 from .arr_client import ArrError, LidarrClient, RadarrClient, SonarrClient
@@ -68,6 +70,8 @@ def _record_add(conn: sqlite3.Connection, row: sqlite3.Row, ts: str) -> None:
 
 
 def run(conn: sqlite3.Connection, cfg: Config, dry_run: bool = False) -> dict[str, Any]:
+    if settings.get(conn, cfg, "paused"):
+        return {"paused": True}
     ts = db.now()
     stats: dict[str, Any] = {"errors": []}
     if dry_run:
@@ -106,12 +110,12 @@ def _apply_music(
         "SELECT COUNT(*) FROM recommendations WHERE domain='artist'"
         " AND status IN ('auto_added','added') AND acted_at>=?",
         (_week_start(),)).fetchone()[0]
-    budget = max(0, cfg.autonomy.music_max_artists_per_week - acted)
+    budget = max(0, settings.get(conn, cfg, "music_max_artists_per_week") - acted)
     stats["music_budget"] = budget
     # Approved rows are actuated in every mode (an explicit approve is
     # consent) and don't consume the weekly budget; proposed rows are
     # auto-picked only in auto mode, inside the budget.
-    auto = cfg.autonomy.music_mode == "auto"
+    auto = settings.get(conn, cfg, "music_mode") == "auto"
     rows = conn.execute(
         "SELECT r.id, r.item_id, r.status, r.why, i.title, i.ids FROM recommendations r"
         " JOIN items i ON i.id = r.item_id"
@@ -178,7 +182,7 @@ def _apply_video(
         # for an approve, capped at video_queue_max_pending per run
         # (video has no weekly budget; the pending cap bounds the blast
         # radius instead). Rows missing the arr's id don't burn a slot.
-        cap = cfg.autonomy.video_queue_max_pending
+        cap = settings.get(conn, cfg, "video_queue_max_pending")
         for row in conn.execute(sql, ("proposed",)):
             if cap <= 0:
                 break
@@ -232,7 +236,7 @@ def _expire_overflow(
     pending = conn.execute(
         "SELECT COUNT(*) FROM recommendations WHERE status='proposed'"
         " AND domain IN ('movie','series')").fetchone()[0]
-    surplus = max(0, pending - cfg.autonomy.video_queue_max_pending)
+    surplus = max(0, pending - settings.get(conn, cfg, "video_queue_max_pending"))
     if dry_run:
         stats["would_expire_overflow"] = surplus
         return

@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 
 from gustarr import config as C
-from gustarr import db
+from gustarr import db, settings
 from gustarr.ml import embed as embed_mod
 from gustarr.ml import rank as rank_mod
 from gustarr.ml import train as train_mod
@@ -583,6 +583,98 @@ def test_rank_skips_domain_when_all_state_is_stale(tmp_path):
     assert conn.execute("SELECT COUNT(*) AS n FROM recommendations").fetchone()["n"] == 0
 
 
+def _artist_centroid_store(tmp_path, names):
+    """Store with one centroid-scored artist candidate per (name, vec)."""
+    conn = db.connect(tmp_path / "t.db")
+    cfg = make_cfg(tmp_path)
+    model = cfg.model.embed_model
+    for name, v in names.items():
+        iid = f"artist:mbid:{name}"
+        db.upsert_item(conn, iid, "artist", title=name)
+        put_vec(conn, iid, v, model)
+        add_candidate(conn, iid, source="lastfm_similar")
+    db.set_state(conn, "centroid:artist", json.dumps({
+        "pos": b64(axis(0)), "neg": None, "dim": DIM, "embed_model": model,
+        "exemplars": []}))
+    return conn, cfg
+
+
+def iso_days_ago(days):
+    return (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_rank_active_snooze_blocks_reproposal(tmp_path):
+    conn, cfg = _artist_centroid_store(tmp_path, {"a1": axis(0), "a2": axis(1)})
+    conn.execute(
+        "INSERT INTO recommendations (run_id, ts, domain, item_id, score, status, acted_at)"
+        " VALUES ('r0', ?, 'artist', 'artist:mbid:a1', 0.9, 'snoozed', ?)",
+        (iso_days_ago(5), iso_days_ago(5)))
+
+    stats = rank_mod.run(conn, cfg)
+
+    assert stats["unsnoozed"] == 0
+    assert stats["proposed"] == 1
+    proposed = {r["item_id"] for r in conn.execute(
+        "SELECT item_id FROM recommendations WHERE status='proposed'")}
+    assert proposed == {"artist:mbid:a2"}  # a1 would top the score if it leaked
+    snoozed = conn.execute(
+        "SELECT status FROM recommendations WHERE item_id='artist:mbid:a1'").fetchone()
+    assert snoozed["status"] == "snoozed"
+
+
+def test_rank_lapsed_snooze_expires_and_reproposes(tmp_path):
+    conn, cfg = _artist_centroid_store(tmp_path, {"a1": axis(0)})
+    conn.execute(
+        "INSERT INTO recommendations (run_id, ts, domain, item_id, score, status, acted_at)"
+        " VALUES ('r0', ?, 'artist', 'artist:mbid:a1', 0.9, 'snoozed', ?)",
+        (iso_days_ago(45), iso_days_ago(31)))
+
+    stats = rank_mod.run(conn, cfg)
+
+    assert stats["unsnoozed"] == 1
+    assert stats["proposed"] == 1
+    rows = conn.execute(
+        "SELECT status, acted_at FROM recommendations WHERE item_id='artist:mbid:a1'"
+        " ORDER BY id").fetchall()
+    assert [r["status"] for r in rows] == ["expired", "proposed"]
+    assert rows[0]["acted_at"] > iso_days_ago(1)  # expiry stamped now, not snooze time
+
+
+def test_rank_exploration_frac_override_changes_slot_split(tmp_path):
+    conn = db.connect(tmp_path / "t.db")
+    cfg = make_cfg(tmp_path, exploration_frac=0.0)
+    model = cfg.model.embed_model
+    r = float(np.sqrt(1 - 0.49))
+    vecs = {
+        "m1": axis(0),
+        "m2": unit(0.8 * axis(0) + 0.6 * axis(2)),
+        "m3": unit(0.7 * axis(0) + r * axis(3)),
+        "m4": unit(0.6 * axis(0) + 0.8 * axis(4)),
+        "m5": unit(0.5 * axis(0) + 0.866 * axis(5)),
+        "m6": axis(1),
+        "m7": -axis(0),
+        "m8": unit(0.45 * axis(0) + 0.893 * axis(6)),
+        "m9": unit(0.4 * axis(0) + 0.917 * axis(7)),
+    }
+    for name, v in vecs.items():
+        iid = f"movie:tmdb:{name}"
+        db.upsert_item(conn, iid, "movie", title=name.upper())
+        put_vec(conn, iid, v, model)
+        add_candidate(conn, iid)
+    db.set_state(conn, "model:movie", json.dumps({
+        "w": b64(4.0 * axis(0)), "b": -1.0, "dim": DIM, "embed_model": model,
+        "trained_at": db.now(), "n_pos": 10, "n_neg": 3, "n_weak": 20}))
+    settings.set(conn, "exploration_frac", 0.4)
+
+    stats = rank_mod.run(conn, cfg, top=5)
+
+    assert stats["proposed"] == 5
+    flags = [json.loads(r["why"])["exploration"] for r in conn.execute(
+        "SELECT why FROM recommendations WHERE status='proposed'")]
+    # cfg alone would explore 0 slots; the override reserves round(5*0.4)
+    assert sum(flags) == 2
+
+
 def test_rank_respects_video_queue_cap(tmp_path):
     """Rank must stop proposing video items at the cap instead of letting
     apply mass-expire the overflow (churned 180 enriched items once)."""
@@ -606,3 +698,21 @@ def test_rank_respects_video_queue_cap(tmp_path):
         "SELECT COUNT(*) FROM recommendations WHERE domain IN ('movie','series')"
         " AND status='proposed'").fetchone()[0]
     assert open_video == 1  # cap already spent; nothing new proposed
+
+
+def test_rank_video_cap_override_widens_budget(tmp_path):
+    conn = db.connect(tmp_path / "t.db")
+    cfg = make_cfg(tmp_path)
+    cfg.autonomy.video_queue_max_pending = 1
+    model = cfg.model.embed_model
+    for i in range(4):
+        iid = f"movie:tmdb:c{i}"
+        db.upsert_item(conn, iid, "movie", title=f"C{i}")
+        put_vec(conn, iid, axis(i), model)
+        add_candidate(conn, iid)
+    db.set_state(conn, "centroid:movie", json.dumps({
+        "pos": b64(axis(0)), "neg": None, "dim": DIM, "embed_model": model,
+        "exemplars": []}))
+    settings.set(conn, "video_queue_max_pending", 3)
+    stats = rank_mod.run(conn, cfg, top=5)
+    assert stats["proposed"] == 3  # override 3 beats the cfg cap of 1

@@ -11,7 +11,7 @@ import httpx
 import pytest
 
 from gustarr import config as C
-from gustarr import db, http, signals
+from gustarr import db, http, settings, signals
 from gustarr.actuate import apply as apply_mod
 from gustarr.actuate import arr_client, jellyfin_collections
 from gustarr.config import ArrConfig
@@ -201,6 +201,78 @@ def add_rec(conn, item_id, domain, title, ids_json, status="proposed",
 
 def rec_row(conn, rec_id):
     return conn.execute("SELECT * FROM recommendations WHERE id=?", (rec_id,)).fetchone()
+
+
+# ── runtime settings overrides ───────────────────────────────────────
+
+
+def test_paused_short_circuits_music_and_video(conn, tmp_path, net):
+    cfg = make_cfg(tmp_path, video_mode="auto")
+    prop = add_rec(conn, "artist:mbid:mb1", "artist", "Artist 1", {"mbid": "mb1"}, score=0.9)
+    appr = add_rec(conn, "movie:tmdb:603", "movie", "The Matrix", {"tmdb": 603},
+                   status="approved")
+    stale = add_rec(conn, "movie:tmdb:604", "movie", "Old Prop", {"tmdb": 604},
+                    ts="2020-01-01T00:00:00Z")
+    settings.set(conn, "paused", True)
+
+    stats = apply_mod.run(conn, cfg)
+
+    assert stats == {"paused": True}
+    assert net.log == []  # no HTTP at all, arrs and jellyfin included
+    assert rec_row(conn, prop)["status"] == "proposed"
+    assert rec_row(conn, appr)["status"] == "approved"
+    assert rec_row(conn, stale)["status"] == "proposed"  # not even TTL expiry
+    # dry_run short-circuits the same way
+    assert apply_mod.run(conn, cfg, dry_run=True) == {"paused": True}
+    assert net.log == []
+
+    settings.clear(conn, "paused")
+    stats = apply_mod.run(conn, cfg)
+    assert stats["music_added"] == 1
+    assert stats["video_added"] == 1
+    assert rec_row(conn, stale)["status"] == "expired"
+
+
+def test_music_weekly_cap_override_honored(conn, tmp_path, net):
+    cfg = make_cfg(tmp_path, music_max_artists_per_week=3)
+    r1 = add_rec(conn, "artist:mbid:mb1", "artist", "Artist 1", {"mbid": "mb1"}, score=0.9)
+    r2 = add_rec(conn, "artist:mbid:mb2", "artist", "Artist 2", {"mbid": "mb2"}, score=0.8)
+    settings.set(conn, "music_max_artists_per_week", 1)
+    assert db.get_state(conn, "setting:music_max_artists_per_week") is not None
+
+    stats = apply_mod.run(conn, cfg)
+
+    assert stats["music_budget"] == 1
+    assert stats["music_added"] == 1
+    assert [b["foreignArtistId"] for b in net.lidarr.posted] == ["mb1"]
+    assert rec_row(conn, r1)["status"] == "auto_added"
+    assert rec_row(conn, r2)["status"] == "proposed"
+
+    settings.clear(conn, "music_max_artists_per_week")
+    stats = apply_mod.run(conn, cfg)
+    assert stats["music_budget"] == 2  # cfg cap 3 minus the add above
+    assert rec_row(conn, r2)["status"] == "auto_added"
+
+
+def test_music_mode_override_to_queue(conn, tmp_path, net):
+    cfg = make_cfg(tmp_path)  # cfg says auto
+    rid = add_rec(conn, "artist:mbid:mb1", "artist", "Artist 1", {"mbid": "mb1"})
+    settings.set(conn, "music_mode", "queue")
+    stats = apply_mod.run(conn, cfg)
+    assert stats["music_added"] == 0
+    assert net.lidarr.posted == []
+    assert rec_row(conn, rid)["status"] == "proposed"
+
+
+def test_video_cap_override_honored(conn, tmp_path, net):
+    cfg = make_cfg(tmp_path, video_mode="auto", video_queue_max_pending=5)
+    top = add_rec(conn, "movie:tmdb:1", "movie", "M1", {"tmdb": 1}, score=0.9)
+    low = add_rec(conn, "movie:tmdb:2", "movie", "M2", {"tmdb": 2}, score=0.8)
+    settings.set(conn, "video_queue_max_pending", 1)
+    stats = apply_mod.run(conn, cfg)
+    assert stats["video_added"] == 1
+    assert rec_row(conn, top)["status"] == "auto_added"
+    assert rec_row(conn, low)["status"] == "proposed"
 
 
 # ── music autonomy ───────────────────────────────────────────────────

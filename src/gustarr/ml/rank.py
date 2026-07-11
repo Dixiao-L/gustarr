@@ -18,7 +18,8 @@ from datetime import datetime, timedelta, timezone
 
 import numpy as np
 
-from .. import db
+from .. import db, settings
+from ..candidates import snooze_cutoff
 from ..config import Config
 
 # Music autonomy caps are low; a 20-deep artist queue just goes stale.
@@ -58,16 +59,19 @@ def _unit_rows(x: np.ndarray) -> np.ndarray:
 
 def _pool(conn: sqlite3.Connection, domain: str) -> dict[str, dict]:
     """Candidates still worth proposing: not owned, not already queued,
-    never explicitly rejected."""
+    not actively snoozed, never explicitly rejected."""
+    # The partial unique index only guards proposed/approved, so the
+    # active-snooze block must live in this query, not in the schema.
     rows = conn.execute(
         "SELECT c.item_id, c.source, c.external_score, c.seed_item_id"
         " FROM candidates c JOIN items i ON i.id = c.item_id"
         " WHERE i.domain = ?"
         "   AND c.item_id NOT IN (SELECT item_id FROM library)"
         "   AND c.item_id NOT IN (SELECT item_id FROM recommendations"
-        "                         WHERE status IN ('proposed','approved'))"
+        "                         WHERE status IN ('proposed','approved')"
+        "                            OR (status='snoozed' AND acted_at >= ?))"
         "   AND c.item_id NOT IN (SELECT item_id FROM events WHERE kind='reject')",
-        (domain,),
+        (domain, snooze_cutoff()),
     )
     info: dict[str, dict] = {}
     for r in rows:
@@ -208,12 +212,13 @@ def _select(
 def run(conn: sqlite3.Connection, cfg: Config, top: int = 20) -> dict:
     model_name = cfg.model.embed_model
     lam = cfg.model.diversity_lambda
-    explore_frac = cfg.model.exploration_frac
+    explore_frac = settings.get(conn, cfg, "exploration_frac")
     now_dt = datetime.now(timezone.utc)
     run_id = now_dt.strftime("%Y%m%d%H%M%S")
     ts = db.now()
     stats: dict = {
-        "proposed": 0, "expired": 0, "unembedded": 0, "rescored": 0, "stale_state": 0,
+        "proposed": 0, "expired": 0, "unsnoozed": 0, "unembedded": 0, "rescored": 0,
+        "stale_state": 0,
     }
 
     domains = [r["domain"] for r in conn.execute(
@@ -273,7 +278,8 @@ def run(conn: sqlite3.Connection, cfg: Config, top: int = 20) -> dict:
                 "SELECT COUNT(*) FROM recommendations"
                 " WHERE status='proposed' AND domain IN ('movie','series')"
             ).fetchone()[0]
-            slots = max(0, min(slots, cfg.autonomy.video_queue_max_pending - open_video))
+            cap = settings.get(conn, cfg, "video_queue_max_pending")
+            slots = max(0, min(slots, cap - open_video))
         slots = min(slots, len(ids))
         if slots == 0:
             continue
@@ -321,4 +327,9 @@ def run(conn: sqlite3.Connection, cfg: Config, top: int = 20) -> dict:
         "UPDATE recommendations SET status='expired', acted_at=?"
         " WHERE status='proposed' AND ts < ?", (ts, cutoff))
     stats["expired"] = cur.rowcount
+    # A snooze is a timer, not a verdict: once it lapses the rec becomes
+    # 'expired', which candidates/rank treat as re-proposable.
+    stats["unsnoozed"] = conn.execute(
+        "UPDATE recommendations SET status='expired', acted_at=?"
+        " WHERE status='snoozed' AND acted_at < ?", (ts, snooze_cutoff())).rowcount
     return stats

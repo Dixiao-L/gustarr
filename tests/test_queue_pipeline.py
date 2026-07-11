@@ -9,7 +9,7 @@ import types
 import pytest
 
 from gustarr import config as C
-from gustarr import db, pipeline, queue
+from gustarr import db, pipeline, queue, settings
 from gustarr.signals import WEIGHTS, aggregate_label
 
 
@@ -187,6 +187,105 @@ def test_set_status_guards(conn):
     assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
 
 
+# ── queue: snooze ────────────────────────────────────────────────────
+
+
+def test_snooze_sets_acted_at_and_writes_no_event(conn):
+    rid = add_rec(conn, "movie:tmdb:20", title="Later", score=0.7)
+    stats = queue.set_status(conn, rid, "snoozed")
+    assert stats == {"updated": 1, "events": 0}
+
+    rec = conn.execute("SELECT * FROM recommendations WHERE id=?", (rid,)).fetchone()
+    assert rec["status"] == "snoozed"
+    assert rec["acted_at"] is not None
+    # not a verdict — the model must learn nothing from a snooze
+    assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+
+
+def test_double_snooze_raises(conn):
+    rid = add_rec(conn, "movie:tmdb:21", title="Later")
+    queue.set_status(conn, rid, "snoozed")
+    with pytest.raises(ValueError, match="already snoozed"):
+        queue.set_status(conn, rid, "snoozed")
+
+
+def test_snooze_only_from_proposed(conn):
+    approved = add_rec(conn, "movie:tmdb:22", title="Yes", status="approved")
+    with pytest.raises(ValueError, match="approved"):
+        queue.set_status(conn, approved, "snoozed")
+    rejected = add_rec(conn, "movie:tmdb:23", title="No", status="rejected")
+    with pytest.raises(ValueError, match="rejected"):
+        queue.set_status(conn, rejected, "snoozed")
+    assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+
+
+def test_snoozed_rec_can_still_be_approved(conn):
+    rid = add_rec(conn, "movie:tmdb:24", title="Actually Yes")
+    queue.set_status(conn, rid, "snoozed")
+    queue.set_status(conn, rid, "approved")
+    rec = conn.execute("SELECT status FROM recommendations WHERE id=?", (rid,)).fetchone()
+    assert rec["status"] == "approved"
+    assert conn.execute("SELECT COUNT(*) FROM events WHERE kind='approve'").fetchone()[0] == 1
+
+
+def test_list_recs_filters_snoozed(conn):
+    add_rec(conn, "movie:tmdb:25", title="Open")
+    snoozed = add_rec(conn, "movie:tmdb:26", title="Napping")
+    queue.set_status(conn, snoozed, "snoozed")
+
+    assert [r["title"] for r in queue.list_recs(conn, status="snoozed")] == ["Napping"]
+    assert [r["title"] for r in queue.list_recs(conn)] == ["Open"]
+
+
+# ── queue: forgive ───────────────────────────────────────────────────
+
+
+def test_forgive_deletes_only_that_recs_reject_and_expires_it(conn):
+    # two rejected recs for the SAME item (legal: the partial unique index
+    # only covers open statuses) — forgiving one must not touch the other's
+    # reject event
+    first = add_rec(conn, "movie:tmdb:30", title="Redeemed", score=0.5)
+    queue.set_status(conn, first, "rejected")
+    # backdate the first verdict: same-second rejects of one item would
+    # collapse into a single row under the events uniqueness key
+    conn.execute("UPDATE events SET ts='2026-01-01T00:00:00Z' WHERE kind='reject'")
+    second = add_rec(conn, "movie:tmdb:30", title="Redeemed", score=0.6)
+    queue.set_status(conn, second, "rejected")
+    assert conn.execute("SELECT COUNT(*) FROM events WHERE kind='reject'").fetchone()[0] == 2
+
+    stats = queue.forgive(conn, first)
+    assert stats == {"deleted_events": 1}
+
+    rec = conn.execute("SELECT status FROM recommendations WHERE id=?", (first,)).fetchone()
+    assert rec["status"] == "expired"
+    survivors = conn.execute("SELECT meta FROM events WHERE kind='reject'").fetchall()
+    assert [json.loads(r["meta"])["rec_id"] for r in survivors] == [second]
+    other = conn.execute("SELECT status FROM recommendations WHERE id=?", (second,)).fetchone()
+    assert other["status"] == "rejected"
+
+
+def test_forgive_spares_other_event_kinds(conn):
+    rid = add_rec(conn, "movie:tmdb:31", title="Watched Anyway")
+    queue.set_status(conn, rid, "rejected")
+    db.add_event(conn, "2026-01-01T00:00:00Z", "movie:tmdb:31", "complete",
+                 WEIGHTS["complete"], "jellyfin")
+
+    assert queue.forgive(conn, rid) == {"deleted_events": 1}
+    kinds = [r[0] for r in conn.execute("SELECT kind FROM events")]
+    assert kinds == ["complete"]
+
+
+def test_forgive_requires_rejected(conn):
+    with pytest.raises(ValueError, match="no recommendation"):
+        queue.forgive(conn, 999)
+    proposed = add_rec(conn, "movie:tmdb:32", title="Open")
+    with pytest.raises(ValueError, match="proposed"):
+        queue.forgive(conn, proposed)
+    added = add_rec(conn, "movie:tmdb:33", title="Done", status="added")
+    with pytest.raises(ValueError, match="added"):
+        queue.forgive(conn, added)
+
+
 # ── queue: explain ───────────────────────────────────────────────────
 
 
@@ -238,6 +337,8 @@ def test_explain_unknown_rec_raises(conn):
 def test_store_stats(conn):
     add_rec(conn, "movie:tmdb:1", title="M", score=0.5)
     add_rec(conn, "movie:tmdb:2", title="N", score=0.6, status="added")
+    add_rec(conn, "movie:tmdb:4", title="Z", score=0.4, status="snoozed")
+    settings.set(conn, "paused", True)
     db.upsert_item(conn, "artist:mbid:aa", "artist", "Radiohead")
     db.add_event(conn, "2024-01-01T00:00:00Z", "artist:mbid:aa", "scrobble",
                  WEIGHTS["scrobble"], "lastfm")
@@ -254,16 +355,18 @@ def test_store_stats(conn):
     db.set_state(conn, "model:movie", json.dumps({"trained_at": "2026-07-01T00:00:00Z"}))
 
     s = queue.store_stats(conn)
-    assert s["tables"]["items"] == 3
+    assert s["tables"]["items"] == 4
     assert s["tables"]["events"] == 3
-    assert s["tables"]["recommendations"] == 2
+    assert s["tables"]["recommendations"] == 3
     assert s["tables"]["candidates"] == 1
     assert s["tables"]["embeddings"] == 1
     assert s["events_by_kind"] == {"scrobble": 2, "complete": 1}
-    assert s["recs_by_status"] == {"proposed": 1, "added": 1}
+    # snoozed shows up like any other status — no special-casing
+    assert s["recs_by_status"] == {"proposed": 1, "added": 1, "snoozed": 1}
     assert s["sync"]["lastfm:last_uts"] == "1700000000"
     assert s["sync"]["arr:known:radarr"] is True
     assert s["models"]["movie"] == "2026-07-01T00:00:00Z"
+    assert s["settings_overridden"] == 1  # only setting:% keys count
     # 3 items carry events/candidates; only the artist has a vector
     assert s["embedding_coverage"] == {"needed": 3, "embedded": 1}
 
@@ -322,6 +425,78 @@ def test_store_stats_diversity_windows_last_100_recs(conn):
     d = queue.store_stats(conn)["diversity"]
     assert d["genre_entropy_recs"] == 1.0  # 50/50 Drama-Comedy; Western aged out
     assert d["exploration_share"] == 0.0
+
+
+# ── settings ─────────────────────────────────────────────────────────
+
+
+def test_settings_defaults_come_from_config(conn, cfg):
+    assert settings.get(conn, cfg, "paused") is False
+    assert settings.get(conn, cfg, "music_mode") == "auto"
+    assert settings.get(conn, cfg, "music_max_artists_per_week") == 3
+    assert settings.get(conn, cfg, "video_queue_max_pending") == 20
+    assert settings.get(conn, cfg, "exploration_frac") == 0.15
+
+
+def test_settings_override_wins_and_clear_restores(conn, cfg):
+    assert settings.set(conn, "music_mode", "queue") == "queue"
+    assert settings.get(conn, cfg, "music_mode") == "queue"
+    # persisted json-encoded under the documented state key
+    assert db.get_state(conn, "setting:music_mode") == '"queue"'
+
+    settings.clear(conn, "music_mode")
+    assert settings.get(conn, cfg, "music_mode") == "auto"
+    assert db.get_state(conn, "setting:music_mode") is None
+    settings.clear(conn, "music_mode")  # clearing a non-override is a no-op
+
+
+def test_settings_get_all_reports_overrides(conn, cfg):
+    settings.set(conn, "paused", "true")
+    allv = settings.get_all(conn, cfg)
+    assert set(allv) == set(settings.RUNTIME_KEYS)
+    assert allv["paused"] == {"value": True, "overridden": True, "default": False}
+    assert allv["exploration_frac"] == {"value": 0.15, "overridden": False, "default": 0.15}
+
+
+def test_settings_coercion(conn):
+    assert settings.set(conn, "music_max_artists_per_week", "3") == 3
+    assert settings.set(conn, "paused", "true") is True
+    assert settings.set(conn, "paused", "false") is False
+    assert settings.set(conn, "exploration_frac", "0.5") == 0.5
+    assert settings.set(conn, "video_queue_max_pending", 1) == 1
+    # coerced types (not the raw strings) survive the json round-trip
+    assert json.loads(db.get_state(conn, "setting:music_max_artists_per_week")) == 3
+    assert json.loads(db.get_state(conn, "setting:paused")) is False
+    assert json.loads(db.get_state(conn, "setting:exploration_frac")) == 0.5
+
+
+def test_settings_unknown_key_raises(conn, cfg):
+    with pytest.raises(ValueError, match="unknown setting"):
+        settings.set(conn, "nope", 1)
+    with pytest.raises(ValueError, match="unknown setting"):
+        settings.get(conn, cfg, "nope")
+    with pytest.raises(ValueError, match="unknown setting"):
+        settings.clear(conn, "nope")
+
+
+def test_settings_invalid_values_raise(conn):
+    for key, bad in [
+        ("paused", "maybe"),
+        ("music_mode", "chaos"),
+        ("music_max_artists_per_week", -1),
+        ("music_max_artists_per_week", "lots"),
+        ("music_max_artists_per_week", 2.5),
+        ("music_max_artists_per_week", True),  # bool is not an int here
+        ("video_queue_max_pending", 0),
+        ("exploration_frac", 0.95),
+        ("exploration_frac", -0.1),
+        ("exploration_frac", "wide"),
+    ]:
+        with pytest.raises(ValueError):
+            settings.set(conn, key, bad)
+    # a failed set must never leave a partial override behind
+    n = conn.execute("SELECT COUNT(*) FROM state WHERE key LIKE 'setting:%'").fetchone()[0]
+    assert n == 0
 
 
 # ── pipeline ─────────────────────────────────────────────────────────
