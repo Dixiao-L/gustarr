@@ -461,6 +461,52 @@ def test_rank_exploration_fallback_without_serendipity(tmp_path):
     assert "serendipity" not in whys["movie:tmdb:f4"]
 
 
+def test_rank_album_domain_slots_and_video_cap_exemption(tmp_path):
+    """Albums rank with ALBUM_TOP=10 slots (not the run-wide top) and,
+    like artists, never count against or suffer the video queue cap."""
+    conn = db.connect(tmp_path / "t.db")
+    cfg = make_cfg(tmp_path)
+    cfg.autonomy.video_queue_max_pending = 1
+    model = cfg.model.embed_model
+    rng = np.random.default_rng(7)
+
+    db.upsert_item(conn, "artist:mbid:seed-a", "artist", title="Seed Artist")
+    # 15 candidates: enough leftover after the 8 MMR picks that the 40-90
+    # exploration band can fill both exploration slots
+    for i in range(15):
+        iid = f"album:mbid:al{i}"
+        db.upsert_item(conn, iid, "album", title=f"AL{i}")
+        put_vec(conn, iid, unit(axis(0) + 0.3 * rng.normal(size=DIM)), model)
+        add_candidate(conn, iid, source="lastfm_top_albums", seed="artist:mbid:seed-a",
+                      ext=1.0 - 0.05 * i)
+    db.set_state(conn, "centroid:album", json.dumps({
+        "pos": b64(axis(0)), "neg": None, "dim": DIM, "embed_model": model,
+        "exemplars": []}))
+    # movies in the same run: the video cap of 1 must bite them, not albums
+    for i in range(3):
+        iid = f"movie:tmdb:m{i}"
+        db.upsert_item(conn, iid, "movie", title=f"M{i}")
+        put_vec(conn, iid, axis(i + 1), model)
+        add_candidate(conn, iid)
+    db.set_state(conn, "centroid:movie", json.dumps({
+        "pos": b64(axis(1)), "neg": None, "dim": DIM, "embed_model": model,
+        "exemplars": []}))
+
+    stats = rank_mod.run(conn, cfg, top=20)
+
+    assert stats["album"] == 10  # ALBUM_TOP, not top=20 or the video cap
+    assert stats["movie"] == 1  # the cap only ever constrains video domains
+    rows = conn.execute(
+        "SELECT * FROM recommendations WHERE domain='album' AND status='proposed'").fetchall()
+    assert len(rows) == 10
+    for r in rows:
+        why = json.loads(r["why"])
+        assert why["sources"] == ["lastfm_top_albums"]
+        assert why["seeds"] == ["Seed Artist"]
+        assert isinstance(why["exploration"], bool)
+        assert 0.0 <= r["score"] <= 1.2
+
+
 def test_rank_centroid_fallback_artist(tmp_path):
     conn = db.connect(tmp_path / "t.db")
     cfg = make_cfg(tmp_path)

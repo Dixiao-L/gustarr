@@ -411,6 +411,9 @@
   'use strict';
 
   const TMDB = 'https://image.tmdb.org/t/p/w342';
+  // Client-side twin of the server's /api/recs?domain=music alias: the page
+  // fetches every domain in one status=all request and tabs filter locally,
+  // so the Music tab's artist+album+track span lives in this set.
   const MUSIC = new Set(['artist', 'album', 'track']);
   const TABS = [
     { id: 'all', label: 'All' },
@@ -427,6 +430,7 @@
     { key: 'paused', label: 'Pause Automation', type: 'toggle' },
     { key: 'music_mode', label: 'Music Mode', type: 'seg', options: ['auto', 'queue'] },
     { key: 'music_max_artists_per_week', label: 'Weekly Artist Cap', type: 'number', min: 0 },
+    { key: 'music_max_albums_per_week', label: 'Weekly Album Cap', type: 'number', min: 0 },
     { key: 'video_queue_max_pending', label: 'Video Queue Depth', type: 'number', min: 1 },
     { key: 'exploration_frac', label: 'Exploration Fraction', type: 'range',
       hint: 'Share of each run reserved for outside-your-bubble picks' },
@@ -439,6 +443,7 @@
   const icon = name =>
     `<svg class="icon" aria-hidden="true"><use href="#i-${name}"/></svg>`;
   const clamp01 = n => Math.max(0, Math.min(1, Number(n) || 0));
+  const titleCase = s => s.charAt(0).toUpperCase() + s.slice(1);
   const simFmt = n => {
     const t = Number(n).toFixed(2);
     return t.startsWith('0.') ? t.slice(1) : t;
@@ -561,15 +566,23 @@
   }
 
   function posterHTML(r) {
-    if (r.poster_path && r.domain !== 'artist')
+    // meta.image (artist/album art) is already a full URL; poster_path is a
+    // TMDB fragment that needs the CDN prefix and never applies to artists.
+    const src = r.image ? r.image
+      : r.poster_path && r.domain !== 'artist' ? TMDB + r.poster_path : null;
+    if (src)
       return `<div class="poster">${monogramHTML(r)}<img loading="lazy" decoding="async"
-        alt="" src="${TMDB}${esc(r.poster_path)}"></div>`;
+        alt="" src="${esc(src)}"></div>`;
     return `<div class="poster">${monogramHTML(r)}</div>`;
   }
 
   function badgesHTML(r, history) {
     const w = r.why || {};
     const b = [];
+    // The Music tab mixes artists and albums; the chip says which one this
+    // card is (meta.type refines albums into e.g. "Single" or "EP").
+    if (MUSIC.has(r.domain))
+      b.push(`<span class="badge dim type">${esc(titleCase(String(r.type || r.domain)))}</span>`);
     if (w.exploration) b.push(`<span class="badge">${icon('compass')}Exploration</span>`);
     if (w.serendipity) b.push(`<span class="badge">${icon('sparkle')}Serendipity</span>`);
     if (history) {
@@ -691,6 +704,8 @@
       ${posterHTML(r)}
       <div class="body">
         <h3 class="title">${esc(r.title || r.item_id)}</h3>
+        ${r.domain === 'album' && r.artist
+          ? `<p class="meta byline">by ${esc(r.artist)}</p>` : ''}
         ${meta ? `<p class="meta" title="${esc(meta)}">${esc(meta)}</p>` : ''}
         <div class="score">
           <span class="track"><span class="fill"
@@ -808,8 +823,6 @@
     const resp = await fetch('/api/settings/' + key, { method: 'DELETE' });
     if (!resp.ok) throw new Error(await errDetail(resp));
   }
-
-  const titleCase = s => s.charAt(0).toUpperCase() + s.slice(1);
 
   function fmtSetting(desc, v) {
     if (desc.type === 'toggle') return v ? 'On' : 'Off';

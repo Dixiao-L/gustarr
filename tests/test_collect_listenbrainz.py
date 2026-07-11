@@ -18,6 +18,8 @@ MBID_C = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 MBID_X = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"  # CF hit with no resolvable metadata
 MBID_W = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"  # weekly-only track
 ARTIST_1 = "11111111-1111-4111-8111-111111111111"
+RELEASE_1 = "99999999-9999-4999-8999-999999999999"  # shared by tracks A and B
+RELEASE_2 = "88888888-8888-4888-8888-888888888888"  # track C's, artist has no mbid
 PL_OLD = "00000000-0000-4000-8000-000000000001"
 PL_NEW = "00000000-0000-4000-8000-000000000002"
 
@@ -37,18 +39,18 @@ METADATA = {
         "recording": {"name": "Song A"},
         "artist": {"name": "Artist One", "artist_credit_id": 1,
                    "artists": [{"artist_mbid": ARTIST_1, "name": "Artist One"}]},
-        "release": {"name": "Album A", "mbid": "99999999-9999-4999-8999-999999999999"},
+        "release": {"name": "Album A", "mbid": RELEASE_1},
     },
     MBID_B: {
         "recording": {"name": "Song B"},
         "artist": {"name": "Artist One", "artist_credit_id": 1,
                    "artists": [{"artist_mbid": ARTIST_1, "name": "Artist One"}]},
-        "release": {"name": "Album B"},
+        "release": {"name": "Album A", "mbid": RELEASE_1},
     },
     MBID_C: {
         "recording": {"name": "Song C"},
         "artist": {"name": "The Unknowns", "artists": []},
-        "release": {},
+        "release": {"name": "Album C", "mbid": RELEASE_2},
     },
 }
 
@@ -171,6 +173,38 @@ def test_cf_candidates_scores_and_artist_aggregation(conn, cfg, monkeypatch):
     assert all(c[2].get("authorization") == "Token sekrit" for c in seen)
 
 
+def test_cf_groups_tracks_into_album_candidates(conn, cfg, monkeypatch):
+    install(monkeypatch, make_handler([]))
+
+    stats = listenbrainz.sync(conn, cfg)
+
+    assert stats["cf_albums"] == 2
+    # tracks A (0.9) and B (0.7) share RELEASE_1: the album takes the max
+    row = candidate(conn, f"album:mbid:{RELEASE_1}", "listenbrainz_cf_album")
+    assert row["external_score"] == pytest.approx(0.9)
+    item = conn.execute(
+        "SELECT * FROM items WHERE id=?", (f"album:mbid:{RELEASE_1}",)).fetchone()
+    assert item["domain"] == "album" and item["title"] == "Album A"
+    assert json.loads(item["ids"]) == {"mbid": RELEASE_1, "artist_mbid": ARTIST_1}
+    meta = json.loads(item["meta"])
+    assert meta["artist"] == "Artist One" and meta["artist_mbid"] == ARTIST_1
+
+    # release whose artist has no mbid still becomes an album, sans artist_mbid
+    row2 = candidate(conn, f"album:mbid:{RELEASE_2}", "listenbrainz_cf_album")
+    assert row2["external_score"] == pytest.approx(0.5)
+    item2 = conn.execute(
+        "SELECT * FROM items WHERE id=?", (f"album:mbid:{RELEASE_2}",)).fetchone()
+    assert item2["title"] == "Album C"
+    assert json.loads(item2["ids"]) == {"mbid": RELEASE_2}
+    assert json.loads(item2["meta"]) == {"artist": "The Unknowns"}
+
+    # metadata-less track X grew no album row: exactly the two above exist
+    n = conn.execute(
+        "SELECT COUNT(*) c FROM candidates WHERE source='listenbrainz_cf_album'"
+    ).fetchone()["c"]
+    assert n == 2
+
+
 def test_weekly_exploration_fetches_newest_playlist(conn, cfg, monkeypatch):
     seen: list = []
     install(monkeypatch, make_handler(seen))
@@ -216,7 +250,7 @@ def test_rerun_is_idempotent_and_refreshes_last_seen(conn, cfg, monkeypatch):
     listenbrainz.sync(conn, cfg)
     n_candidates = conn.execute("SELECT COUNT(*) c FROM candidates").fetchone()["c"]
     n_items = conn.execute("SELECT COUNT(*) c FROM items").fetchone()["c"]
-    assert n_candidates == 8  # 4 cf tracks + 2 cf artists + 2 weekly tracks
+    assert n_candidates == 10  # 4 cf tracks + 2 cf artists + 2 cf albums + 2 weekly tracks
     conn.execute("UPDATE candidates SET last_seen='2020-01-01T00:00:00Z',"
                  " first_seen='2020-01-01T00:00:00Z'")
 

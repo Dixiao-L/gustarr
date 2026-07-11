@@ -1,0 +1,25 @@
+# build context = pyproject.toml, README.md, LICENSE, src/ — exclude the rest
+.git
+.github
+.gitignore
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+tests
+docs
+nix
+flake.nix
+flake.lock
+uv.lock
+Dockerfile
+.dockerignore
+docker-compose*.yml
+gustarr.toml
+gustarr.example.toml
+gustarr.env
+*.db
+*.db-wal
+*.db-shm
+CHANGELOG.md

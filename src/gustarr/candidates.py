@@ -3,7 +3,8 @@
 Seeds are the top positively-labelled items per domain (same label
 policy as training — signals.aggregate_label). Movies/series fan out
 through TMDb recommendations/similar plus a genre-keyed discover pass
-for exploration; artists through Last.fm similar. A serendipity pass
+for exploration; artists through Last.fm similar; albums through
+Last.fm top-albums of the liked artists. A serendipity pass
 counters the bubble those sources create: TMDb discover over the user's
 under-represented genres and least-visited decade (quality-floored),
 and a damped 2-hop Last.fm fan-out from the best hop-1 candidates.
@@ -36,7 +37,23 @@ MAX_NEW_PER_SOURCE = 200
 # Serendipity: deliberate off-taste probes. Tighter cap than the taste
 # sources — seasoning, not the meal.
 SERENDIPITY_MAX_NEW = 100
-SOURCE_CAPS = {"serendipity_tmdb": SERENDIPITY_MAX_NEW, "serendipity_lastfm": SERENDIPITY_MAX_NEW}
+
+# Albums fan out from the already-curated artist seed list, so a modest
+# per-artist depth and run cap keep the pool from drowning in one
+# discography-heavy artist.
+ALBUMS_PER_ARTIST = 8
+# Raw playcounts span orders of magnitude between a mega-act and a niche
+# artist; rank within the artist keeps external_score comparable.
+# 1.0 for the artist's #1 album stepping down to 0.3 for #8.
+ALBUM_RANK_STEP = 0.1
+ALBUM_RANK_FLOOR = 0.3
+ALBUM_MAX_NEW = 100
+
+SOURCE_CAPS = {
+    "serendipity_tmdb": SERENDIPITY_MAX_NEW,
+    "serendipity_lastfm": SERENDIPITY_MAX_NEW,
+    "lastfm_top_albums": ALBUM_MAX_NEW,
+}
 SERENDIPITY_GENRE_PROBES = 4
 # Quality floor: serendipity should be great-but-unfamiliar, not random junk.
 SERENDIPITY_VOTE_FLOOR = 500
@@ -65,7 +82,7 @@ def snooze_cutoff() -> str:
 
 
 def run(conn: sqlite3.Connection, cfg: Config, domain: str | None = None) -> dict[str, Any]:
-    domains = [domain] if domain else ["movie", "series", "artist"]
+    domains = [domain] if domain else ["movie", "series", "artist", "album"]
     stats: dict[str, Any] = {
         "seeds": {}, "new": {}, "updated": {}, "skipped": 0, "capped": [], "errors": 0,
         "serendipity": 0,
@@ -87,6 +104,12 @@ def run(conn: sqlite3.Connection, cfg: Config, domain: str | None = None) -> dic
             _lastfm_similar(conn, lastfm_key, [iid for iid, _ in positives[:SEED_LIMIT]],
                             pool, stats)
             _lastfm_serendipity(conn, lastfm_key, positives, pool, stats)
+        elif dom == "album" and lastfm_key:
+            # Album taste rides on artist taste: reuse the artist seed list
+            # rather than inventing a separate album label policy.
+            positives = _positive_items(conn, "artist")
+            _lastfm_top_albums(conn, lastfm_key, [iid for iid, _ in positives[:SEED_LIMIT]],
+                               pool, stats)
     stats["serendipity"] = sum(
         n for src, n in stats["new"].items() if src.startswith("serendipity_"))
     return stats
@@ -442,6 +465,71 @@ def _lastfm_similar(conn: sqlite3.Connection, api_key: str, seed_ids: list[str],
             pool.add(item_id, "artist", name, None, {"mbid": mb} if mb else {}, {},
                      "lastfm_similar", seed_id, score)
     stats["seeds"]["artist"] = used
+
+
+# ── Last.fm: top albums ──────────────────────────────────────────────
+
+
+def _artist_mbid(conn: sqlite3.Connection, item_id: str) -> str | None:
+    _, ns, key = ids.parse(item_id)
+    if ns == "mbid":
+        return key
+    row = conn.execute("SELECT ids FROM items WHERE id=?", (item_id,)).fetchone()
+    mbid = json.loads(row["ids"]).get("mbid") if row else None
+    return str(mbid) if mbid else None
+
+
+def _top_albums(data: Any) -> list[dict[str, Any]]:
+    albums = ((data or {}).get("topalbums") or {}).get("album") or []
+    if isinstance(albums, dict):  # last.fm collapses single-element lists
+        albums = [albums]
+    return albums
+
+
+def _lastfm_top_albums(conn: sqlite3.Connection, api_key: str, seed_ids: list[str],
+                       pool: _Pool, stats: dict[str, Any]) -> None:
+    """Most-played albums of the liked artists.
+
+    Albums by artists already in the library are exactly the point of
+    this source (own the artist, missing the record), so only the usual
+    item-level exclusions apply — no artist-level filtering.
+
+    Last.fm album mbids are sometimes RELEASE mbids rather than the
+    release-group mbids Lidarr wants; store them as-is. Enrich owns the
+    release-group resolution — MB /release-group/{id} 404s on a release
+    id, and enrich absorbs that failure gracefully.
+    """
+    used = 0
+    for seed_id in seed_ids:
+        mbid = _artist_mbid(conn, seed_id)
+        if not mbid:
+            continue  # name-only artists wait until enrich reveals an mbid
+        used += 1
+        try:
+            data = http.get_json(LASTFM, params={
+                "method": "artist.gettopalbums", "api_key": api_key, "format": "json",
+                "mbid": mbid, "limit": ALBUMS_PER_ARTIST})
+        except http.ApiError:
+            stats["errors"] += 1
+            continue
+        # enumerate over the full response: an mbid-less album still holds
+        # its playcount rank, it just never becomes an item.
+        for rank, album in enumerate(_top_albums(data)):
+            album_mbid, title = album.get("mbid") or None, album.get("name")
+            if not (album_mbid and title):
+                continue  # nothing Lidarr could ever act on
+            artist = album.get("artist") or {}
+            artist_mbid = artist.get("mbid") or mbid
+            score = max(ALBUM_RANK_FLOOR, 1.0 - ALBUM_RANK_STEP * rank)
+            # artist_mbid lands in ids (the actuate/Lidarr contract) and is
+            # mirrored with the name into meta for the UI and enrich.
+            meta: dict[str, Any] = {"artist_mbid": artist_mbid}
+            if artist.get("name"):
+                meta["artist"] = artist["name"]
+            pool.add(ids.make("album", "mbid", album_mbid), "album", title, None,
+                     {"mbid": album_mbid, "artist_mbid": artist_mbid}, meta,
+                     "lastfm_top_albums", seed_id, score)
+    stats["seeds"]["album"] = used
 
 
 # ── serendipity: Last.fm ─────────────────────────────────────────────

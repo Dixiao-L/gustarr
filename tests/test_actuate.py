@@ -31,6 +31,33 @@ class FakeArr:
         self.fail_add = None  # (status_code, body_text)
         # Retry-After: 0 keeps http.py's 5xx retry loop sleepless in tests
         self.fail_headers = {"Retry-After": "0"}
+        # lidarr album model: album rows exist only under an added artist
+        self.artists = []  # artist rows in the library (with id)
+        self.albums = []  # album rows, materialized by artist adds
+        self.album_lookup = {}  # album mbid -> lookup metadata
+        self.next_album_id = 0
+        self.monitor_puts = []  # recorded PUT album/monitor bodies
+        self.commands = []  # recorded POST command bodies
+
+    def register_artist(self, foreign_id, name):
+        """Pre-existing library artist (added outside gustarr): its album
+        rows materialize immediately, as lidarr's own add would do."""
+        row = {"id": 900 + len(self.artists), "artistName": name,
+               "foreignArtistId": foreign_id}
+        self.artists.append(row)
+        self._spawn_albums(row)
+        return row
+
+    def _spawn_albums(self, artist_row):
+        # mirror lidarr: adding an artist creates its album rows; there
+        # is no direct "add album" endpoint
+        for mbid, meta in self.album_lookup.items():
+            if meta["artist_mbid"] == artist_row["foreignArtistId"]:
+                self.next_album_id += 1
+                self.albums.append({
+                    "id": self.next_album_id, "foreignAlbumId": mbid,
+                    "title": meta["title"], "artistId": artist_row["id"],
+                    "monitored": meta.get("monitored", False)})
 
     def handle(self, request: httpx.Request, path: str) -> httpx.Response:
         if request.headers.get("X-Api-Key") != self.api_key:
@@ -60,6 +87,45 @@ class FakeArr:
             mbid = request.url.params["term"].split(":", 1)[1]
             return httpx.Response(
                 200, json=[{"artistName": f"Artist {mbid}", "foreignArtistId": mbid}])
+        if path == "artist" and request.method == "GET":
+            return httpx.Response(200, json=self.artists)
+        if path == "album/lookup":
+            mbid = request.url.params["term"].split(":", 1)[1]
+            meta = self.album_lookup.get(mbid)
+            if meta is None:
+                return httpx.Response(200, json=[])
+            # the embedded artist resource carries an id only when the
+            # artist is already in the library — that id presence is what
+            # the client keys the shell-add decision on
+            artist = next(
+                (a for a in self.artists if a["foreignArtistId"] == meta["artist_mbid"]),
+                None) or {"artistName": meta["artist_name"],
+                          "foreignArtistId": meta["artist_mbid"]}
+            return httpx.Response(200, json=[
+                {"title": meta["title"], "foreignAlbumId": mbid, "artist": artist}])
+        if path == "album" and request.method == "GET":
+            q = request.url.params
+            if "artistId" not in q or q.get("includeAllArtistAlbums") != "true":
+                return httpx.Response(
+                    400, text="artistId and includeAllArtistAlbums=true required")
+            wanted = int(q["artistId"])
+            return httpx.Response(200, json=[a for a in self.albums if a["artistId"] == wanted])
+        if path == "album/monitor" and request.method == "PUT":
+            body = json.loads(request.content)
+            # strict like lidarr: a monitor toggle without ids is a bug
+            if not body.get("albumIds") or not isinstance(body.get("monitored"), bool):
+                return httpx.Response(400, text="albumIds and monitored are required")
+            self.monitor_puts.append(body)
+            for album in self.albums:
+                if album["id"] in body["albumIds"]:
+                    album["monitored"] = body["monitored"]
+            return httpx.Response(202, json=body)
+        if path == "command" and request.method == "POST":
+            body = json.loads(request.content)
+            if not body.get("name"):
+                return httpx.Response(400, text="command name required")
+            self.commands.append(body)
+            return httpx.Response(201, json={"id": len(self.commands), "name": body["name"]})
         if path in ("movie", "series", "artist") and request.method == "POST":
             if self.fail_add:
                 status, text = self.fail_add
@@ -73,8 +139,17 @@ class FakeArr:
                     "propertyName": "ArtistName",
                     "errorMessage": "'Artist Name' must not be empty.",
                     "errorCode": "NotEmptyValidator"}])
+            if path == "artist" and any(
+                    a["foreignArtistId"] == body.get("foreignArtistId") for a in self.artists):
+                return httpx.Response(400, json=[{
+                    "errorMessage": "This artist has already been added",
+                    "errorCode": "ArtistExistsValidator"}])
             self.posted.append(body)
-            return httpx.Response(201, json={"id": 100 + len(self.posted), **body})
+            row = {"id": 100 + len(self.posted), **body}
+            if path == "artist":
+                self.artists.append(row)
+                self._spawn_albums(row)
+            return httpx.Response(201, json=row)
         return httpx.Response(404, text=f"unhandled arr {request.method} {path}")
 
 
@@ -201,6 +276,11 @@ def add_rec(conn, item_id, domain, title, ids_json, status="proposed",
 
 def rec_row(conn, rec_id):
     return conn.execute("SELECT * FROM recommendations WHERE id=?", (rec_id,)).fetchone()
+
+
+def seed_album(net, mbid, artist_mbid, title, artist_name="Some Artist"):
+    net.lidarr.album_lookup[mbid] = {
+        "title": title, "artist_mbid": artist_mbid, "artist_name": artist_name}
 
 
 # ── runtime settings overrides ───────────────────────────────────────
@@ -422,6 +502,171 @@ def test_lidarr_failure_keeps_proposed_and_counts_attempt(conn, tmp_path, net):
     # second failing run keeps counting
     apply_mod.run(conn, cfg)
     assert json.loads(rec_row(conn, r1)["why"])["attempts"] == 2
+
+
+# ── album autonomy ───────────────────────────────────────────────────
+
+
+def test_album_budget_setting_key(conn, tmp_path):
+    cfg = make_cfg(tmp_path, music_max_albums_per_week=7)
+    assert settings.get(conn, cfg, "music_max_albums_per_week") == 7  # cfg is the default
+    assert settings.set(conn, "music_max_albums_per_week", "2") == 2  # string coerced
+    assert settings.get(conn, cfg, "music_max_albums_per_week") == 2
+    with pytest.raises(ValueError):
+        settings.set(conn, "music_max_albums_per_week", -1)
+    settings.clear(conn, "music_max_albums_per_week")
+    assert settings.get(conn, cfg, "music_max_albums_per_week") == 7
+
+
+def test_album_weekly_cap_respected(conn, tmp_path, net):
+    cfg = make_cfg(tmp_path, music_max_albums_per_week=3)
+    now = db.now()
+    last_week = (datetime.now(timezone.utc) - timedelta(days=8)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # two albums already acted this ISO week, one before it
+    add_rec(conn, "album:mbid:done1", "album", "Done One", {"mbid": "done1"},
+            status="auto_added", acted_at=now)
+    add_rec(conn, "album:mbid:done2", "album", "Done Two", {"mbid": "done2"},
+            status="added", acted_at=now)
+    add_rec(conn, "album:mbid:done3", "album", "Old Done", {"mbid": "done3"},
+            status="auto_added", acted_at=last_week)
+    seed_album(net, "al1", "ar1", "Album 1", "Artist One")
+    seed_album(net, "al2", "ar2", "Album 2", "Artist Two")
+    r1 = add_rec(conn, "album:mbid:al1", "album", "Album 1",
+                 {"mbid": "al1", "artist_mbid": "ar1"}, score=0.9)
+    r2 = add_rec(conn, "album:mbid:al2", "album", "Album 2",
+                 {"mbid": "al2", "artist_mbid": "ar2"}, score=0.8)
+
+    stats = apply_mod.run(conn, cfg)
+
+    assert stats["albums_budget"] == 1
+    assert stats["albums_added"] == 1
+    # only the top-scored album landed: exactly one monitored + searched
+    album = next(a for a in net.lidarr.albums if a["foreignAlbumId"] == "al1")
+    assert album["monitored"] is True
+    assert net.lidarr.monitor_puts == [{"albumIds": [album["id"]], "monitored": True}]
+    assert net.lidarr.commands == [{"name": "AlbumSearch", "albumIds": [album["id"]]}]
+    assert rec_row(conn, r1)["status"] == "auto_added"
+    assert rec_row(conn, r1)["acted_at"]
+    assert rec_row(conn, r2)["status"] == "proposed"
+    # audit trail only: gustarr's own add must not read as user praise
+    events = conn.execute(
+        "SELECT kind, weight, source FROM events WHERE item_id='album:mbid:al1'").fetchall()
+    assert [(e["kind"], e["weight"], e["source"]) for e in events] == \
+        [("auto_add", 0.0, "gustarr")]
+
+
+def test_album_budget_override_honored(conn, tmp_path, net):
+    cfg = make_cfg(tmp_path, music_max_albums_per_week=5)
+    seed_album(net, "al1", "ar1", "Album 1")
+    seed_album(net, "al2", "ar2", "Album 2")
+    r1 = add_rec(conn, "album:mbid:al1", "album", "Album 1", {"mbid": "al1"}, score=0.9)
+    r2 = add_rec(conn, "album:mbid:al2", "album", "Album 2", {"mbid": "al2"}, score=0.8)
+    settings.set(conn, "music_max_albums_per_week", 1)
+
+    stats = apply_mod.run(conn, cfg)
+
+    assert stats["albums_budget"] == 1
+    assert stats["albums_added"] == 1
+    assert rec_row(conn, r1)["status"] == "auto_added"
+    assert rec_row(conn, r2)["status"] == "proposed"
+
+
+def test_album_artist_shell_created_unmonitored_when_absent(conn, tmp_path, net):
+    cfg = make_cfg(tmp_path)
+    seed_album(net, "al1", "ar1", "OK Album", "New Artist")
+    rid = add_rec(conn, "album:mbid:al1", "album", "OK Album", {"mbid": "al1"})
+
+    stats = apply_mod.run(conn, cfg)
+
+    assert stats["albums_added"] == 1
+    # the artist arrives as an unmonitored shell: we want THIS album,
+    # never the whole discography
+    shell = net.lidarr.posted[0]
+    assert shell["foreignArtistId"] == "ar1"
+    assert shell["artistName"] == "New Artist"
+    assert shell["monitored"] is False
+    assert shell["addOptions"] == {"monitor": "none", "searchForMissingAlbums": False}
+    assert shell["qualityProfileId"] == 20
+    assert shell["metadataProfileId"] == 30
+    assert shell["rootFolderPath"] == "/music"
+    assert shell["tags"] == [1]
+    assert [a["monitored"] for a in net.lidarr.albums] == [True]
+    assert rec_row(conn, rid)["status"] == "auto_added"
+
+
+def test_approved_album_added_in_queue_mode(conn, tmp_path, net):
+    # explicit approval is consent: actuated even when music_mode='queue'
+    cfg = make_cfg(tmp_path, music_mode="queue")
+    seed_album(net, "al1", "ar1", "Album 1", "Artist One")
+    net.lidarr.register_artist("ar1", "Artist One")
+    rid = add_rec(conn, "album:mbid:al1", "album", "Album 1", {"mbid": "al1"},
+                  status="approved")
+    # queue already wrote the approve event when the user approved
+    db.add_event(conn, db.now(), "album:mbid:al1", "approve", 1.0, "user", {"rec_id": rid})
+    prop = add_rec(conn, "album:mbid:al2", "album", "Album 2", {"mbid": "al2"}, score=0.9)
+
+    stats = apply_mod.run(conn, cfg)
+
+    assert stats["albums_added"] == 1
+    assert net.lidarr.posted == []  # artist already in the library: no shell add
+    assert len(net.lidarr.monitor_puts) == 1
+    assert [c["name"] for c in net.lidarr.commands] == ["AlbumSearch"]
+    row = rec_row(conn, rid)
+    assert row["status"] == "added"
+    assert row["acted_at"]
+    assert rec_row(conn, prop)["status"] == "proposed"  # queue mode: no auto pick
+    # no extra taste event: the approve written at approval time is enough
+    kinds = [e["kind"] for e in conn.execute(
+        "SELECT kind FROM events WHERE item_id='album:mbid:al1'")]
+    assert kinds == ["approve"]
+
+
+def test_album_already_monitored_is_noop_success(conn, tmp_path, net):
+    cfg = make_cfg(tmp_path, music_mode="queue")
+    seed_album(net, "al1", "ar1", "Album 1", "Artist One")
+    net.lidarr.album_lookup["al1"]["monitored"] = True
+    net.lidarr.register_artist("ar1", "Artist One")
+    rid = add_rec(conn, "album:mbid:al1", "album", "Album 1", {"mbid": "al1"},
+                  status="approved")
+
+    stats = apply_mod.run(conn, cfg)
+
+    # already monitored IS the desired end state: success, nothing re-done
+    assert stats["albums_added"] == 1
+    assert stats["errors"] == []
+    assert net.lidarr.posted == []
+    assert net.lidarr.monitor_puts == []
+    assert net.lidarr.commands == []
+    assert rec_row(conn, rid)["status"] == "added"
+
+
+def test_approved_album_survives_lidarr_outage(conn, tmp_path, net):
+    cfg = make_cfg(tmp_path, music_mode="queue")
+    seed_album(net, "al1", "ar1", "Album 1", "Artist One")
+    net.lidarr.fail_add = (503, "service unavailable")  # the artist-shell add 503s
+    rid = add_rec(conn, "album:mbid:al1", "album", "Album 1", {"mbid": "al1"},
+                  status="approved")
+    stats = apply_mod.run(conn, cfg)
+    assert stats["albums_added"] == 0
+    assert any("Album 1" in e for e in stats["errors"])
+    row = rec_row(conn, rid)
+    assert row["status"] == "approved"  # retryable, not terminally failed
+    assert json.loads(row["why"])["attempts"] == 1
+    # lidarr back up: the same approval lands on the next apply
+    net.lidarr.fail_add = None
+    stats = apply_mod.run(conn, cfg)
+    assert stats["albums_added"] == 1
+    assert rec_row(conn, rid)["status"] == "added"
+
+
+def test_approved_album_unknown_mbid_marked_failed(conn, tmp_path, net):
+    cfg = make_cfg(tmp_path, music_mode="queue")
+    rid = add_rec(conn, "album:mbid:nope", "album", "Ghost Album", {"mbid": "nope"},
+                  status="approved")
+    stats = apply_mod.run(conn, cfg)
+    assert stats["albums_added"] == 0
+    assert any("found nothing" in e for e in stats["errors"])
+    assert rec_row(conn, rid)["status"] == "failed"  # deterministic 4xx-style failure
 
 
 # ── video approvals ──────────────────────────────────────────────────

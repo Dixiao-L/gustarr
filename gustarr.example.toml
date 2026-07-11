@@ -1,28 +1,41 @@
-# gustarr configuration. Secrets use env:VAR — resolved from the process
-# environment (systemd EnvironmentFile=, agenix, direnv...), so this file
-# is safe to commit.
+# gustarr configuration — full key reference in docs/configuration.md.
+# Secrets use env:VAR — resolved from the process environment (systemd
+# EnvironmentFile=, agenix, docker env_file, direnv...), so this file is
+# safe to commit. Every section is optional — configure only the services
+# you run, the pipeline skips the rest — but without [tmdb] the video side
+# and without [lastfm] the music side can't enrich or find candidates.
 
 [core]
 data_dir = "/var/lib/gustarr"
 # db_path defaults to <data_dir>/gustarr.db
 
+# Watch/listen history + favorites — the main taste signal for video.
 [jellyfin]
 url = "http://127.0.0.1:8096"
 api_key = "env:JELLYFIN_API_KEY"
 user = "your-jellyfin-username"
 
+# api_key is required (music metadata + similar artists); user is optional
+# and enables scrobble/loved-track sync. Free key: last.fm/api
 [lastfm]
 api_key = "env:LASTFM_API_KEY"
 user = "your-lastfm-username"
 
+# Optional: open collaborative-filtering recommendations + your Weekly
+# Exploration playlist feed the music candidate pool.
 [listenbrainz]
 user = "your-listenbrainz-username"
 # token only needed if you want gustarr to submit anything; reads are public
+# (a token merely lifts rate limits)
 # token = "env:LISTENBRAINZ_TOKEN"
 
+# Movie/series metadata and candidates. Free key: themoviedb.org/settings/api
+# (No TVDB key needed anywhere — series ids resolve through TMDb/Sonarr.)
 [tmdb]
 api_key = "env:TMDB_API_KEY"
 
+# Each *arr is optional. Items gustarr adds are tagged "gustarr" (override
+# with `tag = "..."`); it never removes or modifies anything without that tag.
 [sonarr]
 url = "http://127.0.0.1:8989"
 api_key = "env:SONARR_API_KEY"
@@ -41,19 +54,25 @@ api_key = "env:LIDARR_API_KEY"
 quality_profile = "Standard"
 root_folder = "/media/data/music"
 
+# Autonomy: how much gustarr may do without you. Several of these can be
+# overridden at runtime from the web UI (overrides win until cleared).
 [autonomy]
-music_mode = "auto"    # auto-add music within the caps below
-video_mode = "queue"   # movies/TV wait for approve/reject
-music_max_artists_per_week = 3
-music_max_albums_per_week = 10
-video_queue_max_pending = 20
-proposal_ttl_days = 30
+music_mode = "auto"    # auto-add music within the caps below ("queue" = ask first)
+video_mode = "queue"   # movies/TV wait for approve/reject ("auto" = add top picks)
+music_max_artists_per_week = 3   # weekly auto-add budget; approvals don't consume it
+music_max_albums_per_week = 10   # weekly auto-add budget for album picks
+video_queue_max_pending = 20     # open-proposal cap; overflow expires lowest-scored
+proposal_ttl_days = 30           # stale proposals expire instead of silting the queue
 
 [model]
-embed_model = "BAAI/bge-m3"
-device = "cuda"        # cpu works, just slower
-exploration_frac = 0.15
-diversity_lambda = 0.3
+embed_model = "BAAI/bge-m3"      # any sentence-transformers model; swap re-embeds cleanly
+device = "cuda"        # cpu works, just slower (use "cpu" in the Docker image)
+# model_dir = ""       # HuggingFace cache dir; empty = default ($HF_HOME)
+exploration_frac = 0.15          # share of each run's slots for exploration picks
+diversity_lambda = 0.3           # MMR trade-off: 0 = pure relevance
 
 [web]
 bind = "127.0.0.1:8790"
+# Extra hostnames past the Host/Origin guard — needed when serving via a
+# reverse proxy or a non-localhost bind (otherwise browsers get 403).
+# allowed_hosts = ["nas.lan"]

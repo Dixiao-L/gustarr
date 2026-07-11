@@ -97,6 +97,34 @@ def test_list_recs_filters(conn):
     assert [r["title"] for r in queue.list_recs(conn, status="approved")] == ["A"]
 
 
+def test_list_recs_surfaces_image_artist_and_type(conn):
+    album = add_rec(conn, "album:mbid:rg1", domain="album", title="In Rainbows", year=2007,
+                    score=0.8, meta={"image": "https://img.example/ir.jpg",
+                                     "artist": "Radiohead", "type": "Album"})
+    bare = add_rec(conn, "artist:mbid:aa", domain="artist", title="Radiohead", score=0.3)
+
+    rows = {r["id"]: r for r in queue.list_recs(conn)}
+    assert rows[album]["image"] == "https://img.example/ir.jpg"
+    assert rows[album]["artist"] == "Radiohead"
+    assert rows[album]["type"] == "Album"
+    # pre-enrichment items must list cleanly, not KeyError
+    assert rows[bare]["image"] is None
+    assert rows[bare]["artist"] is None
+    assert rows[bare]["type"] is None
+
+
+def test_list_recs_music_domain_alias(conn):
+    artist = add_rec(conn, "artist:mbid:aa", domain="artist", title="Artist", score=0.9)
+    album = add_rec(conn, "album:mbid:rg1", domain="album", title="Album", score=0.5)
+    add_rec(conn, "movie:tmdb:1", title="Movie", score=0.7)
+
+    # 'music' spans both audio domains; score ordering still applies
+    assert [r["id"] for r in queue.list_recs(conn, domain="music")] == [artist, album]
+    # the alias never leaks into exact-domain filters
+    assert [r["id"] for r in queue.list_recs(conn, domain="album")] == [album]
+    assert [r["id"] for r in queue.list_recs(conn, domain="artist")] == [artist]
+
+
 # ── queue: approve / reject ──────────────────────────────────────────
 
 
@@ -434,6 +462,7 @@ def test_settings_defaults_come_from_config(conn, cfg):
     assert settings.get(conn, cfg, "paused") is False
     assert settings.get(conn, cfg, "music_mode") == "auto"
     assert settings.get(conn, cfg, "music_max_artists_per_week") == 3
+    assert settings.get(conn, cfg, "music_max_albums_per_week") == 10
     assert settings.get(conn, cfg, "video_queue_max_pending") == 20
     assert settings.get(conn, cfg, "exploration_frac") == 0.15
 

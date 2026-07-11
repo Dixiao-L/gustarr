@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 
 from .. import db, http, settings
 from ..config import Config
@@ -103,15 +103,34 @@ def run(conn: sqlite3.Connection, cfg: Config, dry_run: bool = False) -> dict[st
 def _apply_music(
     conn: sqlite3.Connection, cfg: Config, ts: str, dry_run: bool, stats: dict[str, Any]
 ) -> None:
-    # autonomy.music_max_albums_per_week is reserved for future
-    # album-level recs; artists are the only music domain actuated today.
-    stats["music_added"] = 0
+    # One client for both music domains so the tag/profile/root lookups
+    # are fetched once per run (they're cached on the instance).
+    client = LidarrClient(cfg.lidarr) if cfg.lidarr is not None else None
+    _apply_music_domain(
+        conn, cfg, ts, dry_run, stats, client, domain="artist",
+        budget_setting="music_max_artists_per_week",
+        added_key="music_added", budget_key="music_budget", add=LidarrClient.add_artist)
+    _apply_music_domain(
+        conn, cfg, ts, dry_run, stats, client, domain="album",
+        budget_setting="music_max_albums_per_week",
+        added_key="albums_added", budget_key="albums_budget", add=LidarrClient.add_album)
+
+
+def _apply_music_domain(
+    conn: sqlite3.Connection, cfg: Config, ts: str, dry_run: bool, stats: dict[str, Any],
+    client: LidarrClient | None, *, domain: str, budget_setting: str,
+    added_key: str, budget_key: str, add: Callable[[LidarrClient, str], Any],
+) -> None:
+    # Artists and albums share one flow: same mode switch, same approve
+    # semantics, same error split — only the domain, the weekly budget
+    # and the LidarrClient method differ.
+    stats[added_key] = 0
     acted = conn.execute(
-        "SELECT COUNT(*) FROM recommendations WHERE domain='artist'"
+        "SELECT COUNT(*) FROM recommendations WHERE domain=?"
         " AND status IN ('auto_added','added') AND acted_at>=?",
-        (_week_start(),)).fetchone()[0]
-    budget = max(0, settings.get(conn, cfg, "music_max_artists_per_week") - acted)
-    stats["music_budget"] = budget
+        (domain, _week_start())).fetchone()[0]
+    budget = max(0, settings.get(conn, cfg, budget_setting) - acted)
+    stats[budget_key] = budget
     # Approved rows are actuated in every mode (an explicit approve is
     # consent) and don't consume the weekly budget; proposed rows are
     # auto-picked only in auto mode, inside the budget.
@@ -119,8 +138,8 @@ def _apply_music(
     rows = conn.execute(
         "SELECT r.id, r.item_id, r.status, r.why, i.title, i.ids FROM recommendations r"
         " JOIN items i ON i.id = r.item_id"
-        " WHERE r.domain='artist' AND r.status IN ('approved','proposed')"
-        " ORDER BY r.status='approved' DESC, r.score DESC").fetchall()
+        " WHERE r.domain=? AND r.status IN ('approved','proposed')"
+        " ORDER BY r.status='approved' DESC, r.score DESC", (domain,)).fetchall()
     picks: list[tuple[sqlite3.Row, str]] = []
     unaddressable: list[sqlite3.Row] = []
     auto_picked = 0
@@ -130,7 +149,7 @@ def _apply_music(
             continue
         mbid = external_id(row, "mbid")
         if mbid is None:
-            # an approved artist we cannot address fails loudly instead
+            # an approved rec we cannot address fails loudly instead
             # of being stranded forever; a proposed one is just skipped.
             if approved:
                 unaddressable.append(row)
@@ -142,20 +161,18 @@ def _apply_music(
     if dry_run:
         stats["would_add"].extend(row["title"] or row["item_id"] for row, _ in picks)
         return
-    if cfg.lidarr is None:
+    if client is None:
         # stays approved/proposed: retried once lidarr gets configured
-        stats["errors"].append("music recommendations ready but lidarr is not configured")
+        stats["errors"].append(
+            f"music {domain} recommendations ready but lidarr is not configured")
         return
     for row in unaddressable:
         stats["errors"].append(f"{row['title'] or row['item_id']}: no mbid,"
                                " cannot add to lidarr")
         _mark(conn, row["id"], "failed", ts)
-    if not picks:
-        return
-    client = LidarrClient(cfg.lidarr)
     for row, mbid in picks:
         try:
-            client.add_artist(mbid)
+            add(client, mbid)
         except (http.ApiError, ArrError) as exc:
             stats["errors"].append(f"lidarr add {row['title'] or mbid}: {exc}")
             if row["status"] == "approved" and not _transient(exc):
@@ -164,7 +181,7 @@ def _apply_music(
                 _bump_attempts(conn, row)
             continue
         _record_add(conn, row, ts)
-        stats["music_added"] += 1
+        stats[added_key] += 1
 
 
 def _apply_video(

@@ -23,6 +23,8 @@ from .config import Config
 TMDB = "https://api.themoviedb.org/3"
 MB = "https://musicbrainz.org/ws/2"
 LASTFM = "https://ws.audioscrobbler.com/2.0/"
+DEEZER = "https://api.deezer.com"
+CAA = "https://coverartarchive.org"
 
 # Below this MusicBrainz search score a name match is too fuzzy to
 # auto-merge; keeping the fallback id beats pointing someone's scrobble
@@ -44,8 +46,8 @@ def run(
         "SELECT * FROM items WHERE enriched_at IS NULL"
         + (" AND domain=?" if domain else "")
         # Rankable domains first: a first sync can mint 10k+ tracks, and
-        # artists/movies/series are what train/rank actually consume.
-        + " ORDER BY CASE WHEN domain IN ('artist','movie','series') THEN 0 ELSE 1 END,"
+        # artists/albums/movies/series are what train/rank actually consume.
+        + " ORDER BY CASE WHEN domain IN ('artist','album','movie','series') THEN 0 ELSE 1 END,"
         " (EXISTS(SELECT 1 FROM candidates c WHERE c.item_id = items.id)"
         "   OR EXISTS(SELECT 1 FROM events e WHERE e.item_id = items.id)) DESC,"
         " updated_at DESC LIMIT ?"
@@ -98,7 +100,8 @@ def _enrich_one(
     elif domain == "artist":
         _artist(conn, cfg, item_id, row["title"], ids_map, eff, stats)
     else:  # album | track
-        _release_or_recording(conn, item_id, domain, row["title"], ids_map, stats)
+        _release_or_recording(conn, item_id, domain, row["title"], ids_map,
+                              json.loads(row["meta"] or "{}"), stats)
 
 
 # ── movies / series (TMDb) ───────────────────────────────────────────
@@ -230,6 +233,9 @@ def _artist(conn, cfg, item_id, title, ids_map, eff, stats) -> None:
             # No confident MB match: enrich the fallback item from
             # Last.fm alone so it still leaves the queue.
             meta = _lastfm_artist_meta(cfg, None, name)
+            image = _deezer_artist_image(name)
+            if image:
+                meta["image"] = image
             db.upsert_item(conn, item_id, "artist", meta=meta, enriched=True)
             stats["enriched"] += 1
             return
@@ -250,6 +256,9 @@ def _artist(conn, cfg, item_id, title, ids_map, eff, stats) -> None:
     db.upsert_item(conn, item_id, "artist", title=data.get("name"),
                    ids={**ids_map, "mbid": mbid}, meta=meta, enriched=True)
     lf = _lastfm_artist_meta(cfg, mbid, data.get("name") or name)
+    image = _deezer_artist_image(data.get("name") or name)
+    if image:
+        lf["image"] = image
     if lf:
         db.upsert_item(conn, item_id, "artist", meta=lf)
     stats["enriched"] += 1
@@ -301,13 +310,37 @@ def _clean_bio(summary: str) -> str:
     return _READ_MORE_RE.sub("", _LINK_RE.sub("", summary)).strip()
 
 
+def _deezer_artist_image(name: str) -> str | None:
+    """MusicBrainz stopped serving artist images and Last.fm's are blank
+    stars, so the UI portrait comes from Deezer's keyless search. Purely
+    decorative: any failure returns None rather than failing the item."""
+    try:
+        data = http.get_json(f"{DEEZER}/search/artist", params={"q": name, "limit": 1})
+        hits = (data or {}).get("data") or []
+        pic = hits[0].get("picture_big") if hits and isinstance(hits[0], dict) else None
+    except Exception:
+        return None
+    # Deezer serves a generic silhouette from an empty /artist// path
+    # for unknown names; the monogram beats a wrong-looking placeholder.
+    if not pic or "/artist//" in pic:
+        return None
+    return pic
+
+
 # ── albums / tracks (MusicBrainz) ────────────────────────────────────
 
 
-def _release_or_recording(conn, item_id, domain, title, ids_map, stats) -> None:
+def _release_or_recording(conn, item_id, domain, title, ids_map, meta, stats) -> None:
     mbid = ids_map.get("mbid")
+    if domain == "album" and mbid and (not title or not meta.get("tags")):
+        # Albums rank and actuate in their own slots now, so unlike
+        # tracks they earn a real lookup. Missing tags also qualifies
+        # so rows fast-stamped before albums ranked get upgraded when
+        # requeued; titled+tagged albums stay on the cheap path below.
+        _album(conn, item_id, mbid, ids_map, stats)
+        return
     if not mbid or title:
-        # Tracks/albums feed artist aggregation, not ranking, and the
+        # Tracks feed artist aggregation, not ranking, and the
         # collectors already deliver their titles. An MB lookup per track
         # at the mandatory 1.1s spacing turns a first Last.fm sync (10k+
         # tracks) into hours of grind for metadata nothing consumes —
@@ -315,19 +348,57 @@ def _release_or_recording(conn, item_id, domain, title, ids_map, stats) -> None:
         db.upsert_item(conn, item_id, domain, enriched=True)
         stats["skipped"] += 1
         return
-    endpoint = "recording" if domain == "track" else "release"
-    data = http.get_json(f"{MB}/{endpoint}/{mbid}",
+    data = http.get_json(f"{MB}/recording/{mbid}",
                          params={"inc": "artist-credits+tags", "fmt": "json"})
-    credits = data.get("artist-credit") or []
     meta = {
-        "artists": [c["artist"]["name"] for c in credits
-                    if isinstance(c, dict) and isinstance(c.get("artist"), dict)],
+        "artists": _credit_names(data),
         "tags": _top_tag_names(data.get("tags")),
     }
     db.upsert_item(conn, item_id, domain, title=data.get("title"),
                    year=_year(data.get("date") or data.get("first-release-date")),
                    meta=meta, enriched=True)
     stats["enriched"] += 1
+
+
+def _album(conn, item_id, mbid, ids_map, stats) -> None:
+    # An album mbid is a RELEASE-GROUP id — that is the namespace
+    # Lidarr's foreignAlbumId speaks, and it carries the first-release
+    # date instead of one pressing's date.
+    data = http.get_json(f"{MB}/release-group/{mbid}",
+                         params={"inc": "artist-credits+tags+genres", "fmt": "json"})
+    artists = _credit_names(data)
+    meta = {
+        "artists": artists,
+        "tags": _top_tag_names(data.get("tags")),
+        "genres": _top_tag_names(data.get("genres"), cap=None),
+        "type": data.get("primary-type"),
+        # Stored unprobed: CAA 404s for coverless groups, but the UI
+        # paints the monogram under the image, so a dead URL costs
+        # nothing while probing would cost a round-trip per album.
+        "image": f"{CAA}/release-group/{mbid}/front-250",
+    }
+    if artists:
+        meta["artist"] = artists[0]
+    new_ids = {**ids_map, "mbid": mbid}
+    artist_mbid = _credit_artist_mbid(data)
+    if artist_mbid:
+        new_ids["artist_mbid"] = artist_mbid  # lets actuation add the artist to Lidarr too
+    db.upsert_item(conn, item_id, "album", title=data.get("title"),
+                   year=_year(data.get("first-release-date")),
+                   ids=new_ids, meta=meta, enriched=True)
+    stats["enriched"] += 1
+
+
+def _credit_names(data: dict[str, Any]) -> list[str]:
+    return [c["artist"]["name"] for c in data.get("artist-credit") or []
+            if isinstance(c, dict) and isinstance(c.get("artist"), dict)]
+
+
+def _credit_artist_mbid(data: dict[str, Any]) -> str | None:
+    for c in data.get("artist-credit") or []:
+        if isinstance(c, dict) and isinstance(c.get("artist"), dict) and c["artist"].get("id"):
+            return c["artist"]["id"]
+    return None
 
 
 # ── shared ───────────────────────────────────────────────────────────

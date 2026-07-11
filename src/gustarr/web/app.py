@@ -85,6 +85,8 @@ def create_app(cfg: Config) -> FastAPI:
         domain: str | None = None,
         conn: sqlite3.Connection = Depends(get_conn),
     ) -> list[dict[str, Any]]:
+        # domain='music' expands to artist+album inside list_recs, so the
+        # web UI and the CLI share one alias implementation.
         return queue.list_recs(conn, domain=domain or None, status=status)
 
     @app.post("/api/recs/{rec_id}/approve")
