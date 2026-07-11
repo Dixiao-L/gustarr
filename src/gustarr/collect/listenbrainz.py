@@ -86,6 +86,10 @@ def _sync_cf(conn: sqlite3.Connection, user: str, headers: dict[str, str],
     metadata = _fetch_metadata(list(scores), headers)
     ts = db.now()
     artist_best: dict[str, tuple[str | None, float]] = {}
+    # album id → (title, artist_name, artist_id, best track score): several
+    # CF tracks off one record are a stronger album signal than any single
+    # track, so the album inherits the max.
+    album_best: dict[str, tuple[str, str | None, str | None, float]] = {}
     for mbid, score in scores.items():
         info = metadata.get(mbid) or {}
         recording = info.get("recording") or {}
@@ -104,16 +108,36 @@ def _sync_cf(conn: sqlite3.Connection, user: str, headers: dict[str, str],
                        ids={"mbid": mbid}, meta=meta)
         _upsert_candidate(conn, track_id, "listenbrainz_cf", score, ts)
         stats["cf_tracks"] += 1
+        numeric = float(score) if isinstance(score, (int, float)) else 0.0
         if artist_id:
             _upsert_artist(conn, artist_id, artist_name)
-            numeric = float(score) if isinstance(score, (int, float)) else 0.0
             prev = artist_best.get(artist_id)
             if prev is None or numeric > prev[1]:
                 artist_best[artist_id] = (artist_name, numeric)
+        if release.get("mbid") and release.get("name"):
+            # LB hands back RELEASE mbids, not release-groups; store as-is,
+            # enrich owns upgrading them to the release-group Lidarr wants.
+            album_id = ids.make("album", "mbid", release["mbid"])
+            aprev = album_best.get(album_id)
+            if aprev is None or numeric > aprev[3]:
+                album_best[album_id] = (release["name"], artist_name, artist_id, numeric)
 
     for artist_id, (_, best) in artist_best.items():
         _upsert_candidate(conn, artist_id, "listenbrainz_cf_artist", best, ts)
         stats["cf_artists"] += 1
+
+    for album_id, (title, artist_name, artist_id, best) in album_best.items():
+        ids_d: dict[str, Any] = {"mbid": ids.parse(album_id)[2]}
+        meta = {"artist": artist_name} if artist_name else {}
+        if artist_id:
+            _, ns, key = ids.parse(artist_id)
+            if ns == "mbid":
+                # ids for the actuate/Lidarr contract, meta for the UI/enrich.
+                ids_d["artist_mbid"] = key
+                meta["artist_mbid"] = key
+        db.upsert_item(conn, album_id, "album", title=title, ids=ids_d, meta=meta)
+        _upsert_candidate(conn, album_id, "listenbrainz_cf_album", best, ts)
+        stats["cf_albums"] += 1
 
 
 def _recording_mbid(track: dict[str, Any]) -> str | None:
@@ -161,7 +185,8 @@ def sync(conn: sqlite3.Connection, cfg: Config) -> dict[str, Any]:
     if not user:
         return {"skipped": "listenbrainz not configured"}
     headers = _headers(cfg)
-    stats: dict[str, Any] = {"cf_tracks": 0, "cf_artists": 0, "weekly_tracks": 0}
+    stats: dict[str, Any] = {"cf_tracks": 0, "cf_artists": 0, "cf_albums": 0,
+                             "weekly_tracks": 0}
     _sync_cf(conn, user, headers, stats)
     try:
         _sync_weekly(conn, user, headers, stats)

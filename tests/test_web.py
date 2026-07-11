@@ -14,6 +14,7 @@ from gustarr.web.app import create_app
 MATRIX = "movie:tmdb:603"
 BLADE = "movie:tmdb:78"
 RADIOHEAD = "artist:mbid:a74b1b7f"
+IN_RAINBOWS = "album:mbid:rg-1"
 
 
 @pytest.fixture
@@ -51,6 +52,25 @@ def _fetch(cfg, sql, *params):
         conn.close()
 
 
+def _add_album_rec(cfg):
+    # Not in the shared fixture: most tests pin exact fixture row sets,
+    # so the album rec is opt-in for the tests that need one.
+    conn = db.connect(cfg.db_path)
+    try:
+        db.upsert_item(conn, IN_RAINBOWS, "album", "In Rainbows", 2007,
+                       {"mbid": "rg-1", "artist_mbid": "a74b1b7f"},
+                       {"artist": "Radiohead", "type": "Album",
+                        "image": "https://img.example/ir.jpg"})
+        rec = conn.execute(
+            "INSERT INTO recommendations (run_id, ts, domain, item_id, score, why)"
+            " VALUES ('r1',?,?,?,?,?)",
+            (db.now(), "album", IN_RAINBOWS, 0.7, "{}")).lastrowid
+        conn.commit()
+        return rec
+    finally:
+        conn.close()
+
+
 def test_list_recs(web):
     client, _, movie_rec, artist_rec = web
     resp = client.get("/api/recs")
@@ -67,6 +87,27 @@ def test_list_recs(web):
     assert [r["id"] for r in movies] == [movie_rec]
     # empty domain param means "all domains"
     assert len(client.get("/api/recs", params={"domain": ""}).json()) == 2
+
+
+def test_music_domain_alias_and_album_fields(web):
+    client, cfg, movie_rec, artist_rec = web
+    album_rec = _add_album_rec(cfg)
+
+    rows = client.get("/api/recs", params={"domain": "music"}).json()
+    assert {r["id"] for r in rows} == {artist_rec, album_rec}  # movie filtered out
+    by_id = {r["id"]: r for r in rows}
+    assert by_id[album_rec]["title"] == "In Rainbows"
+    assert by_id[album_rec]["artist"] == "Radiohead"
+    assert by_id[album_rec]["type"] == "Album"
+    assert by_id[album_rec]["image"] == "https://img.example/ir.jpg"
+    # release-group mbid rides along for Lidarr's foreignAlbumId
+    assert by_id[album_rec]["ids"]["mbid"] == "rg-1"
+    # artists without an enriched image still list cleanly
+    assert by_id[artist_rec]["image"] is None
+
+    # exact-domain filtering is unchanged by the alias
+    albums = client.get("/api/recs", params={"domain": "album"}).json()
+    assert [r["id"] for r in albums] == [album_rec]
 
 
 def test_approve_flips_status_and_records_event(web):
@@ -160,13 +201,34 @@ def test_index_head_and_controls(web):
     assert "<dialog" in text
 
 
+def test_index_album_and_music_markup(web):
+    client, *_ = web
+    text = client.get("/").text
+    # music cards label themselves via a muted type chip (meta.type or domain)
+    assert 'badge dim type' in text
+    assert "r.type || r.domain" in text
+    # album cards carry a "by <artist>" byline under the title
+    assert "byline" in text
+    assert "by ${esc(r.artist)}" in text
+    # meta.image paints over the monogram; its URL is used verbatim (no TMDB prefix)
+    assert "r.image ? r.image" in text
+    # the Music tab spans the audio domains client-side, mirroring the
+    # server's domain=music alias (one status=all fetch feeds every tab)
+    assert "'artist', 'album', 'track'" in text
+    assert "domain=music" in text
+    # the album weekly cap is editable next to the artist one
+    assert "music_max_albums_per_week" in text
+    assert "Weekly Album Cap" in text
+
+
 def test_settings_get_defaults(web):
     client, *_ = web
     resp = client.get("/api/settings")
     assert resp.status_code == 200
     body = resp.json()
     assert set(body) == {"paused", "music_mode", "music_max_artists_per_week",
-                         "video_queue_max_pending", "exploration_frac"}
+                         "music_max_albums_per_week", "video_queue_max_pending",
+                         "exploration_frac"}
     for entry in body.values():
         assert set(entry) == {"value", "overridden", "default"}
         assert entry["overridden"] is False
@@ -174,6 +236,7 @@ def test_settings_get_defaults(web):
     assert body["paused"]["value"] is False
     assert body["music_mode"]["value"] == "auto"
     assert body["music_max_artists_per_week"]["value"] == 3
+    assert body["music_max_albums_per_week"]["value"] == 10
     assert body["video_queue_max_pending"]["value"] == 20
     assert body["exploration_frac"]["value"] == pytest.approx(0.15)
 

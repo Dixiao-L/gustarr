@@ -64,6 +64,10 @@ class ArrClient:
         return http.post_json(
             self._url(path), json_body=body, headers={"X-Api-Key": self.cfg.api_key})
 
+    def _put(self, path: str, body: Any) -> Any:
+        return http.request_json(
+            "PUT", self._url(path), json_body=body, headers={"X-Api-Key": self.cfg.api_key})
+
     def ensure_tag(self) -> int:
         if self._tag_id is None:
             want = self.cfg.tag.lower()
@@ -203,3 +207,72 @@ class LidarrClient(ArrClient):
             "addOptions": {"monitor": "all", "searchForMissingAlbums": True},
         }
         return self._post_add("artist", body, mbid)
+
+    def _ensure_artist_shell(self, artist: dict[str, Any]) -> int:
+        """Album adds need the album's artist row to exist first. When it
+        doesn't, add the artist as an *unmonitored* shell (monitor 'none',
+        no missing-album search) so only the one wanted album ever gets
+        monitored — never the whole discography."""
+        if artist.get("id"):
+            return artist["id"]
+        body = {
+            **artist,
+            "qualityProfileId": self.quality_profile_id(),
+            "metadataProfileId": self.metadata_profile_id(),
+            "rootFolderPath": self.root_folder_path(),
+            "monitored": False,
+            "tags": [self.ensure_tag()],
+            "addOptions": {"monitor": "none", "searchForMissingAlbums": False},
+        }
+        foreign = artist.get("foreignArtistId")
+        try:
+            resp = self._post("artist", body)
+        except http.ApiError as exc:
+            if not _is_duplicate_add(exc):
+                raise
+            # the lookup said the artist was absent but the add says it
+            # exists (raced/stale lookup): recover the id from the list
+            resp = next(
+                (a for a in self._get("artist") or []
+                 if a.get("foreignArtistId") == foreign), None)
+            if resp is None:
+                raise ArrError(
+                    f"lidarr reports artist {foreign} as already added but it is"
+                    " missing from the artist list") from exc
+        artist_id = (resp or {}).get("id")
+        if not artist_id:
+            raise ArrError(
+                f"lidarr artist add for {artist.get('artistName') or foreign} returned no id")
+        return artist_id
+
+    def add_album(self, album_mbid: str) -> dict[str, Any]:
+        # Lidarr has no direct "add album" endpoint: album rows are
+        # created as a side effect of adding the artist. So: lookup the
+        # album (release-group mbid), ensure its artist exists (as an
+        # unmonitored shell when absent), find the album row under that
+        # artist, flip it to monitored, then trigger an AlbumSearch.
+        found = self._get("album/lookup", params={"term": f"lidarr:{album_mbid}"}) or []
+        if not found:
+            raise ArrError(f"lidarr album lookup found nothing for mbid {album_mbid}")
+        info = found[0]
+        title = info.get("title") or album_mbid
+        artist = info.get("artist")
+        if not isinstance(artist, dict):
+            raise ArrError(f"lidarr album lookup for {album_mbid} carries no artist resource")
+        artist_id = self._ensure_artist_shell(artist)
+        albums = self._get(
+            "album", params={"artistId": artist_id, "includeAllArtistAlbums": "true"}) or []
+        album = next((a for a in albums if a.get("foreignAlbumId") == album_mbid), None)
+        if album is None:
+            raise ArrError(
+                f"lidarr has no album {album_mbid} under artist id {artist_id}"
+                " (metadata refresh may not have populated it yet)")
+        if album.get("monitored"):
+            # already monitored — that IS the desired end state, not an error
+            return {"existing": True, "title": title, "arr_id": album.get("id")}
+        album_id = album.get("id")
+        if album_id is None:
+            raise ArrError(f"lidarr album row for {album_mbid} carries no id")
+        self._put("album/monitor", {"albumIds": [album_id], "monitored": True})
+        self._post("command", {"name": "AlbumSearch", "albumIds": [album_id]})
+        return {"added": True, "title": title, "arr_id": album_id}

@@ -74,6 +74,25 @@ LASTFM_ARTIST = {
     }
 }
 
+DEEZER_PIC = "https://cdn-images.dzcdn.net/images/artist/abc123/500x500-000000-80-0-0.jpg"
+
+DEEZER_ARTIST = {"data": [{"id": 399, "name": "Radiohead", "picture_big": DEEZER_PIC}]}
+
+RG_MBID = "b1392450-e666-3926-a536-22c65f834433"
+
+MB_RELEASE_GROUP = {
+    "id": RG_MBID,
+    "title": "OK Computer",
+    "first-release-date": "1997-05-21",
+    "primary-type": "Album",
+    "artist-credit": [{"artist": {"id": MBID, "name": "Radiohead"}}],
+    "tags": [
+        {"count": 3, "name": "art rock"},
+        {"count": 9, "name": "alternative rock"},
+    ],
+    "genres": [{"count": 7, "name": "art rock"}],
+}
+
 
 class FakeApi:
     """Dispatches on URL substring, in registration order (specific first)."""
@@ -300,9 +319,10 @@ def test_artist_mbid_musicbrainz_plus_lastfm(conn, tmp_path, monkeypatch):
     cfg = make_cfg(tmp_path, lastfm={"api_key": "lk"})
     iid = ids.make("artist", "mbid", MBID)
     db.upsert_item(conn, iid, "artist", ids={"mbid": MBID})
-    mock_api(monkeypatch, [
+    api = mock_api(monkeypatch, [
         (f"/artist/{MBID}", MB_ARTIST),
         ("audioscrobbler", LASTFM_ARTIST),
+        ("deezer", DEEZER_ARTIST),
     ])
 
     stats = run(conn, cfg)
@@ -319,6 +339,10 @@ def test_artist_mbid_musicbrainz_plus_lastfm(conn, tmp_path, monkeypatch):
     assert meta["bio"] == "Radiohead are an English rock band."
     assert meta["listeners"] == 5000000
     assert meta["similar"] == ["Thom Yorke", "Blur"]
+    assert meta["image"] == DEEZER_PIC
+    dz = [c for c in api.calls if "deezer" in c[1]]
+    assert dz == [("GET", "https://api.deezer.com/search/artist",
+                   {"q": "Radiohead", "limit": 1})]
 
 
 def test_artist_fallback_search_merges(conn, tmp_path, monkeypatch):
@@ -330,6 +354,7 @@ def test_artist_fallback_search_merges(conn, tmp_path, monkeypatch):
         (f"/artist/{MBID}", MB_ARTIST),
         ("/ws/2/artist", {"artists": [{"id": MBID, "score": 100, "name": "Radiohead"}]}),
         ("audioscrobbler", LASTFM_ARTIST),
+        ("deezer", DEEZER_ARTIST),
     ])
 
     stats = run(conn, cfg)
@@ -343,6 +368,7 @@ def test_artist_fallback_search_merges(conn, tmp_path, monkeypatch):
     assert row["enriched_at"] is not None
     assert json.loads(row["ids"])["mbid"] == MBID
     assert json.loads(row["meta"])["bio"] == "Radiohead are an English rock band."
+    assert json.loads(row["meta"])["image"] == DEEZER_PIC
     search_call = api.calls[0]
     assert search_call[2]["query"] == 'artist:"Radiohead"'
 
@@ -354,6 +380,7 @@ def test_artist_fallback_low_score_enriches_from_lastfm_only(conn, tmp_path, mon
     mock_api(monkeypatch, [
         ("/ws/2/artist", {"artists": [{"id": "zzz", "score": 55, "name": "Radio Head Trib"}]}),
         ("audioscrobbler", LASTFM_ARTIST),
+        ("deezer", DEEZER_ARTIST),
     ])
 
     stats = run(conn, cfg)
@@ -363,7 +390,54 @@ def test_artist_fallback_low_score_enriches_from_lastfm_only(conn, tmp_path, mon
     assert row["enriched_at"] is not None
     meta = json.loads(row["meta"])
     assert meta["listeners"] == 5000000
+    assert meta["image"] == DEEZER_PIC  # portraits work even without an MB match
     assert "mbid" not in json.loads(row["ids"])
+
+
+def test_artist_deezer_failure_never_fails_item(conn, tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path, lastfm={"api_key": "lk"})
+    iid = ids.make("artist", "mbid", MBID)
+    db.upsert_item(conn, iid, "artist", ids={"mbid": MBID})
+    url = "https://api.deezer.com/search/artist"
+    mock_api(monkeypatch, [
+        (f"/artist/{MBID}", MB_ARTIST),
+        ("audioscrobbler", LASTFM_ARTIST),
+        ("deezer", http.ApiError(url, 503, "down")),
+    ])
+
+    stats = run(conn, cfg)
+
+    assert stats == {"enriched": 1, "merged": 0, "skipped": 0, "errors": 0}
+    row = conn.execute("SELECT enriched_at, meta FROM items WHERE id=?", (iid,)).fetchone()
+    assert row["enriched_at"] is not None
+    meta = json.loads(row["meta"])
+    assert "image" not in meta
+    assert meta["bio"] == "Radiohead are an English rock band."  # Last.fm meta survived
+
+
+@pytest.mark.parametrize("payload", [
+    {"data": []},  # no hit
+    {"data": [{"name": "Radiohead", "picture_big": ""}]},  # empty url
+    # Deezer's generic silhouette lives under an empty /artist// path
+    {"data": [{"name": "Radiohead",
+               "picture_big": "https://cdn-images.dzcdn.net/images/artist//500x500.jpg"}]},
+])
+def test_artist_deezer_placeholder_or_miss_skipped(conn, tmp_path, monkeypatch, payload):
+    cfg = make_cfg(tmp_path, lastfm={"api_key": "lk"})
+    iid = ids.make("artist", "mbid", MBID)
+    db.upsert_item(conn, iid, "artist", ids={"mbid": MBID})
+    mock_api(monkeypatch, [
+        (f"/artist/{MBID}", MB_ARTIST),
+        ("audioscrobbler", LASTFM_ARTIST),
+        ("deezer", payload),
+    ])
+
+    stats = run(conn, cfg)
+
+    assert stats["enriched"] == 1 and stats["errors"] == 0
+    meta = json.loads(conn.execute(
+        "SELECT meta FROM items WHERE id=?", (iid,)).fetchone()["meta"])
+    assert "image" not in meta
 
 
 def test_track_lastfm_fallback_just_marked(conn, tmp_path, monkeypatch):
@@ -381,27 +455,91 @@ def test_track_lastfm_fallback_just_marked(conn, tmp_path, monkeypatch):
     assert "enrich_error" not in json.loads(row["meta"])
 
 
-def test_album_mbid_release_lookup(conn, tmp_path, monkeypatch):
+def test_album_mbid_release_group_lookup(conn, tmp_path, monkeypatch):
     cfg = make_cfg(tmp_path)
-    amid = "1b022e01-4da6-387b-8658-8678046e4cef"
-    iid = ids.make("album", "mbid", amid)
-    db.upsert_item(conn, iid, "album", ids={"mbid": amid})
-    mock_api(monkeypatch, [
-        (f"/release/{amid}", {
-            "title": "OK Computer",
-            "date": "1997-05-21",
-            "artist-credit": [{"artist": {"name": "Radiohead"}}],
-            "tags": [{"count": 3, "name": "art rock"}],
-        }),
-    ])
+    iid = ids.make("album", "mbid", RG_MBID)
+    db.upsert_item(conn, iid, "album", ids={"mbid": RG_MBID})
+    api = mock_api(monkeypatch, [(f"/release-group/{RG_MBID}", MB_RELEASE_GROUP)])
 
     stats = run(conn, cfg)
 
-    assert stats["enriched"] == 1
+    assert stats == {"enriched": 1, "merged": 0, "skipped": 0, "errors": 0}
     row = conn.execute("SELECT * FROM items WHERE id=?", (iid,)).fetchone()
+    assert row["enriched_at"] is not None
     assert row["title"] == "OK Computer" and row["year"] == 1997
     meta = json.loads(row["meta"])
-    assert meta["artists"] == ["Radiohead"] and meta["tags"] == ["art rock"]
+    assert meta["artists"] == ["Radiohead"] and meta["artist"] == "Radiohead"
+    assert meta["tags"] == ["alternative rock", "art rock"]
+    assert meta["genres"] == ["art rock"]
+    assert meta["type"] == "Album"
+    assert meta["image"] == f"https://coverartarchive.org/release-group/{RG_MBID}/front-250"
+    id_map = json.loads(row["ids"])
+    assert id_map["mbid"] == RG_MBID and id_map["artist_mbid"] == MBID
+    # the cover URL is stored optimistically: the only request is MB's
+    assert [c[1] for c in api.calls] == \
+        [f"https://musicbrainz.org/ws/2/release-group/{RG_MBID}"]
+    assert api.calls[0][2] == {"inc": "artist-credits+tags+genres", "fmt": "json"}
+
+
+def test_album_titled_but_untagged_still_enriched(conn, tmp_path, monkeypatch):
+    """Collector-titled albums lack tags/cover, which ranking and the UI
+    now consume, so a title alone must not fast-stamp an mbid album."""
+    cfg = make_cfg(tmp_path)
+    iid = ids.make("album", "mbid", RG_MBID)
+    db.upsert_item(conn, iid, "album", title="OK Computer", ids={"mbid": RG_MBID})
+    mock_api(monkeypatch, [(f"/release-group/{RG_MBID}", MB_RELEASE_GROUP)])
+
+    stats = run(conn, cfg)
+
+    assert stats == {"enriched": 1, "merged": 0, "skipped": 0, "errors": 0}
+    meta = json.loads(conn.execute(
+        "SELECT meta FROM items WHERE id=?", (iid,)).fetchone()["meta"])
+    assert meta["tags"] == ["alternative rock", "art rock"]
+    assert meta["image"].endswith(f"/release-group/{RG_MBID}/front-250")
+
+
+def test_album_titled_with_tags_fast_stamps(conn, tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path)
+    iid = ids.make("album", "mbid", RG_MBID)
+    db.upsert_item(conn, iid, "album", title="OK Computer",
+                   ids={"mbid": RG_MBID}, meta={"tags": ["art rock"]})
+    api = mock_api(monkeypatch, [])
+
+    stats = run(conn, cfg)
+
+    assert stats == {"enriched": 0, "merged": 0, "skipped": 1, "errors": 0}
+    assert api.calls == []  # already enriched: no MB round-trip on requeue
+    row = conn.execute("SELECT enriched_at FROM items WHERE id=?", (iid,)).fetchone()
+    assert row["enriched_at"] is not None
+
+
+def test_album_without_mbid_fast_stamps(conn, tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path)
+    iid = ids.make("album", "lastfm", "Radiohead", "OK Computer")
+    db.upsert_item(conn, iid, "album", title="OK Computer")
+    api = mock_api(monkeypatch, [])
+
+    stats = run(conn, cfg)
+
+    assert stats == {"enriched": 0, "merged": 0, "skipped": 1, "errors": 0}
+    assert api.calls == []
+
+
+def test_track_titled_with_mbid_keeps_fast_path(conn, tmp_path, monkeypatch):
+    """Only albums earn the release-group lookup: a titled track with an
+    mbid must still stamp without any HTTP."""
+    cfg = make_cfg(tmp_path)
+    tid = ids.make("track", "mbid", "0f13fa17-40ee-4d3d-b16f-6a832d2d1a29")
+    db.upsert_item(conn, tid, "track", title="Paranoid Android",
+                   ids={"mbid": "0f13fa17-40ee-4d3d-b16f-6a832d2d1a29"})
+    api = mock_api(monkeypatch, [])
+
+    stats = run(conn, cfg)
+
+    assert stats == {"enriched": 0, "merged": 0, "skipped": 1, "errors": 0}
+    assert api.calls == []
+    row = conn.execute("SELECT enriched_at FROM items WHERE id=?", (tid,)).fetchone()
+    assert row["enriched_at"] is not None
 
 
 def test_api_error_still_sets_enriched_at(conn, tmp_path, monkeypatch):

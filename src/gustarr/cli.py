@@ -244,7 +244,7 @@ def stats(ctx: Ctx) -> None:
 @click.option("--dry-run", is_flag=True)
 @click.pass_obj
 def run(ctx: Ctx, recipe: str, dry_run: bool) -> None:
-    """nightly: sync→enrich→candidates→embed→train→rank. weekly: nightly + apply."""
+    """Full pipeline: sync→enrich→candidates→embed→train→rank→apply. Both recipes are identical; weekly is kept as a timer alias."""
     from .pipeline import run_recipe
 
     stats = run_recipe(ctx.conn, ctx.cfg, recipe, dry_run=dry_run)

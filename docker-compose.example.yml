@@ -1,0 +1,54 @@
+# gustarr compose example. Copy to docker-compose.yml and adjust.
+#
+# Config: copy gustarr.example.toml to ./gustarr.toml. For containers set
+#   [core]  data_dir = "/var/lib/gustarr"
+#   [model] device   = "cpu"                # image ships CPU-only torch
+#   [web]   bind     = "0.0.0.0:8790"       # reachable through the port map
+#   [web]   allowed_hosts = ["nas.lan"]     # hostname you browse to (Host guard)
+# Secrets stay out of the TOML via env:VAR — put the actual values in
+# ./gustarr.env (chmod 600, gitignored):
+#   TMDB_API_KEY=...
+#   LASTFM_API_KEY=...
+#   SONARR_API_KEY=...
+
+services:
+  # long-running approval web UI — the only daemon
+  gustarr:
+    image: ghcr.io/dixiao-l/gustarr:latest
+    # build: .                              # or build locally
+    restart: unless-stopped
+    ports:
+      - "8790:8790"
+    env_file:
+      - gustarr.env
+    volumes:
+      - ./gustarr.toml:/etc/gustarr/gustarr.toml:ro
+      - gustarr-state:/var/lib/gustarr     # SQLite store + model cache: back this up
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8790/api/stats', timeout=5)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # There is deliberately no scheduler in the container. Run pipelines as
+  # one-shots from host cron / a host systemd timer:
+  #
+  #   30 4 * * *  cd /opt/gustarr && docker compose run --rm gustarr run nightly
+  #   0  9 * * 6  cd /opt/gustarr && docker compose run --rm gustarr run weekly
+  #
+  # ...or uncomment this one-shot service and use `docker compose run pipeline`:
+  #
+  # pipeline:
+  #   image: ghcr.io/dixiao-l/gustarr:latest
+  #   profiles: ["cron"]                   # never started by `up`
+  #   command: ["run", "nightly"]
+  #   env_file:
+  #     - gustarr.env
+  #   volumes:
+  #     - ./gustarr.toml:/etc/gustarr/gustarr.toml:ro
+  #     - gustarr-state:/var/lib/gustarr
+
+volumes:
+  gustarr-state:

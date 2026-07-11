@@ -24,6 +24,11 @@ from ..config import Config
 
 # Music autonomy caps are low; a 20-deep artist queue just goes stale.
 ARTIST_TOP = 10
+# Albums actuate under their own weekly budget (music_max_albums_per_week),
+# so their queue depth mirrors the artist one. Like artists they are
+# exempt from the video queue cap below.
+ALBUM_TOP = 10
+DOMAIN_TOP = {"artist": ARTIST_TOP, "album": ALBUM_TOP}
 SOURCE_BONUS = 0.03
 EXT_BONUS = 0.05
 NEG_PULL = 0.6
@@ -269,7 +274,7 @@ def run(conn: sqlite3.Connection, cfg: Config, top: int = 20) -> dict:
         if centroid is not None and centroid.get("dim") == x.shape[1] and centroid.get("pos"):
             cent_sims = xn @ _unit(_vec(centroid["pos"]))
 
-        slots = min(top, ARTIST_TOP) if domain == "artist" else top
+        slots = min(top, DOMAIN_TOP.get(domain, top))
         if domain in ("movie", "series"):
             # Respect the video queue cap here rather than letting apply
             # mass-expire the overflow later — proposing 80 and trimming

@@ -89,6 +89,8 @@ RUNTIME_KEYS: dict[str, _Spec] = {
     "music_mode": _Spec(_as_choice("auto", "queue"), lambda cfg: cfg.autonomy.music_mode),
     "music_max_artists_per_week": _Spec(
         _as_int(0), lambda cfg: cfg.autonomy.music_max_artists_per_week),
+    "music_max_albums_per_week": _Spec(
+        _as_int(0), lambda cfg: cfg.autonomy.music_max_albums_per_week),
     "video_queue_max_pending": _Spec(
         _as_int(1), lambda cfg: cfg.autonomy.video_queue_max_pending),
     "exploration_frac": _Spec(_as_float(0.0, 0.9), lambda cfg: cfg.model.exploration_frac),

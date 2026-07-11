@@ -96,7 +96,7 @@ in
       onCalendar = lib.mkOption {
         type = lib.types.str;
         default = "*-*-* 04:30:00";
-        description = "sync → enrich → candidates → embed → train → rank.";
+        description = "The full pipeline: sync → … → rank → apply (approvals land nightly).";
       };
     };
 
@@ -105,7 +105,7 @@ in
       onCalendar = lib.mkOption {
         type = lib.types.str;
         default = "Sat *-*-* 09:00:00";
-        description = "nightly stages + apply (actuates the *arrs within caps).";
+        description = "Same pipeline as nightly — a second weekly window, kept for back-compat.";
       };
     };
 

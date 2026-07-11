@@ -509,6 +509,118 @@ def test_rejected_artist_stays_excluded_when_mbid_appears(conn, cfg, router):
     assert ev["item_id"] == canon
 
 
+# ── top albums ───────────────────────────────────────────────────────
+
+
+def seed_artist(conn, name, mb=None, ts=None):
+    if mb:
+        iid = ids.make("artist", "mbid", mb)
+        db.upsert_item(conn, iid, "artist", title=name, ids={"mbid": mb})
+    else:
+        iid = ids.make("artist", "lastfm", name)
+        db.upsert_item(conn, iid, "artist", title=name)
+    db.add_event(conn, ts or iso(1), iid, "loved", 1.0, "lastfm")
+    return iid
+
+
+def album_entry(mbid, name, playcount, artist="Nirvana", artist_mbid=""):
+    return {"name": name, "mbid": mbid, "playcount": playcount,
+            "artist": {"name": artist, "mbid": artist_mbid}}
+
+
+def test_album_top_albums_fanout_rank_normalized(conn, cfg, router):
+    mb1 = "5b11f4ce-a62d-471e-81fc-a69a8278c7da"
+    mb2 = "a74b1b7f-71a5-4011-9441-d0b5e4122711"
+    seed1 = seed_artist(conn, "Nirvana", mb=mb1, ts=iso(1))
+    seed2 = seed_artist(conn, "Radiohead", mb=mb2, ts=iso(2))
+    seed_artist(conn, "Name Only", ts=iso(3))  # no mbid anywhere: never queried
+    owned = ids.make("album", "mbid", "alb-own")
+    db.upsert_item(conn, owned, "album", title="Owned")
+    conn.execute("INSERT INTO library (item_id, arr) VALUES (?, 'lidarr')", (owned,))
+
+    def top_albums(params):
+        assert params["limit"] == 8
+        if params["mbid"] == mb1:
+            return {"topalbums": {"album": [
+                album_entry("alb-1", "Nevermind", 900, artist_mbid=mb1),
+                album_entry("", "No Mbid", 800),  # unactionable, but keeps its rank
+                album_entry("alb-2", "In Utero", 700),  # no artist mbid: seed's is used
+                album_entry("alb-own", "Owned", 600, artist_mbid=mb1),
+            ]}}
+        assert params["mbid"] == mb2
+        return {"topalbums": {"album":  # single-element list collapse
+            album_entry("alb-3", "OK Computer", 500, artist="Radiohead", artist_mbid=mb2)}}
+
+    router.route("lastfm:artist.gettopalbums", top_albums)
+    stats = run(conn, cfg, domain="album")
+
+    # mbid seeds queried best-label first; name-only artist skipped entirely
+    assert [p["mbid"] for _, p in router.calls] == [mb1, mb2]
+    assert stats["seeds"]["album"] == 2
+
+    rows = candidate_rows(conn)
+    top = rows[(ids.make("album", "mbid", "alb-1"), "lastfm_top_albums")]
+    assert top["external_score"] == pytest.approx(1.0)  # playcount #1
+    assert top["seed_item_id"] == seed1
+    # rank includes the skipped mbid-less entry: In Utero is playcount #3
+    assert rows[(ids.make("album", "mbid", "alb-2"), "lastfm_top_albums")][
+        "external_score"] == pytest.approx(0.8)
+    third = rows[(ids.make("album", "mbid", "alb-3"), "lastfm_top_albums")]
+    assert third["external_score"] == pytest.approx(1.0)
+    assert third["seed_item_id"] == seed2
+    assert not any(k[0] == owned for k in rows)  # item exclusions apply unchanged
+    albums = [k for k in rows if k[1] == "lastfm_top_albums"]
+    assert len(albums) == 3  # mbid-less entry never became an item
+
+    item = conn.execute("SELECT * FROM items WHERE id=?",
+                        (ids.make("album", "mbid", "alb-1"),)).fetchone()
+    assert item["domain"] == "album" and item["title"] == "Nevermind"
+    assert json.loads(item["ids"]) == {"mbid": "alb-1", "artist_mbid": mb1}
+    meta = json.loads(item["meta"])
+    assert meta["artist"] == "Nirvana" and meta["artist_mbid"] == mb1
+    # entry carried no artist mbid: the seed artist's fills in
+    in_utero = conn.execute("SELECT * FROM items WHERE id=?",
+                            (ids.make("album", "mbid", "alb-2"),)).fetchone()
+    assert json.loads(in_utero["ids"])["artist_mbid"] == mb1
+
+    assert stats["new"] == {"lastfm_top_albums": 3}
+    assert stats["skipped"] == 1
+
+
+def test_album_cap_100_and_rank_floor(conn, cfg, router):
+    mb = "5b11f4ce-a62d-471e-81fc-a69a8278c7da"
+    seed_artist(conn, "Nirvana", mb=mb)
+    # oversized payload (the live API honors limit=8; the cap is our guard)
+    router.route("lastfm:artist.gettopalbums", {"topalbums": {"album": [
+        album_entry(f"alb-{i}", f"A{i}", 1000 - i, artist_mbid=mb) for i in range(120)]}})
+
+    stats = run(conn, cfg, domain="album")
+
+    n = conn.execute(
+        "SELECT count(*) c FROM candidates WHERE source='lastfm_top_albums'").fetchone()["c"]
+    assert n == 100
+    assert stats["capped"] == ["lastfm_top_albums"]
+    rows = candidate_rows(conn)
+    # deep ranks clamp at the 0.3 floor instead of going negative
+    assert rows[(ids.make("album", "mbid", "alb-50"), "lastfm_top_albums")][
+        "external_score"] == pytest.approx(0.3)
+
+
+def test_album_domain_in_default_run(conn, cfg, router):
+    # a full run (no domain filter) reaches the album source; the artist
+    # sources fire too since the same key configures them
+    mb = "5b11f4ce-a62d-471e-81fc-a69a8278c7da"
+    seed_artist(conn, "Nirvana", mb=mb)
+    router.route("lastfm:artist.getsimilar", {"similarartists": {"artist": []}})
+    router.route("lastfm:artist.gettopalbums", {"topalbums": {"album": [
+        album_entry("alb-1", "Nevermind", 900, artist_mbid=mb)]}})
+
+    stats = run(conn, cfg)
+
+    assert stats["new"] == {"lastfm_top_albums": 1}
+    assert (ids.make("album", "mbid", "alb-1"), "lastfm_top_albums") in candidate_rows(conn)
+
+
 # ── serendipity ──────────────────────────────────────────────────────
 
 

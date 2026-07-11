@@ -36,7 +36,11 @@ def list_recs(
     if status != "all":
         where.append("r.status = ?")
         params.append(status)
-    if domain:
+    if domain == "music":
+        # 'music' is the UI's tab, never a stored domain — expanding the
+        # alias here gives every caller (web, CLI) the same behaviour.
+        where.append("r.domain IN ('artist', 'album')")
+    elif domain:
         where.append("r.domain = ?")
         params.append(domain)
     if where:
@@ -56,6 +60,12 @@ def list_recs(
             "ids": json.loads(r["ids"]),
             "genres": meta.get("genres") or [],
             "poster_path": meta.get("poster_path"),
+            # Music cards need these: image is a direct URL (no TMDB prefix),
+            # artist feeds the album card's "by <artist>" byline, and type
+            # ("Album"/"Single"/"EP") feeds the card's type chip.
+            "image": meta.get("image"),
+            "artist": meta.get("artist"),
+            "type": meta.get("type"),
             "overview": overview[:220] if overview else None,
             "trailer": meta.get("trailer"),
             "score": r["score"],
