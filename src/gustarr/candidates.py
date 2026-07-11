@@ -7,9 +7,9 @@ for exploration; artists through Last.fm similar. A serendipity pass
 counters the bubble those sources create: TMDb discover over the user's
 under-represented genres and least-visited decade (quality-floored),
 and a damped 2-hop Last.fm fan-out from the best hop-1 candidates.
-Exclusions (library, open/acted recommendations, rejected items) are
-applied at insert time — nothing is deleted from the pool, excluded
-rows simply never enter.
+Exclusions (library, open/acted recommendations, actively snoozed or
+rejected items) are applied at insert time — nothing is deleted from
+the pool, excluded rows simply never enter.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections import Counter
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from . import db, http, ids, signals
@@ -50,6 +51,17 @@ SERENDIPITY_DECADES = range(1960, 2020, 10)
 # failed to actuate) or ever rejected must never re-enter the pool —
 # 'failed' is terminal, so re-proposing it would just re-fail in apply.
 BLOCKED_REC_STATUSES = ("proposed", "approved", "auto_added", "added", "failed")
+
+# 'snoozed' blocks re-entry only while the snooze is active; rank's
+# expiry pass flips snoozes older than this window back to 'expired'
+# (re-proposable). rank._pool mirrors the same acted_at condition.
+SNOOZE_DAYS = 30
+
+
+def snooze_cutoff() -> str:
+    """acted_at values at/after this mark a still-active snooze."""
+    return (datetime.now(timezone.utc) - timedelta(days=SNOOZE_DAYS)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
 
 
 def run(conn: sqlite3.Connection, cfg: Config, domain: str | None = None) -> dict[str, Any]:
@@ -133,11 +145,12 @@ def _excluded_ids(conn: sqlite3.Connection) -> set[str]:
         "SELECT x.item_id, i.domain, i.ids FROM ("
         "SELECT item_id FROM library"
         f" UNION SELECT item_id FROM recommendations WHERE status IN ({marks})"
+        "   OR (status='snoozed' AND acted_at >= ?)"
         " UNION SELECT item_id FROM events WHERE kind='reject') x"
         " LEFT JOIN items i ON i.id = x.item_id"
     )
     excluded: set[str] = set()
-    for r in conn.execute(q, BLOCKED_REC_STATUSES):
+    for r in conn.execute(q, (*BLOCKED_REC_STATUSES, snooze_cutoff())):
         excluded.add(r["item_id"])
         if r["domain"] is None:
             continue

@@ -137,6 +137,9 @@ in
       environment = gpuEnv // cfg.extraEnvironment;
       serviceConfig = commonService // {
         Type = "oneshot";
+        # The web UI's "Run Now" drops this sentinel; consume it on start
+        # so the path unit below doesn't retrigger.
+        ExecStartPre = "${pkgs.coreutils}/bin/rm -f ${cfg.stateDir}/run-requested";
         ExecStart = "${lib.getExe cfg.package} --config ${configFile} run nightly";
         # embed can legitimately take a while on first run (model download
         # + full-library embedding); don't let systemd kill a working job.
@@ -149,6 +152,16 @@ in
         OnCalendar = cfg.nightly.onCalendar;
         RandomizedDelaySec = 600;
         Persistent = true;
+      };
+    };
+    # "Run Now" bridge: the unprivileged web UI can't systemctl-start
+    # anything; it touches a sentinel in the state dir and this path
+    # unit starts the pipeline. Systemd is the privilege boundary.
+    systemd.paths.gustarr-run-requested = lib.mkIf cfg.nightly.enable {
+      wantedBy = [ "multi-user.target" ];
+      pathConfig = {
+        PathExists = "${cfg.stateDir}/run-requested";
+        Unit = "gustarr-nightly.service";
       };
     };
 

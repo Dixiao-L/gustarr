@@ -68,8 +68,8 @@ def list_recs(
 
 
 def set_status(conn: sqlite3.Connection, rec_id: int, status: str) -> dict[str, int]:
-    if status not in ("approved", "rejected"):
-        raise ValueError(f"only approved/rejected can be set here, not {status!r}")
+    if status not in ("approved", "rejected", "snoozed"):
+        raise ValueError(f"only approved/rejected/snoozed can be set here, not {status!r}")
     row = conn.execute(
         "SELECT item_id, status, why FROM recommendations WHERE id=?", (rec_id,)).fetchone()
     if row is None:
@@ -78,10 +78,18 @@ def set_status(conn: sqlite3.Connection, rec_id: int, status: str) -> dict[str, 
         raise ValueError(f"recommendation #{rec_id} is already {row['status']}; too late")
     if row["status"] == status:
         raise ValueError(f"recommendation #{rec_id} is already {status}")
+    if status == "snoozed" and row["status"] != "proposed":
+        raise ValueError(
+            f"recommendation #{rec_id} is {row['status']}; only proposed recs can be snoozed")
 
     ts = db.now()
     conn.execute(
         "UPDATE recommendations SET status=?, acted_at=? WHERE id=?", (status, ts, rec_id))
+    if status == "snoozed":
+        # "Not now" is not a verdict — deliberately no taste event, so the
+        # model learns nothing from a snooze. Rank's expiry pass flips
+        # snoozed→expired after the TTL, making the item proposable again.
+        return {"updated": 1, "events": 0}
     kind = "approve" if status == "approved" else "reject"
     weight = signals.WEIGHTS[kind]
     meta: dict[str, Any] = {"rec_id": rec_id}
@@ -93,6 +101,27 @@ def set_status(conn: sqlite3.Connection, rec_id: int, status: str) -> dict[str, 
         meta["exploration"] = True
     added = db.add_event(conn, ts, row["item_id"], kind, weight, "user", meta=meta)
     return {"updated": 1, "events": int(added)}
+
+
+def forgive(conn: sqlite3.Connection, rec_id: int) -> dict[str, int]:
+    """Undo a reject: delete that rec's reject event(s) so training stops
+    penalising the item, and flip the rec to 'expired' so rank may
+    propose it again. Only this rec's events go — a reject of the same
+    item via another recommendation is a separate verdict and stays."""
+    row = conn.execute("SELECT status FROM recommendations WHERE id=?", (rec_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"no recommendation #{rec_id}")
+    if row["status"] != "rejected":
+        raise ValueError(f"recommendation #{rec_id} is {row['status']}; only rejected"
+                         " recs can be forgiven")
+
+    cur = conn.execute(
+        "DELETE FROM events WHERE kind='reject' AND json_extract(meta, '$.rec_id') = ?",
+        (rec_id,))
+    conn.execute(
+        "UPDATE recommendations SET status='expired', acted_at=? WHERE id=?",
+        (db.now(), rec_id))
+    return {"deleted_events": cur.rowcount}
 
 
 # ── explanations ─────────────────────────────────────────────────────
@@ -249,6 +278,8 @@ def store_stats(conn: sqlite3.Connection) -> dict[str, Any]:
         "recs_by_status": recs_by_status,
         "sync": sync,
         "models": models,
+        "settings_overridden": conn.execute(
+            "SELECT COUNT(*) FROM state WHERE key LIKE 'setting:%'").fetchone()[0],
         "embedding_coverage": {"needed": needed, "embedded": embedded},
         "diversity": _diversity(conn),
     }

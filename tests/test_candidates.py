@@ -9,7 +9,7 @@ import pytest
 
 from gustarr import config as C
 from gustarr import db, http, ids
-from gustarr.candidates import _excluded_ids, _tmdb_result, run
+from gustarr.candidates import SNOOZE_DAYS, _excluded_ids, _tmdb_result, run
 
 TMDB = "https://api.themoviedb.org/3"
 
@@ -353,6 +353,46 @@ def test_failed_rec_never_reenters_pool(conn, cfg, router):
     stats = run(conn, cfg, domain="movie")
 
     assert candidate_rows(conn) == {}
+    assert stats["skipped"] == 1
+
+
+def add_snoozed_rec(conn, item_id, days_ago):
+    db.upsert_item(conn, item_id, "movie", title=item_id)
+    conn.execute(
+        "INSERT INTO recommendations (run_id, ts, domain, item_id, score, status, acted_at)"
+        " VALUES ('r1', ?, 'movie', ?, 0.5, 'snoozed', ?)",
+        (iso(days_ago), item_id, iso(days_ago)))
+
+
+def test_excluded_ids_snooze_window(conn):
+    active = ids.make("movie", "tmdb", "800")
+    add_snoozed_rec(conn, active, days_ago=SNOOZE_DAYS - 1)
+    lapsed = ids.make("movie", "tmdb", "801")
+    add_snoozed_rec(conn, lapsed, days_ago=SNOOZE_DAYS + 1)
+
+    excluded = _excluded_ids(conn)
+
+    assert active in excluded
+    assert lapsed not in excluded  # rank will expire it; re-proposable
+
+
+def test_snoozed_item_blocked_only_while_active(conn, cfg, router):
+    seed_movie(conn, 603, "The Matrix")
+    active = ids.make("movie", "tmdb", "800")
+    add_snoozed_rec(conn, active, days_ago=2)
+    lapsed = ids.make("movie", "tmdb", "801")
+    add_snoozed_rec(conn, lapsed, days_ago=SNOOZE_DAYS + 1)
+    router.route("/movie/603/recommendations", {"results": [
+        movie_result(800), movie_result(801)]})
+    router.route("/movie/603/similar", {"results": []})
+    router.route("/genre/movie/list", {"genres": []})
+    router.route("/discover/movie", {"results": []})
+
+    stats = run(conn, cfg, domain="movie")
+
+    rows = candidate_rows(conn)
+    assert (lapsed, "tmdb_similar") in rows
+    assert not any(k[0] == active for k in rows)
     assert stats["skipped"] == 1
 
 

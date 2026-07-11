@@ -18,7 +18,7 @@ from urllib.parse import urlsplit
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from .. import db, queue
+from .. import db, queue, settings
 from ..config import Config
 
 _INDEX = Path(__file__).parent / "static" / "index.html"
@@ -95,6 +95,19 @@ def create_app(cfg: Config) -> FastAPI:
     def api_reject(rec_id: int, conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
         return act(conn, rec_id, "rejected")
 
+    @app.post("/api/recs/{rec_id}/snooze")
+    def api_snooze(rec_id: int, conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
+        return act(conn, rec_id, "snoozed")
+
+    @app.post("/api/recs/{rec_id}/forgive")
+    def api_forgive(rec_id: int, conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
+        try:
+            stats = queue.forgive(conn, rec_id)
+        except ValueError as exc:  # unknown rec / not rejected
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        conn.commit()
+        return {"id": rec_id, "status": "expired", **stats}
+
     @app.get("/api/recs/{rec_id}/why")
     def api_why(rec_id: int, conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, str]:
         try:
@@ -105,6 +118,44 @@ def create_app(cfg: Config) -> FastAPI:
     @app.get("/api/stats")
     def api_stats(conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
         return queue.store_stats(conn)
+
+    @app.get("/api/settings")
+    def api_settings(conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
+        return settings.get_all(conn, cfg)
+
+    @app.put("/api/settings/{key}")
+    def api_settings_set(
+        key: str, payload: dict[str, Any], conn: sqlite3.Connection = Depends(get_conn)
+    ) -> dict[str, Any]:
+        if "value" not in payload:
+            raise HTTPException(status_code=400, detail="body must be {\"value\": ...}")
+        try:
+            value = settings.set(conn, key, payload["value"])
+        except ValueError as exc:  # unknown key / invalid value
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        conn.commit()
+        return {"key": key, "value": value}
+
+    @app.delete("/api/settings/{key}")
+    def api_settings_clear(
+        key: str, conn: sqlite3.Connection = Depends(get_conn)
+    ) -> dict[str, Any]:
+        try:
+            settings.clear(conn, key)
+        except ValueError as exc:  # unknown key
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        conn.commit()
+        return {"key": key, "cleared": True}
+
+    @app.post("/api/run")
+    def api_run() -> dict[str, bool]:
+        # The sentinel file is the whole IPC: a systemd path unit on the
+        # host watches data_dir and starts the pipeline when it appears,
+        # so the web process never runs the pipeline in-process.
+        sentinel = Path(cfg.data_dir) / "run-requested"
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.touch(mode=0o644)
+        return {"requested": True}
 
     @app.get("/", include_in_schema=False)
     def index() -> HTMLResponse:
