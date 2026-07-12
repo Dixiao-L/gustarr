@@ -96,7 +96,9 @@ def make_handler(seen: list, cf_status: int = 200):
             return httpx.Response(200, json=hits)
         if path == "/1/user/alice/playlists/createdfor":
             return httpx.Response(200, json=CREATEDFOR if cf_status == 200 else {"playlists": []})
-        if path == f"/1/playlists/{PL_NEW}":
+        if path == f"/1/playlist/{PL_NEW}":
+            # singular route, like the real API — the plural form is a 404
+            # there, so it deliberately falls through to the 404 below
             return httpx.Response(200, json=WEEKLY_JSPF)
         return httpx.Response(404)
 
@@ -223,8 +225,9 @@ def test_weekly_exploration_fetches_newest_playlist(conn, cfg, monkeypatch):
     stats = listenbrainz.sync(conn, cfg)
 
     assert stats["weekly_tracks"] == 2
-    playlist_calls = [c[1] for c in seen if c[1].startswith("/1/playlists/")]
-    assert playlist_calls == [f"/1/playlists/{PL_NEW}"]
+    # the prefix catches a regression to the plural route too
+    playlist_calls = [c[1] for c in seen if c[1].startswith("/1/playlist")]
+    assert playlist_calls == [f"/1/playlist/{PL_NEW}"]  # singular, newest week only
 
     track_w = db.lookup_item(conn, "track", "mbid", MBID_W)
     row = candidate(conn, track_w, "listenbrainz_weekly")

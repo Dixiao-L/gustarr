@@ -71,7 +71,8 @@ population average.
 sync jellyfin ────┐          items       events           ┌──▶ apply → Lidarr (auto, capped)
 sync lastfm ──────┤          library     candidates       ├──▶ apply → Radarr/Sonarr (queue)
 sync listenbrainz ┼──▶       embeddings  recommendations ─┼──▶ Jellyfin collections
-sync arr ─────────┘                                       └──▶ recs / approve / reject /
+sync arr ─────────┘                                       ├──▶ Jellyfin weekly playlist
+                                                          └──▶ recs / approve / reject /
                                                                snooze / forgive / why
                     enrich → candidates → embed → train → rank      (CLI + web UI)
 ```

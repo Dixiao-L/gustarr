@@ -18,7 +18,7 @@ from typing import Any, Callable
 
 from .. import db, http, settings
 from ..config import Config
-from . import jellyfin_collections
+from . import jellyfin_collections, jellyfin_playlist
 from .arr_client import ArrConfigError, ArrError, LidarrClient, RadarrClient, SonarrClient
 
 
@@ -118,6 +118,11 @@ def run(conn: sqlite3.Connection, cfg: Config, dry_run: bool = False) -> dict[st
         stats["jellyfin"] = jellyfin_collections.sync_collections(conn, cfg, dry_run=dry_run)
     except Exception as exc:  # collections are cosmetic — never fail the run
         stats["jellyfin_error"] = str(exc)
+    try:
+        stats["jellyfin_playlist"] = jellyfin_playlist.sync_playlists(
+            conn, cfg, dry_run=dry_run)
+    except Exception as exc:  # same: a playlist hiccup never fails the run
+        stats["jellyfin_playlist_error"] = str(exc)
     return stats
 
 

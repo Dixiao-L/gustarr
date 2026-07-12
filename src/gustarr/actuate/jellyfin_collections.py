@@ -18,23 +18,36 @@ COLLECTIONS = {
     "track": "Gustarr Discover: Music",
 }
 
-# Jellyfin AnyProviderIdEquals filter: our identity namespace → provider
-# name. Only used when the item carries no 'jellyfin' identity yet (the
-# collector hands us the Jellyfin item id directly for library items).
+# our identity namespace → Jellyfin ProviderIds key + item type, for
+# items that carry no 'jellyfin' identity yet (the collector hands us
+# the Jellyfin item id directly for library items).
 PROVIDERS = {
-    "movie": ("tmdb", "tmdb"),
-    "series": ("tvdb", "tvdb"),
-    "artist": ("mbid", "musicbrainzartist"),
+    "movie": ("tmdb", "tmdb", "Movie"),
+    "series": ("tvdb", "tvdb", "Series"),
+    "artist": ("mbid", "musicbrainzartist", "MusicArtist"),
 }
 
 
-def _find_item(base: str, headers: dict[str, str], provider_value: str) -> str | None:
+def _find_item(base: str, headers: dict[str, str], item_type: str,
+               provider: str, ext: str, title: str | None) -> str | None:
+    """Jellyfin 10.x has no provider-id query (the Emby-era
+    AnyProviderIdEquals parameter is silently ignored, which would make
+    every lookup 'match' an arbitrary item), so search by title and
+    verify the provider id client-side."""
+    if not title:
+        return None
     found = http.get_json(
         f"{base}/Items",
-        params={"Recursive": "true", "AnyProviderIdEquals": provider_value},
+        params={"Recursive": "true", "IncludeItemTypes": item_type,
+                "SearchTerm": title, "Fields": "ProviderIds", "Limit": 25},
         headers=headers)
-    items = (found or {}).get("Items") or []
-    return items[0]["Id"] if items else None
+    want = str(ext).casefold()
+    for item in (found or {}).get("Items") or []:
+        pids = {k.casefold(): str(v).casefold()
+                for k, v in (item.get("ProviderIds") or {}).items() if v}
+        if pids.get(provider) == want:
+            return item["Id"]
+    return None
 
 
 def _find_collection(base: str, headers: dict[str, str], name: str) -> str | None:
@@ -62,7 +75,7 @@ def sync_collections(
     if not base or not token:
         return {"skipped": True}
     rows = conn.execute(
-        "SELECT DISTINCT r.domain, i.id AS item_id FROM recommendations r"
+        "SELECT DISTINCT r.domain, i.id AS item_id, i.title FROM recommendations r"
         " JOIN items i ON i.id = r.item_id WHERE r.status IN ('auto_added','added')"
     ).fetchall()
     if dry_run:
@@ -87,11 +100,12 @@ def sync_collections(
             provider = PROVIDERS.get(row["domain"])
             if provider is None:
                 continue
-            ext = idents.get(provider[0])
+            ns, provider_key, item_type = provider
+            ext = idents.get(ns)
             if ext is None:
                 continue
             stats["checked"] += 1
-            jf_id = _find_item(base, headers, f"{provider[1]}.{ext}")
+            jf_id = _find_item(base, headers, item_type, provider_key, ext, row["title"])
             if jf_id is None:
                 continue
             stats["matched"] += 1

@@ -4,6 +4,29 @@ All notable changes to Gustarr are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/).
 
+## [0.4.0] - 2026-07-13
+
+### Added
+- **Weekly Exploration in Jellyfin**: each profile with both a
+  ListenBrainz and a Jellyfin user gets a "Weekly Exploration" playlist,
+  reconciled every run against what the library holds (matched by
+  MusicBrainz track id, with an artist-verified name fallback). The
+  week's picks are music you mostly don't have yet — Gustarr feeds them
+  to Lidarr, and the playlist grows as they arrive. Gustarr tracks the
+  playlist it created in the store and never touches one it didn't
+  make; disable with `[listenbrainz] weekly_playlist = false`.
+
+### Fixed
+- The ListenBrainz Weekly Exploration candidates source had been dead
+  since 0.1.0: the playlist fetch used a plural API route the server
+  answers with a redirect into a 404. Found by pre-release review of
+  the playlist feature, which shares the fetch.
+- Jellyfin item matching (Discover collections, and the new playlist)
+  no longer relies on the Emby-era `AnyProviderIdEquals` query, which
+  Jellyfin 10.x silently ignores — matching an arbitrary item instead
+  of the right one. Lookups now search by title and verify provider ids
+  client-side.
+
 ## [0.3.0] - 2026-07-12
 
 ### Changed

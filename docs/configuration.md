@@ -127,6 +127,7 @@ scrobble history.
 |---|---|
 | `user` | ListenBrainz username; enables CF recommendations + Weekly Exploration playlist as candidates |
 | `token` | optional; reads are public — a token only lifts rate limits |
+| `weekly_playlist` | default `true`: each profile with both a ListenBrainz and a Jellyfin user gets a "Weekly Exploration" playlist in Jellyfin, reconciled every run with whatever the library holds — the week's picks arrive via Lidarr over the following days and the playlist grows with them. Gustarr only ever touches the playlist it created (tracked in the store) — a playlist you made with the same name is left alone. Set `false` to disable. |
 
 ### `[tmdb]`
 

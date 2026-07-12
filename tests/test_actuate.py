@@ -1,6 +1,6 @@
 """Offline tests for the actuation slice: arr clients, apply, Jellyfin
-collections. All HTTP goes through an httpx.MockTransport injected by
-monkeypatching gustarr.http.request_json."""
+collections and weekly playlists. All HTTP goes through an
+httpx.MockTransport injected by monkeypatching gustarr.http.request_json."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import pytest
 from gustarr import config as C
 from gustarr import db, http, settings, signals
 from gustarr.actuate import apply as apply_mod
-from gustarr.actuate import arr_client, jellyfin_collections
+from gustarr.actuate import arr_client, jellyfin_collections, jellyfin_playlist
 from gustarr.config import ArrConfig
 
 # ── fakes ────────────────────────────────────────────────────────────
@@ -154,32 +154,55 @@ class FakeArr:
 
 
 class FakeJellyfin:
+    """Jellyfin 10.x as the collections sync sees it: a typed library
+    searchable by title (Fields=ProviderIds exposes provider ids for the
+    client-side verify) plus the /Collections surface. AnyProviderIdEquals
+    is deliberately NOT a filter: the real server ignores the unknown
+    parameter and returns everything of the requested type, so a
+    regression back to it matches garbage here as in production."""
+
     def __init__(self, api_key="jk"):
         self.api_key = api_key
-        self.items = {}  # "tmdb.603" -> jellyfin item id
+        self.library = []  # {"Id", "Name", "Type", "ProviderIds": {...}}
         self.collections = {}  # id -> {"name": ..., "members": [...]}
         self.next_id = 1
-        self.provider_queries = []  # AnyProviderIdEquals values searched
+        self.item_searches = []  # SearchTerm values of non-BoxSet lookups
+
+    def add_library_item(self, jf_id, name, item_type, providers=None):
+        self.library.append({"Id": jf_id, "Name": name, "Type": item_type,
+                             "ProviderIds": dict(providers or {})})
+
+    def _list_items(self, q) -> httpx.Response:
+        if "ParentId" in q:
+            coll = self.collections.get(q["ParentId"])
+            members = coll["members"] if coll else []
+            return httpx.Response(200, json={"Items": [{"Id": m} for m in members]})
+        # collections surface in /Items as BoxSet rows
+        items = self.library + [
+            {"Id": cid, "Name": c["name"], "Type": "BoxSet", "ProviderIds": {}}
+            for cid, c in self.collections.items()]
+        types = q["IncludeItemTypes"].split(",") if q.get("IncludeItemTypes") else None
+        if types:
+            items = [i for i in items if i["Type"] in types]
+        if "SearchTerm" in q:
+            if types != ["BoxSet"]:
+                self.item_searches.append(q["SearchTerm"])
+            term = q["SearchTerm"].casefold()
+            items = [i for i in items if term in i["Name"].casefold()]
+        if "Limit" in q:
+            items = items[: int(q["Limit"])]
+        with_pids = "ProviderIds" in (q.get("Fields") or "").split(",")
+        return httpx.Response(200, json={"Items": [
+            {"Id": i["Id"], "Name": i["Name"], "Type": i["Type"],
+             **({"ProviderIds": dict(i["ProviderIds"])} if with_pids else {})}
+            for i in items]})
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         if request.headers.get("X-Emby-Token") != self.api_key:
             return httpx.Response(401, text="bad token")
         path, q = request.url.path, request.url.params
-        if path == "/Items":
-            if "AnyProviderIdEquals" in q:
-                self.provider_queries.append(q["AnyProviderIdEquals"])
-                jf_id = self.items.get(q["AnyProviderIdEquals"])
-                found = [{"Id": jf_id}] if jf_id else []
-                return httpx.Response(200, json={"Items": found})
-            if q.get("IncludeItemTypes") == "BoxSet":
-                term = q.get("SearchTerm", "").lower()
-                found = [{"Id": cid, "Name": c["name"]}
-                         for cid, c in self.collections.items() if term in c["name"].lower()]
-                return httpx.Response(200, json={"Items": found})
-            if "ParentId" in q:
-                coll = self.collections.get(q["ParentId"])
-                members = coll["members"] if coll else []
-                return httpx.Response(200, json={"Items": [{"Id": m} for m in members]})
+        if path == "/Items" and request.method == "GET":
+            return self._list_items(q)
         if path == "/Collections" and request.method == "POST":
             cid = f"coll{self.next_id}"
             self.next_id += 1
@@ -1074,8 +1097,9 @@ def test_jellyfin_collections_created_then_idempotent(conn, tmp_path, net):
             acted_at=db.now())
     add_rec(conn, "artist", "Artist 1", {"mbid": "mb1"},
             status="auto_added", acted_at=db.now())
-    net.jellyfin.items["tmdb.603"] = "jf-603"
-    net.jellyfin.items["musicbrainzartist.mb1"] = "jf-mb1"
+    net.jellyfin.add_library_item("jf-603", "The Matrix", "Movie", {"Tmdb": "603"})
+    net.jellyfin.add_library_item("jf-mb1", "Artist 1", "MusicArtist",
+                                  {"MusicBrainzArtist": "mb1"})
 
     stats = jellyfin_collections.sync_collections(conn, cfg)
     assert stats == {"checked": 2, "matched": 2, "collections_created": 2,
@@ -1096,7 +1120,7 @@ def test_jellyfin_collection_extended_not_recreated(conn, tmp_path, net):
     net.jellyfin.collections["coll-pre"] = {
         "name": "Gustarr Discover: Movies", "members": ["jf-1"]}
     add_rec(conn, "movie", "M2", {"tmdb": 2}, status="added")
-    net.jellyfin.items["tmdb.2"] = "jf-2"
+    net.jellyfin.add_library_item("jf-2", "M2", "Movie", {"Tmdb": "2"})
     stats = jellyfin_collections.sync_collections(conn, cfg)
     assert stats["collections_created"] == 0
     assert stats["collection_adds"] == 1
@@ -1116,7 +1140,7 @@ def test_jellyfin_identity_skips_provider_search(conn, tmp_path, net):
 
     assert stats == {"checked": 2, "matched": 2, "collections_created": 2,
                      "collection_adds": 2}
-    assert net.jellyfin.provider_queries == []  # no AnyProviderIdEquals lookups
+    assert net.jellyfin.item_searches == []  # no /Items title lookups at all
     by_name = {c["name"]: c["members"] for c in net.jellyfin.collections.values()}
     assert by_name["Gustarr Discover: Movies"] == ["jf-direct"]
     assert by_name["Gustarr Discover: Music"] == ["jf-album"]
@@ -1138,3 +1162,383 @@ def test_jellyfin_failure_is_best_effort(conn, tmp_path, net, monkeypatch):
     stats = apply_mod.run(conn, cfg)
     assert stats["video_added"] == 1  # arr work still landed
     assert "jellyfin down" in stats["jellyfin_error"]
+
+
+# ── jellyfin weekly playlist ─────────────────────────────────────────
+
+
+class FakeLB:
+    """ListenBrainz created-for playlists: exactly the two endpoints
+    fetch_weekly reads — the createdfor listing and the SINGULAR
+    /1/playlist/{mbid} fetch. The plural path is a 404 on the real API,
+    so it is deliberately unserved here and a regression back to it
+    fails loudly. set_week appends, so calling it again models a new
+    week arriving while the old one still sits in the listing."""
+
+    def __init__(self):
+        self.weekly = {}  # user -> [{"mbid": ..., "date": ...}]
+        self.tracks = {}  # playlist mbid -> JSPF track list
+
+    def set_week(self, user, mbid, tracks, date="2026-07-06"):
+        self.weekly.setdefault(user, []).append({"mbid": mbid, "date": date})
+        self.tracks[mbid] = tracks
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.startswith("/1/user/") and path.endswith("/playlists/createdfor"):
+            user = path.split("/")[3]
+            wrappers = [{"playlist": {
+                "title": f"Weekly Exploration for {user}, week of {w['date']}",
+                "identifier": f"https://listenbrainz.org/playlist/{w['mbid']}",
+                "date": w["date"]}} for w in self.weekly.get(user, [])]
+            return httpx.Response(200, json={"playlists": wrappers})
+        if path.startswith("/1/playlist/"):  # singular, like the real API
+            tracks = self.tracks.get(path.split("/")[3])
+            if tracks is None:
+                return httpx.Response(404, text="no such playlist")
+            return httpx.Response(200, json={"playlist": {"track": tracks}})
+        return httpx.Response(404, text=f"unhandled listenbrainz {request.method} {path}")
+
+
+class FakeJellyfinPlaylists:
+    """Jellyfin 10.x as the playlist sync sees it: a user list, one typed
+    /Items listing (Ids, ParentId, IncludeItemTypes, case-insensitive
+    SearchTerm on Name, Fields=ProviderIds, Limit), POST /Playlists and
+    DELETE /Items/{id}. Two real-server behaviours are pinned by what is
+    NOT served: AnyProviderIdEquals is no filter (the real server ignores
+    the unknown parameter and returns everything of the requested type,
+    so a regression to it matches garbage), and /Playlists/{id}/Items
+    errors under API-key auth, so here it 404s like any unhandled route.
+    Separate from FakeJellyfin so the collection tests' fake stays lean."""
+
+    def __init__(self, api_key="jk"):
+        self.api_key = api_key
+        self.users = [{"Id": "u-ldx", "Name": "ldx"}]
+        self.audio = []  # library: {"Id", "Name", "Type", "Artists", "ProviderIds"}
+        self.playlists = {}  # id -> {"Name": ..., "items": [item ids]}
+        self.created = []  # POST /Playlists JSON bodies
+        self.deleted = []  # playlist ids removed via DELETE /Items/{id}
+        self.next_id = 1
+        self.log = []  # (method, path) of every authenticated request
+
+    def add_track(self, jf_id, name, artists=(), mbid=None):
+        self.audio.append({
+            "Id": jf_id, "Name": name, "Type": "Audio", "Artists": list(artists),
+            "ProviderIds": {"MusicBrainzTrack": mbid} if mbid else {}})
+
+    def seed_playlist(self, name, item_ids):
+        """A playlist that exists server-side but not in gustarr's state —
+        i.e. one the user made themselves."""
+        pid = f"pl{self.next_id}"
+        self.next_id += 1
+        self.playlists[pid] = {"Name": name, "items": list(item_ids)}
+        return pid
+
+    def playlist_items(self, pid):
+        return list(self.playlists[pid]["items"])
+
+    def writes(self):
+        return [(m, p) for m, p in self.log if m != "GET"]
+
+    def _list_items(self, q) -> httpx.Response:
+        if "ParentId" in q:
+            pl = self.playlists.get(q["ParentId"])
+            members = pl["items"] if pl else []
+            return httpx.Response(200, json={"Items": [{"Id": m} for m in members]})
+        # playlists are items too: the alive check finds them by Ids
+        items = self.audio + [
+            {"Id": pid, "Name": pl["Name"], "Type": "Playlist", "ProviderIds": {}}
+            for pid, pl in self.playlists.items()]
+        if "Ids" in q:
+            wanted = set(q["Ids"].split(","))
+            items = [i for i in items if i["Id"] in wanted]
+        if q.get("IncludeItemTypes"):
+            types = q["IncludeItemTypes"].split(",")
+            items = [i for i in items if i["Type"] in types]
+        if "SearchTerm" in q:
+            term = q["SearchTerm"].casefold()
+            items = [i for i in items if term in i["Name"].casefold()]
+        if "Limit" in q:
+            items = items[: int(q["Limit"])]
+        with_pids = "ProviderIds" in (q.get("Fields") or "").split(",")
+        out = []
+        for i in items:
+            dto = {"Id": i["Id"], "Name": i["Name"], "Type": i["Type"]}
+            if i["Type"] == "Audio":  # audio DTOs always carry Artists
+                dto["Artists"] = list(i.get("Artists") or [])
+            if with_pids:
+                dto["ProviderIds"] = dict(i["ProviderIds"])
+            out.append(dto)
+        return httpx.Response(200, json={"Items": out})
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        if request.headers.get("X-Emby-Token") != self.api_key:
+            return httpx.Response(401, text="bad token")
+        path, q = request.url.path, request.url.params
+        self.log.append((request.method, path))
+        if path == "/Users" and request.method == "GET":
+            return httpx.Response(200, json=self.users)
+        if path == "/Items" and request.method == "GET":
+            return self._list_items(q)
+        if path == "/Playlists" and request.method == "POST":
+            body = json.loads(request.content)
+            self.created.append(body)
+            pid = f"pl{self.next_id}"
+            self.next_id += 1
+            self.playlists[pid] = {"Name": body["Name"],
+                                   "items": list(body.get("Ids") or [])}
+            return httpx.Response(200, json={"Id": pid})
+        if request.method == "DELETE" and path.startswith("/Items/"):
+            pid = path.removeprefix("/Items/")
+            if pid not in self.playlists:
+                return httpx.Response(404, text="no such item")
+            del self.playlists[pid]
+            self.deleted.append(pid)
+            return httpx.Response(204)
+        return httpx.Response(404, text=f"unhandled jellyfin {request.method} {path}")
+
+
+class FakePlaylistNet:
+    def __init__(self):
+        self.lb = FakeLB()
+        self.jellyfin = FakeJellyfinPlaylists()
+        self.log = []  # (method, host, path)
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        self.log.append((request.method, request.url.host, request.url.path))
+        if request.url.host == "api.listenbrainz.org":
+            return self.lb.handle(request)
+        if request.url.host == "jellyfin.test":
+            return self.jellyfin.handle(request)
+        return httpx.Response(404, text=f"no such host {request.url.host}")
+
+
+@pytest.fixture
+def plnet(monkeypatch):
+    monkeypatch.setattr(http, "HOST_DELAYS", {})
+    monkeypatch.setattr(http.time, "sleep", lambda _s: None)
+    fake = FakePlaylistNet()
+    transport = httpx.MockTransport(fake.handler)
+    orig = http.request_json
+
+    def patched(method, url, **kw):
+        kw["transport"] = transport
+        return orig(method, url, **kw)
+
+    monkeypatch.setattr(http, "request_json", patched)
+    return fake
+
+
+def make_playlist_cfg(tmp_path, profiles=None, listenbrainz=None):
+    raw = {
+        "core": {"data_dir": str(tmp_path)},
+        "jellyfin": {"url": "http://jellyfin.test", "api_key": "jk"},
+        "profiles": profiles or {
+            "ldx": {"jellyfin_user": "ldx", "listenbrainz_user": "ldx"}},
+    }
+    if listenbrainz is not None:
+        raw["listenbrainz"] = listenbrainz
+    return C._build(raw)
+
+
+def jspf(rec_mbid, title=None, creator=None):
+    track = {"identifier": f"https://musicbrainz.org/recording/{rec_mbid}"}
+    if title:
+        track["title"] = title
+    if creator:
+        track["creator"] = creator
+    return track
+
+
+def test_weekly_playlist_first_run_creates(conn, tmp_path, plnet):
+    cfg = make_playlist_cfg(tmp_path)
+    jf = plnet.jellyfin
+    jf.add_track("jf-b", "Beta", ["Artist B"], mbid="rec-b")
+    jf.add_track("jf-a", "Alpha", ["Artist A"], mbid="rec-a")
+    plnet.lb.set_week("ldx", "week-1", [
+        jspf("rec-b", "Beta", "Artist B"),
+        jspf("rec-a", "Alpha", "Artist A"),
+        jspf("rec-c", "Gamma", "Artist C"),  # nowhere in the library
+    ])
+
+    stats = jellyfin_playlist.sync_playlists(conn, cfg)
+
+    assert stats == {"profiles": 1, "matched": 2, "missing": 1,
+                     "created": 1, "rebuilt": 0, "unchanged": 0}
+    # created for the profile's Jellyfin user, tracks in LB running order,
+    # matched via MusicBrainzTrack provider ids on the title-search hits
+    assert jf.created == [{"Name": "Weekly Exploration", "Ids": ["jf-b", "jf-a"],
+                           "UserId": "u-ldx", "MediaType": "Audio"}]
+    (pid,) = jf.playlists
+    assert jf.playlist_items(pid) == ["jf-b", "jf-a"]
+    # the ONLY state is the profile-scoped playlist id: reconciliation is
+    # content-driven now, so no week/mbid key exists
+    assert db.get_state(conn, "p:ldx:jellyfin:weekly_playlist_id") == pid
+    assert db.get_state(conn, "p:ldx:jellyfin:weekly_playlist_mbid") is None
+    # the playlist exists in Jellyfin, so its record must already be
+    # committed — it has to survive a crash later in the run
+    other = db.connect(tmp_path / "t.db")
+    try:
+        assert db.pget_state(other, "ldx", "jellyfin:weekly_playlist_id") == pid
+    finally:
+        other.close()
+
+
+def test_weekly_playlist_unchanged_rerun_is_noop(conn, tmp_path, plnet):
+    cfg = make_playlist_cfg(tmp_path)
+    jf = plnet.jellyfin
+    jf.add_track("jf-a", "Alpha", ["Artist A"], mbid="rec-a")
+    plnet.lb.set_week("ldx", "week-1", [jspf("rec-a", "Alpha", "Artist A")])
+    assert jellyfin_playlist.sync_playlists(conn, cfg)["created"] == 1
+    pid = db.pget_state(conn, "ldx", "jellyfin:weekly_playlist_id")
+    jf.log.clear()
+
+    stats = jellyfin_playlist.sync_playlists(conn, cfg)
+
+    assert stats == {"profiles": 1, "matched": 1, "missing": 0,
+                     "created": 0, "rebuilt": 0, "unchanged": 1}
+    assert jf.writes() == []  # contents already match: no POST, no DELETE
+    assert jf.playlist_items(pid) == ["jf-a"]
+    assert db.pget_state(conn, "ldx", "jellyfin:weekly_playlist_id") == pid
+
+
+def test_weekly_playlist_library_growth_rebuilds(conn, tmp_path, plnet):
+    """Weekly Exploration is mostly music the user doesn't have yet, and
+    gustarr itself feeds it to Lidarr: when a missing track lands mid-week
+    the playlist must grow — by delete+recreate, since Jellyfin 10.x gives
+    an API key no workable in-place playlist edit."""
+    cfg = make_playlist_cfg(tmp_path)
+    jf = plnet.jellyfin
+    jf.add_track("jf-a", "Alpha", ["Artist A"], mbid="rec-a")
+    plnet.lb.set_week("ldx", "week-1", [jspf("rec-a", "Alpha", "Artist A"),
+                                        jspf("rec-b", "Beta", "Artist B")])
+    first = jellyfin_playlist.sync_playlists(conn, cfg)
+    assert first["created"] == 1 and first["missing"] == 1
+    old_pid = db.pget_state(conn, "ldx", "jellyfin:weekly_playlist_id")
+    # mid-week, the missing track arrives in the library
+    jf.add_track("jf-b", "Beta", ["Artist B"], mbid="rec-b")
+    jf.log.clear()
+
+    stats = jellyfin_playlist.sync_playlists(conn, cfg)
+
+    assert stats == {"profiles": 1, "matched": 2, "missing": 0,
+                     "created": 0, "rebuilt": 1, "unchanged": 0}
+    # rebuilt = DELETE /Items/{old} then POST /Playlists, LB order restored
+    assert jf.writes() == [("DELETE", f"/Items/{old_pid}"), ("POST", "/Playlists")]
+    assert jf.deleted == [old_pid]
+    new_pid = db.pget_state(conn, "ldx", "jellyfin:weekly_playlist_id")
+    assert new_pid != old_pid
+    assert list(jf.playlists) == [new_pid]  # the old playlist is gone
+    assert jf.playlist_items(new_pid) == ["jf-a", "jf-b"]
+
+
+def test_weekly_playlist_zero_matches_never_wipes(conn, tmp_path, plnet):
+    cfg = make_playlist_cfg(tmp_path)
+    jf = plnet.jellyfin
+    jf.add_track("jf-a", "Alpha", ["Artist A"], mbid="rec-a")
+    plnet.lb.set_week("ldx", "week-1", [jspf("rec-a", "Alpha", "Artist A")],
+                      date="2026-06-29")
+    jellyfin_playlist.sync_playlists(conn, cfg)
+    pid = db.pget_state(conn, "ldx", "jellyfin:weekly_playlist_id")
+    # a new week arrives of which the library holds nothing yet
+    plnet.lb.set_week("ldx", "week-2", [jspf("rec-x", "Xenon", "Artist X"),
+                                        jspf("rec-y", "Yttrium", "Artist Y")],
+                      date="2026-07-06")
+    jf.log.clear()
+
+    stats = jellyfin_playlist.sync_playlists(conn, cfg)
+
+    assert stats == {"profiles": 1, "matched": 0, "missing": 2,
+                     "created": 0, "rebuilt": 0, "unchanged": 0}
+    assert jf.writes() == []  # never wipe: an empty rebuild helps nobody
+    assert jf.deleted == []
+    assert jf.playlist_items(pid) == ["jf-a"]  # last week stays playable
+    assert db.pget_state(conn, "ldx", "jellyfin:weekly_playlist_id") == pid
+
+
+def test_weekly_playlist_deleted_serverside_recreated_fresh(conn, tmp_path, plnet):
+    cfg = make_playlist_cfg(tmp_path)
+    jf = plnet.jellyfin
+    jf.add_track("jf-a", "Alpha", ["Artist A"], mbid="rec-a")
+    plnet.lb.set_week("ldx", "week-1", [jspf("rec-a", "Alpha", "Artist A")])
+    # the user hand-made a playlist with the exact same name...
+    user_pid = jf.seed_playlist("Weekly Exploration", ["jf-user-pick"])
+    # ...while gustarr's own playlist from a previous sync is gone server-side
+    db.pset_state(conn, "ldx", "jellyfin:weekly_playlist_id", "vanished")
+
+    stats = jellyfin_playlist.sync_playlists(conn, cfg)
+
+    assert stats["created"] == 1
+    assert stats["rebuilt"] == 0 and stats["unchanged"] == 0
+    new_pid = db.pget_state(conn, "ldx", "jellyfin:weekly_playlist_id")
+    assert new_pid and new_pid not in ("vanished", user_pid)
+    assert jf.playlist_items(new_pid) == ["jf-a"]
+    # the user's own playlist was never adopted, emptied or deleted
+    assert jf.playlist_items(user_pid) == ["jf-user-pick"]
+    assert jf.deleted == []
+
+
+def test_weekly_playlist_name_artist_fallback(conn, tmp_path, plnet):
+    cfg = make_playlist_cfg(tmp_path)
+    jf = plnet.jellyfin
+    # no MusicBrainzTrack provider ids anywhere: only the artist-verified
+    # exact-title fallback can match
+    jf.add_track("jf-wrong", "Same Song", ["Impostor"])  # decoy first
+    jf.add_track("jf-right", "SAME SONG", ["Right Artist", "Guest"])
+    plnet.lb.set_week("ldx", "week-1", [
+        jspf("rec-x", "Same Song", "Right Artist"),
+        jspf("rec-y", "Same Song", "Someone Else"),  # title exists, artist absent
+    ])
+
+    stats = jellyfin_playlist.sync_playlists(conn, cfg)
+
+    assert stats == {"profiles": 1, "matched": 1, "missing": 1,
+                     "created": 1, "rebuilt": 0, "unchanged": 0}
+    pid = db.pget_state(conn, "ldx", "jellyfin:weekly_playlist_id")
+    assert jf.playlist_items(pid) == ["jf-right"]  # never the wrong-artist hit
+
+
+def test_weekly_playlist_opt_out_and_scoping(conn, tmp_path, plnet):
+    # explicit opt-out: nothing is even fetched
+    off = make_playlist_cfg(tmp_path, listenbrainz={"weekly_playlist": False})
+    assert jellyfin_playlist.sync_playlists(conn, off) == {"skipped": True}
+    assert plnet.log == []
+
+    # a profile with no listenbrainz_user contributes nothing, and LB with
+    # no weekly playlist generated yet (empty createdfor) writes nothing
+    cfg = make_playlist_cfg(tmp_path, profiles={
+        "ldx": {"jellyfin_user": "ldx", "listenbrainz_user": "ldx"},
+        "video-only": {"jellyfin_user": "someone"}})
+    stats = jellyfin_playlist.sync_playlists(conn, cfg)
+    assert stats == {"profiles": 0, "matched": 0, "missing": 0,
+                     "created": 0, "rebuilt": 0, "unchanged": 0}
+    assert plnet.jellyfin.log == []  # Jellyfin never touched
+    assert plnet.jellyfin.playlists == {}
+    assert db.pget_state(conn, "ldx", "jellyfin:weekly_playlist_id") is None
+    # only ldx was consulted: the LB-less profile never reached the API
+    lb_paths = [p for _m, h, p in plnet.log if h == "api.listenbrainz.org"]
+    assert lb_paths == ["/1/user/ldx/playlists/createdfor"]
+
+
+def test_weekly_playlist_dry_run_makes_no_jellyfin_calls(conn, tmp_path, plnet):
+    cfg = make_playlist_cfg(tmp_path)
+    jf = plnet.jellyfin
+    jf.add_track("jf-a", "Alpha", ["Artist A"], mbid="rec-a")
+    plnet.lb.set_week("ldx", "week-1", [jspf("rec-a", "Alpha", "Artist A"),
+                                        jspf("rec-b", "Beta", "Artist B")])
+    jellyfin_playlist.sync_playlists(conn, cfg)
+    pid = db.pget_state(conn, "ldx", "jellyfin:weekly_playlist_id")
+    # a real run would now rebuild: the second track just hit the library
+    jf.add_track("jf-b", "Beta", ["Artist B"], mbid="rec-b")
+    jf.log.clear()
+    before = len(plnet.log)
+
+    stats = jellyfin_playlist.sync_playlists(conn, cfg, dry_run=True)
+
+    assert stats == {"profiles": 1, "matched": 0, "missing": 0, "created": 0,
+                     "rebuilt": 0, "unchanged": 0, "would_sync": 1}
+    # ZERO Jellyfin requests, by both request logs
+    assert jf.log == []
+    assert [p for _m, h, p in plnet.log[before:] if h == "jellyfin.test"] == []
+    assert jf.playlist_items(pid) == ["jf-a"]  # existing playlist untouched
+    assert db.pget_state(conn, "ldx", "jellyfin:weekly_playlist_id") == pid

@@ -170,8 +170,11 @@ def _recording_mbid(track: dict[str, Any]) -> str | None:
     return mbid or None
 
 
-def _sync_weekly(conn: sqlite3.Connection, profile: str, user: str, headers: dict[str, str],
-                 stats: dict[str, Any]) -> None:
+def fetch_weekly(user: str, headers: dict[str, str]) -> tuple[str, list[dict[str, Any]]] | None:
+    """The newest Weekly Exploration playlist LB generated for the user:
+    (playlist mbid, JSPF track list), or None while LB hasn't made one.
+    Shared by the candidates sync and the Jellyfin playlist actuation so
+    both see the same week."""
     listing = get_json(f"{API}/1/user/{user}/playlists/createdfor", headers=headers) or {}
     weekly = [
         wrapper.get("playlist") or {}
@@ -179,14 +182,24 @@ def _sync_weekly(conn: sqlite3.Connection, profile: str, user: str, headers: dic
         if "Weekly Exploration" in ((wrapper.get("playlist") or {}).get("title") or "")
     ]
     if not weekly:
-        return
+        return None
     newest = max(weekly, key=lambda p: p.get("date") or "")
     playlist_mbid = str(newest.get("identifier") or "").rstrip("/").rsplit("/", 1)[-1]
     if not playlist_mbid:
+        return None
+    # singular /1/playlist/ — the plural form 308s into a 404
+    data = get_json(f"{API}/1/playlist/{playlist_mbid}", headers=headers) or {}
+    return playlist_mbid, (data.get("playlist") or {}).get("track") or []
+
+
+def _sync_weekly(conn: sqlite3.Connection, profile: str, user: str, headers: dict[str, str],
+                 stats: dict[str, Any]) -> None:
+    fetched = fetch_weekly(user, headers)
+    if fetched is None:
         return
-    data = get_json(f"{API}/1/playlists/{playlist_mbid}", headers=headers) or {}
+    _playlist_mbid, tracks = fetched
     ts = db.now()
-    for track in (data.get("playlist") or {}).get("track") or []:
+    for track in tracks:
         mbid = _recording_mbid(track)
         if not mbid:
             continue
