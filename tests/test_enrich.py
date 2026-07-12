@@ -93,6 +93,29 @@ MB_RELEASE_GROUP = {
     "genres": [{"count": 7, "name": "art rock"}],
 }
 
+# a RELEASE mbid Last.fm hands out where a release-group id belongs
+REL_MBID = "f1d5f0b2-3f9e-4b8a-8a3d-2c1e5b6a7c89"
+
+YORU_MBID = "0b8a3e2b-6f1d-4c58-9e2a-7f0f2b1c9d44"
+
+# kana-primary artist whose romanized spellings live only in MB aliases
+MB_YORUSHIKA = {
+    "id": YORU_MBID,
+    "name": "ヨルシカ",
+    "type": "Group",
+    "country": "JP",
+    "life-span": {"begin": "2017"},
+    "tags": [{"count": 4, "name": "j-rock"}],
+    "genres": [],
+    "aliases": [{"name": "Yorushika"}, {"name": "yorusika"}],
+}
+
+
+def alias_target(conn, alias_id):
+    row = conn.execute(
+        "SELECT canonical_id FROM item_aliases WHERE alias_id=?", (alias_id,)).fetchone()
+    return row["canonical_id"] if row else None
+
 
 class FakeApi:
     """Dispatches on URL substring, in registration order (specific first)."""
@@ -141,7 +164,7 @@ def test_movie_tmdb_detail(conn, tmp_path, monkeypatch):
 
     stats = run(conn, cfg)
 
-    assert stats == {"enriched": 1, "merged": 0, "skipped": 0, "errors": 0}
+    assert stats == {"enriched": 1, "merged": 0, "skipped": 0, "errors": 0, "alias_conflicts": 0}
     row = conn.execute("SELECT * FROM items WHERE id=?", (iid,)).fetchone()
     assert row["enriched_at"] is not None
     assert row["year"] == 1999
@@ -308,7 +331,7 @@ def test_series_without_tvdb_mapping_enriched_under_tmdb(conn, tmp_path, monkeyp
 
     stats = run(conn, cfg)
 
-    assert stats == {"enriched": 1, "merged": 0, "skipped": 0, "errors": 0}
+    assert stats == {"enriched": 1, "merged": 0, "skipped": 0, "errors": 0, "alias_conflicts": 0}
     row = conn.execute("SELECT * FROM items WHERE id=?", (fid,)).fetchone()
     assert row["enriched_at"] is not None
     assert json.loads(row["meta"])["no_tvdb"] is True
@@ -340,6 +363,10 @@ def test_artist_mbid_musicbrainz_plus_lastfm(conn, tmp_path, monkeypatch):
     assert meta["listeners"] == 5000000
     assert meta["similar"] == ["Thom Yorke", "Blur"]
     assert meta["image"] == DEEZER_PIC
+    # stored even when MB knows none: key-present marks "fetched" for dedupe
+    assert meta["aliases"] == []
+    # the primary spelling redirects future name-keyed encounters here
+    assert alias_target(conn, ids.make("artist", "lastfm", "Radiohead")) == iid
     dz = [c for c in api.calls if "deezer" in c[1]]
     assert dz == [("GET", "https://api.deezer.com/search/artist",
                    {"q": "Radiohead", "limit": 1})]
@@ -378,6 +405,9 @@ def test_artist_fallback_low_score_enriches_from_lastfm_only(conn, tmp_path, mon
     fid = ids.make("artist", "lastfm", "Radiohead")
     db.upsert_item(conn, fid, "artist", title="Radiohead")
     mock_api(monkeypatch, [
+        # the low score triggers an alias check on the top hit; none match
+        ("/ws/2/artist/zzz", {"id": "zzz", "name": "Radio Head Trib",
+                              "aliases": [{"name": "The Tribute"}]}),
         ("/ws/2/artist", {"artists": [{"id": "zzz", "score": 55, "name": "Radio Head Trib"}]}),
         ("audioscrobbler", LASTFM_ARTIST),
         ("deezer", DEEZER_ARTIST),
@@ -385,7 +415,7 @@ def test_artist_fallback_low_score_enriches_from_lastfm_only(conn, tmp_path, mon
 
     stats = run(conn, cfg)
 
-    assert stats == {"enriched": 1, "merged": 0, "skipped": 0, "errors": 0}
+    assert stats == {"enriched": 1, "merged": 0, "skipped": 0, "errors": 0, "alias_conflicts": 0}
     row = conn.execute("SELECT * FROM items WHERE id=?", (fid,)).fetchone()
     assert row["enriched_at"] is not None
     meta = json.loads(row["meta"])
@@ -407,7 +437,7 @@ def test_artist_deezer_failure_never_fails_item(conn, tmp_path, monkeypatch):
 
     stats = run(conn, cfg)
 
-    assert stats == {"enriched": 1, "merged": 0, "skipped": 0, "errors": 0}
+    assert stats == {"enriched": 1, "merged": 0, "skipped": 0, "errors": 0, "alias_conflicts": 0}
     row = conn.execute("SELECT enriched_at, meta FROM items WHERE id=?", (iid,)).fetchone()
     assert row["enriched_at"] is not None
     meta = json.loads(row["meta"])
@@ -440,6 +470,108 @@ def test_artist_deezer_placeholder_or_miss_skipped(conn, tmp_path, monkeypatch, 
     assert "image" not in meta
 
 
+def test_artist_alias_bridging_merges_romaji_fallback_with_events(conn, tmp_path, monkeypatch):
+    """The live-store failure mode: months of scrobbles sit on a romaji
+    fallback while the mbid item is kana-primary. Enriching the mbid item
+    must pull the fallback (and its events) in via MB's alias list."""
+    cfg = make_cfg(tmp_path)
+    fid = ids.make("artist", "lastfm", "Yorushika")
+    db.upsert_item(conn, fid, "artist", title="Yorushika", enriched=True)
+    db.add_event(conn, "2026-01-01T00:00:00Z", fid, "scrobble", 0.15, "lastfm")
+    db.add_event(conn, "2026-02-01T00:00:00Z", fid, "loved", 1.0, "lastfm")
+    cid = ids.make("artist", "mbid", YORU_MBID)
+    db.upsert_item(conn, cid, "artist", ids={"mbid": YORU_MBID})
+    mock_api(monkeypatch, [
+        (f"/artist/{YORU_MBID}", MB_YORUSHIKA),
+        ("deezer", {"data": []}),
+    ])
+
+    stats = run(conn, cfg)
+
+    assert stats == {"enriched": 1, "merged": 1, "skipped": 0, "errors": 0, "alias_conflicts": 0}
+    assert conn.execute("SELECT 1 FROM items WHERE id=?", (fid,)).fetchone() is None
+    events = [r["item_id"] for r in conn.execute("SELECT item_id FROM events")]
+    assert events == [cid, cid]
+    row = conn.execute("SELECT title, meta FROM items WHERE id=?", (cid,)).fetchone()
+    assert row["title"] == "ヨルシカ"
+    assert json.loads(row["meta"])["aliases"] == ["Yorushika", "yorusika"]  # raw, as MB wrote them
+    # every spelling — primary and aliases — now redirects on arrival
+    assert alias_target(conn, fid) == cid
+    assert alias_target(conn, ids.make("artist", "lastfm", "ヨルシカ")) == cid
+    assert alias_target(conn, ids.make("artist", "lastfm", "yorusika")) == cid
+
+
+def test_artist_low_score_search_rescued_by_exact_alias(conn, tmp_path, monkeypatch):
+    """A romaji query against a kana-primary artist scores below
+    MB_MERGE_SCORE while being exactly right; the alias list proves it."""
+    cfg = make_cfg(tmp_path)
+    fid = ids.make("artist", "lastfm", "Yorushika")
+    db.upsert_item(conn, fid, "artist", title="Yorushika")
+    db.add_event(conn, "2026-01-01T00:00:00Z", fid, "scrobble", 0.15, "lastfm")
+    api = mock_api(monkeypatch, [
+        (f"/artist/{YORU_MBID}", MB_YORUSHIKA),
+        ("/ws/2/artist", {"artists": [{"id": YORU_MBID, "score": 62, "name": "ヨルシカ",
+                                       "aliases": [{"name": "Yorushika"}]}]}),
+        ("deezer", {"data": []}),
+    ])
+
+    stats = run(conn, cfg)
+
+    cid = ids.make("artist", "mbid", YORU_MBID)
+    assert stats["merged"] == 1 and stats["enriched"] == 1 and stats["errors"] == 0
+    assert conn.execute("SELECT 1 FROM items WHERE id=?", (fid,)).fetchone() is None
+    events = [r["item_id"] for r in conn.execute("SELECT item_id FROM events")]
+    assert events == [cid]
+    assert json.loads(conn.execute(
+        "SELECT ids FROM items WHERE id=?", (cid,)).fetchone()["ids"])["mbid"] == YORU_MBID
+    # the search payload carried aliases, so no extra detail fetch happened
+    detail_calls = [c for c in api.calls if f"/artist/{YORU_MBID}" in c[1]]
+    assert len(detail_calls) == 1
+
+
+def test_artist_low_score_search_fetches_aliases_when_payload_lacks_them(
+        conn, tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path)
+    fid = ids.make("artist", "lastfm", "Yorushika")
+    db.upsert_item(conn, fid, "artist", title="Yorushika")
+    api = mock_api(monkeypatch, [
+        (f"/artist/{YORU_MBID}", MB_YORUSHIKA),
+        # search hit has no alias list at all → top hit fetched with inc=aliases
+        ("/ws/2/artist", {"artists": [{"id": YORU_MBID, "score": 70, "name": "ヨルシカ"}]}),
+        ("deezer", {"data": []}),
+    ])
+
+    stats = run(conn, cfg)
+
+    cid = ids.make("artist", "mbid", YORU_MBID)
+    assert stats["merged"] == 1 and stats["enriched"] == 1 and stats["errors"] == 0
+    assert conn.execute("SELECT 1 FROM items WHERE id=?", (cid,)).fetchone() is not None
+    detail_calls = [c for c in api.calls if f"/artist/{YORU_MBID}" in c[1]]
+    assert detail_calls[0][2] == {"inc": "aliases", "fmt": "json"}
+
+
+def test_artist_alias_conflict_counted_not_clobbered(conn, tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path)
+    other = "artist:mbid:11111111-2222-3333-4444-555555555555"
+    taken = ids.make("artist", "lastfm", "Yorushika")
+    conn.execute("INSERT INTO item_aliases (alias_id, canonical_id) VALUES (?,?)",
+                 (taken, other))
+    cid = ids.make("artist", "mbid", YORU_MBID)
+    db.upsert_item(conn, cid, "artist", ids={"mbid": YORU_MBID})
+    mock_api(monkeypatch, [
+        (f"/artist/{YORU_MBID}", MB_YORUSHIKA),
+        ("deezer", {"data": []}),
+    ])
+
+    stats = run(conn, cfg)
+
+    assert stats["alias_conflicts"] == 1 and stats["merged"] == 0 and stats["errors"] == 0
+    assert alias_target(conn, taken) == other  # first writer keeps the spelling
+    # the unclaimed spellings still bridged to this artist
+    assert alias_target(conn, ids.make("artist", "lastfm", "ヨルシカ")) == cid
+    assert alias_target(conn, ids.make("artist", "lastfm", "yorusika")) == cid
+
+
 def test_track_lastfm_fallback_just_marked(conn, tmp_path, monkeypatch):
     cfg = make_cfg(tmp_path)
     tid = ids.make("track", "lastfm", "Radiohead", "Paranoid Android")
@@ -448,7 +580,7 @@ def test_track_lastfm_fallback_just_marked(conn, tmp_path, monkeypatch):
 
     stats = run(conn, cfg)
 
-    assert stats == {"enriched": 0, "merged": 0, "skipped": 1, "errors": 0}
+    assert stats == {"enriched": 0, "merged": 0, "skipped": 1, "errors": 0, "alias_conflicts": 0}
     assert api.calls == []
     row = conn.execute("SELECT enriched_at, meta FROM items WHERE id=?", (tid,)).fetchone()
     assert row["enriched_at"] is not None
@@ -463,7 +595,7 @@ def test_album_mbid_release_group_lookup(conn, tmp_path, monkeypatch):
 
     stats = run(conn, cfg)
 
-    assert stats == {"enriched": 1, "merged": 0, "skipped": 0, "errors": 0}
+    assert stats == {"enriched": 1, "merged": 0, "skipped": 0, "errors": 0, "alias_conflicts": 0}
     row = conn.execute("SELECT * FROM items WHERE id=?", (iid,)).fetchone()
     assert row["enriched_at"] is not None
     assert row["title"] == "OK Computer" and row["year"] == 1997
@@ -491,7 +623,7 @@ def test_album_titled_but_untagged_still_enriched(conn, tmp_path, monkeypatch):
 
     stats = run(conn, cfg)
 
-    assert stats == {"enriched": 1, "merged": 0, "skipped": 0, "errors": 0}
+    assert stats == {"enriched": 1, "merged": 0, "skipped": 0, "errors": 0, "alias_conflicts": 0}
     meta = json.loads(conn.execute(
         "SELECT meta FROM items WHERE id=?", (iid,)).fetchone()["meta"])
     assert meta["tags"] == ["alternative rock", "art rock"]
@@ -507,7 +639,7 @@ def test_album_titled_with_tags_fast_stamps(conn, tmp_path, monkeypatch):
 
     stats = run(conn, cfg)
 
-    assert stats == {"enriched": 0, "merged": 0, "skipped": 1, "errors": 0}
+    assert stats == {"enriched": 0, "merged": 0, "skipped": 1, "errors": 0, "alias_conflicts": 0}
     assert api.calls == []  # already enriched: no MB round-trip on requeue
     row = conn.execute("SELECT enriched_at FROM items WHERE id=?", (iid,)).fetchone()
     assert row["enriched_at"] is not None
@@ -521,8 +653,79 @@ def test_album_without_mbid_fast_stamps(conn, tmp_path, monkeypatch):
 
     stats = run(conn, cfg)
 
-    assert stats == {"enriched": 0, "merged": 0, "skipped": 1, "errors": 0}
+    assert stats == {"enriched": 0, "merged": 0, "skipped": 1, "errors": 0, "alias_conflicts": 0}
     assert api.calls == []
+
+
+def test_album_release_mbid_404_resolves_release_group_and_merges(conn, tmp_path, monkeypatch):
+    """Last.fm sometimes hands over a RELEASE mbid; the release-group
+    lookup 404s, but one /release call recovers the group id instead of
+    stamping a permanent error."""
+    cfg = make_cfg(tmp_path)
+    fid = ids.make("album", "mbid", REL_MBID)
+    db.upsert_item(conn, fid, "album", ids={"mbid": REL_MBID})
+    db.add_event(conn, "2026-01-01T00:00:00Z", fid, "scrobble", 0.15, "lastfm")
+    rg_url = f"https://musicbrainz.org/ws/2/release-group/{REL_MBID}"
+    api = mock_api(monkeypatch, [
+        (f"/release-group/{REL_MBID}", http.ApiError(rg_url, 404, "not found")),
+        (f"/release-group/{RG_MBID}", MB_RELEASE_GROUP),
+        (f"/release/{REL_MBID}", {"id": REL_MBID, "release-group": {"id": RG_MBID}}),
+    ])
+
+    stats = run(conn, cfg)
+
+    cid = ids.make("album", "mbid", RG_MBID)
+    assert stats == {"enriched": 1, "merged": 1, "skipped": 0, "errors": 0, "alias_conflicts": 0}
+    assert conn.execute("SELECT 1 FROM items WHERE id=?", (fid,)).fetchone() is None
+    events = [r["item_id"] for r in conn.execute("SELECT item_id FROM events")]
+    assert events == [cid]
+    row = conn.execute("SELECT * FROM items WHERE id=?", (cid,)).fetchone()
+    assert row["enriched_at"] is not None
+    assert row["title"] == "OK Computer"
+    assert json.loads(row["ids"])["mbid"] == RG_MBID
+    assert json.loads(row["meta"])["image"].endswith(f"/release-group/{RG_MBID}/front-250")
+    assert alias_target(conn, fid) == cid
+    release_call = [c for c in api.calls if f"/release/{REL_MBID}" in c[1]]
+    assert release_call[0][2] == {"inc": "release-groups", "fmt": "json"}
+
+
+def test_album_double_404_is_permanent(conn, tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path)
+    iid = ids.make("album", "mbid", REL_MBID)
+    db.upsert_item(conn, iid, "album", ids={"mbid": REL_MBID})
+    rg_url = f"https://musicbrainz.org/ws/2/release-group/{REL_MBID}"
+    rel_url = f"https://musicbrainz.org/ws/2/release/{REL_MBID}"
+    mock_api(monkeypatch, [
+        (f"/release-group/{REL_MBID}", http.ApiError(rg_url, 404, "not found")),
+        (f"/release/{REL_MBID}", http.ApiError(rel_url, 404, "not found")),
+    ])
+
+    stats = run(conn, cfg)
+
+    assert stats == {"enriched": 0, "merged": 0, "skipped": 0, "errors": 1, "alias_conflicts": 0}
+    row = conn.execute("SELECT enriched_at, meta FROM items WHERE id=?", (iid,)).fetchone()
+    assert row["enriched_at"] is not None  # permanently stamped, never requeued
+    assert "404" in json.loads(row["meta"])["enrich_error"]
+
+
+def test_album_release_lookup_5xx_stays_queued(conn, tmp_path, monkeypatch):
+    """A transient failure on the recovery lookup must not become
+    permanent just because the first 404 was."""
+    cfg = make_cfg(tmp_path)
+    iid = ids.make("album", "mbid", REL_MBID)
+    db.upsert_item(conn, iid, "album", ids={"mbid": REL_MBID})
+    rg_url = f"https://musicbrainz.org/ws/2/release-group/{REL_MBID}"
+    rel_url = f"https://musicbrainz.org/ws/2/release/{REL_MBID}"
+    mock_api(monkeypatch, [
+        (f"/release-group/{REL_MBID}", http.ApiError(rg_url, 404, "not found")),
+        (f"/release/{REL_MBID}", http.ApiError(rel_url, 503, "down")),
+    ])
+
+    stats = run(conn, cfg)
+
+    assert stats["errors"] == 1
+    row = conn.execute("SELECT enriched_at FROM items WHERE id=?", (iid,)).fetchone()
+    assert row["enriched_at"] is None
 
 
 def test_track_titled_with_mbid_keeps_fast_path(conn, tmp_path, monkeypatch):
@@ -536,7 +739,7 @@ def test_track_titled_with_mbid_keeps_fast_path(conn, tmp_path, monkeypatch):
 
     stats = run(conn, cfg)
 
-    assert stats == {"enriched": 0, "merged": 0, "skipped": 1, "errors": 0}
+    assert stats == {"enriched": 0, "merged": 0, "skipped": 1, "errors": 0, "alias_conflicts": 0}
     assert api.calls == []
     row = conn.execute("SELECT enriched_at FROM items WHERE id=?", (tid,)).fetchone()
     assert row["enriched_at"] is not None
@@ -551,7 +754,7 @@ def test_api_error_still_sets_enriched_at(conn, tmp_path, monkeypatch):
 
     stats = run(conn, cfg)
 
-    assert stats == {"enriched": 0, "merged": 0, "skipped": 0, "errors": 1}
+    assert stats == {"enriched": 0, "merged": 0, "skipped": 0, "errors": 1, "alias_conflicts": 0}
     row = conn.execute("SELECT enriched_at, meta FROM items WHERE id=?", (iid,)).fetchone()
     assert row["enriched_at"] is not None
     assert "404" in json.loads(row["meta"])["enrich_error"]
@@ -583,7 +786,7 @@ def test_transient_failure_leaves_item_queued_for_retry(conn, tmp_path, monkeypa
 
     stats = run(conn, cfg)
 
-    assert stats == {"enriched": 0, "merged": 0, "skipped": 0, "errors": 1}
+    assert stats == {"enriched": 0, "merged": 0, "skipped": 0, "errors": 1, "alias_conflicts": 0}
     row = conn.execute("SELECT enriched_at, meta FROM items WHERE id=?", (iid,)).fetchone()
     assert row["enriched_at"] is None
     assert "boom" in json.loads(row["meta"])["enrich_error"]
@@ -636,7 +839,7 @@ def test_domain_filter(conn, tmp_path, monkeypatch):
 
     stats = run(conn, cfg, domain="track")
 
-    assert stats == {"enriched": 0, "merged": 0, "skipped": 1, "errors": 0}
+    assert stats == {"enriched": 0, "merged": 0, "skipped": 1, "errors": 0, "alias_conflicts": 0}
     movie = conn.execute(
         "SELECT enriched_at FROM items WHERE domain='movie'").fetchone()
     assert movie["enriched_at"] is None

@@ -41,7 +41,7 @@ def run(
     domain: str | None = None,
     limit: int | None = None,
 ) -> dict[str, int]:
-    stats = {"enriched": 0, "merged": 0, "skipped": 0, "errors": 0}
+    stats = {"enriched": 0, "merged": 0, "skipped": 0, "errors": 0, "alias_conflicts": 0}
     sql = (
         "SELECT * FROM items WHERE enriched_at IS NULL"
         + (" AND domain=?" if domain else "")
@@ -245,14 +245,27 @@ def _artist(conn, cfg, item_id, title, ids_map, eff, stats) -> None:
             db.merge_item(conn, item_id, canonical)
             stats["merged"] += 1
             item_id = eff["id"] = canonical
-    data = http.get_json(f"{MB}/artist/{mbid}", params={"inc": "tags+genres", "fmt": "json"})
+    data = http.get_json(f"{MB}/artist/{mbid}",
+                         params={"inc": "tags+genres+aliases", "fmt": "json"})
+    # Some artists carry hundreds of locale aliases; 30 covers every real
+    # spelling without bloating meta. Stored raw (as MB wrote them) so the
+    # UI can show them; normalization happens only at comparison time.
+    alias_names = [a["name"] for a in data.get("aliases") or []
+                   if isinstance(a, dict) and a.get("name")][:30]
     meta = {
         "tags": _top_tag_names(data.get("tags")),
         "genres": _top_tag_names(data.get("genres"), cap=None),
         "type": data.get("type"),
         "country": data.get("country"),
         "begin_year": _year((data.get("life-span") or {}).get("begin")),
+        # stored even when empty: key-present is `dedupe --fetch`'s
+        # already-fetched marker, sparing a 1.1s MB round-trip per artist
+        "aliases": alias_names,
     }
+    # Bridge before the enriched write: a merged-in fallback twin drags
+    # its stale title/meta along, and MB's authoritative values must land
+    # last so they win the upsert merge.
+    _bridge_artist_aliases(conn, item_id, [data.get("name") or name, *alias_names], stats)
     db.upsert_item(conn, item_id, "artist", title=data.get("name"),
                    ids={**ids_map, "mbid": mbid}, meta=meta, enriched=True)
     lf = _lastfm_artist_meta(cfg, mbid, data.get("name") or name)
@@ -268,9 +281,66 @@ def _mb_search_artist(name: str) -> dict[str, Any] | None:
     query = f'artist:"{name.replace(chr(34), "")}"'
     data = http.get_json(f"{MB}/artist", params={"query": query, "fmt": "json", "limit": 3})
     hits = (data or {}).get("artists") or []
-    if hits and int(hits[0].get("score") or 0) >= MB_MERGE_SCORE:
+    if not hits:
+        return None
+    if int(hits[0].get("score") or 0) >= MB_MERGE_SCORE:
         return hits[0]
+    # A romaji query for a kana-primary artist legitimately scores far
+    # below MB_MERGE_SCORE on the name field while being exactly the
+    # artist asked for. An exact normalized match against a hit's alias
+    # list is that proof, so it overrides the score gate.
+    want = ids.normalize_key(name)
+    for i, hit in enumerate(hits):
+        aliases = hit.get("aliases")
+        if aliases is None and i == 0 and hit.get("id"):
+            # Search payloads can omit alias lists; one direct lookup of
+            # the top hit settles it before the merge is given up on.
+            detail = http.get_json(f"{MB}/artist/{hit['id']}",
+                                   params={"inc": "aliases", "fmt": "json"})
+            aliases = (detail or {}).get("aliases")
+        for a in aliases or []:
+            if isinstance(a, dict) and a.get("name") and ids.normalize_key(a["name"]) == want:
+                return hit
     return None
+
+
+def _bridge_artist_aliases(conn, canonical: str, names: list[str],
+                           stats: dict[str, int]) -> None:
+    """Point every spelling MB knows for this artist at its canonical mbid
+    item. Cross-script variants (romaji vs kana/kanji) mint different
+    fallback ids that normalize_key cannot fold, so the alias list is the
+    only bridge: a fallback twin that already accumulated events (months
+    of romaji scrobbles) merges in now, and the item_aliases row makes any
+    future encounter of that spelling land on the canonical id on arrival.
+    dedupe.py runs the same registration offline for pre-existing stores.
+    """
+    fallback_ids = set()
+    for raw in names:
+        if not raw or not isinstance(raw, str):
+            continue
+        try:
+            # aliases are stored raw; ids.make is the normalizer, so this
+            # is exactly the id a collector would mint for that spelling
+            fallback_ids.add(ids.make("artist", "lastfm", raw))
+        except ValueError:
+            continue  # name normalizes to nothing
+    fallback_ids.discard(canonical)
+    for fid in sorted(fallback_ids):  # deterministic conflict attribution
+        row = conn.execute(
+            "SELECT canonical_id FROM item_aliases WHERE alias_id=?", (fid,)).fetchone()
+        if row is not None:
+            if row["canonical_id"] != canonical:
+                # first-writer-wins: two artists genuinely sharing a
+                # spelling would ping-pong the mapping forever otherwise
+                stats["alias_conflicts"] += 1
+            continue
+        if conn.execute("SELECT 1 FROM items WHERE id=?", (fid,)).fetchone() is not None:
+            db.merge_item(conn, fid, canonical)  # records the alias row itself
+            stats["merged"] += 1
+        else:
+            conn.execute(
+                "INSERT OR IGNORE INTO item_aliases (alias_id, canonical_id) VALUES (?,?)",
+                (fid, canonical))
 
 
 def _lastfm_artist_meta(cfg: Config, mbid: str | None, name: str | None) -> dict[str, Any]:
@@ -364,8 +434,28 @@ def _album(conn, item_id, mbid, ids_map, stats) -> None:
     # An album mbid is a RELEASE-GROUP id — that is the namespace
     # Lidarr's foreignAlbumId speaks, and it carries the first-release
     # date instead of one pressing's date.
-    data = http.get_json(f"{MB}/release-group/{mbid}",
-                         params={"inc": "artist-credits+tags+genres", "fmt": "json"})
+    rg_params = {"inc": "artist-credits+tags+genres", "fmt": "json"}
+    try:
+        data = http.get_json(f"{MB}/release-group/{mbid}", params=rg_params)
+    except http.ApiError as exc:
+        if exc.status != 404:
+            raise
+        # Last.fm hands out RELEASE mbids for albums often enough that a
+        # 404 here usually means wrong id *kind*, not a dead id: ask MB
+        # which release-group the release belongs to before giving up.
+        rel = http.get_json(f"{MB}/release/{mbid}",
+                            params={"inc": "release-groups", "fmt": "json"})
+        rg_id = ((rel or {}).get("release-group") or {}).get("id")
+        if not rg_id:
+            raise  # true double-404 (or group-less release): permanent
+        canonical = ids.make("album", "mbid", rg_id)
+        if canonical != item_id:
+            db.merge_item(conn, item_id, canonical)
+            stats["merged"] += 1
+            item_id = canonical
+        mbid = rg_id
+        ids_map = {**ids_map, "mbid": rg_id}
+        data = http.get_json(f"{MB}/release-group/{rg_id}", params=rg_params)
     artists = _credit_names(data)
     meta = {
         "artists": artists,
