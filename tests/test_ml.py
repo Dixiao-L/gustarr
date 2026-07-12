@@ -762,3 +762,22 @@ def test_rank_video_cap_override_widens_budget(tmp_path):
     settings.set(conn, "video_queue_max_pending", 3)
     stats = rank_mod.run(conn, cfg, top=5)
     assert stats["proposed"] == 3  # override 3 beats the cfg cap of 1
+
+
+def test_album_domain_falls_back_to_artist_model(tmp_path):
+    """Albums have no listen events of their own yet; they must score
+    against the artist taste state instead of being skipped."""
+    conn = db.connect(tmp_path / "t.db")
+    cfg = make_cfg(tmp_path)
+    model = cfg.model.embed_model
+    pos = axis(0)
+    db.set_state(conn, "centroid:artist", json.dumps({
+        "dim": DIM, "embed_model": model, "pos": b64(pos), "neg": None,
+        "exemplars": []}))
+    for i in range(3):
+        iid = f"album:mbid:al{i}"
+        db.upsert_item(conn, iid, "album", title=f"Album {i}")
+        put_vec(conn, iid, unit(pos + 0.1 * axis(i + 1)), model)
+        add_candidate(conn, iid, source="lastfm_top_albums")
+    stats = rank_mod.run(conn, cfg, top=5)
+    assert stats.get("album", 0) == 3
