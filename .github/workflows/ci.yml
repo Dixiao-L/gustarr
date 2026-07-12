@@ -6,6 +6,11 @@ on:
     tags: ["v*"]
   pull_request:
 
+# Least privilege for GITHUB_TOKEN; the docker job widens its own scope
+# (packages: write) at the job level.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
