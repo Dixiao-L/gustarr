@@ -1,6 +1,8 @@
 # Weekly dependency PRs, grouped so routine bumps arrive as one PR per
-# ecosystem instead of ten. Security updates ignore the schedule and the
-# groups — they open immediately, one per advisory.
+# ecosystem instead of ten. Security updates ignore the schedule but are
+# grouped too: everything resolving an open alert lands as one PR per
+# ecosystem (the *-security groups below — these override the repo-level
+# "grouped security updates" toggle).
 version: 2
 updates:
   - package-ecosystem: "uv"
@@ -10,7 +12,11 @@ updates:
       day: "monday"
     groups:
       python-minor-patch:
+        applies-to: version-updates
         update-types: ["minor", "patch"]
+      python-security:
+        applies-to: security-updates
+        patterns: ["*"]
     open-pull-requests-limit: 5
 
   - package-ecosystem: "github-actions"
@@ -20,6 +26,10 @@ updates:
       day: "monday"
     groups:
       actions:
+        applies-to: version-updates
+        patterns: ["*"]
+      actions-security:
+        applies-to: security-updates
         patterns: ["*"]
 
   - package-ecosystem: "docker"
@@ -27,3 +37,7 @@ updates:
     schedule:
       interval: "weekly"
       day: "monday"
+    groups:
+      docker-security:
+        applies-to: security-updates
+        patterns: ["*"]
