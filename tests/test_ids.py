@@ -81,6 +81,29 @@ def test_blank_input_normalizes_to_empty():
     assert ids.normalize_key("   \t\n") == ""
 
 
+def test_sep_survives_as_part_boundary_while_parts_fold():
+    # stored track keys embed the literal \x1f between artist and title —
+    # the constant is a wire format now, and the fold must pass it through
+    # intact while folding width/case/whitespace inside each part
+    assert ids.SEP == "\x1f"
+    messy = "ＹＯＡＳＯＢＩ" + ids.SEP + "  Yoru ni\tKakeru "
+    assert ids.normalize_key(messy) == "yoasobi" + ids.SEP + "yoru ni kakeru"
+
+
+def test_sep_keeps_shifted_splits_distinct():
+    # Python counts \x1f as whitespace: a naive fold would collapse it into
+    # a space and collide two different tracks whenever the artist/title
+    # split shifts ("A B"+"C" vs "A"+"B C")
+    assert ids.normalize_key(f"A B{ids.SEP}C") != ids.normalize_key(f"A{ids.SEP}B C")
+
+
+def test_all_empty_parts_normalize_to_empty():
+    # a bare separator names nothing: all-blank parts must report "no
+    # identity" ('') exactly like a blank single-part key does
+    assert ids.normalize_key(ids.SEP) == ""
+    assert ids.normalize_key(f"  {ids.SEP} ") == ""
+
+
 # ── NS_PRIORITY / DOMAINS vocabulary ─────────────────────────────────
 
 

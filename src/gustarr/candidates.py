@@ -436,7 +436,12 @@ def _resolve_artist(conn: sqlite3.Connection, pool: _Pool,
         item_id = db.resolve_item(conn, "artist", "mbid", mb, title=name)
         twin = db.lookup_item(conn, "artist", "name", name)
         winner = db.attach_identity(conn, item_id, "name", name)
-        if pool.excluded & {item_id, twin}:
+        # a refused attach (the spelling belongs to a DIFFERENT artist
+        # with its own mbid) must not carry that artist's verdict over —
+        # only a twin that actually merged in propagates its exclusion
+        merged = twin is not None and twin != item_id \
+            and db.lookup_item(conn, "artist", "name", name) != twin
+        if item_id in pool.excluded or (merged and twin in pool.excluded):
             pool.excluded.add(winner)
         ns, key = "mbid", mb
     else:

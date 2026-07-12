@@ -263,6 +263,13 @@ def _sync_audio(conn: sqlite3.Connection, profile: str, base: str, uid: str,
         arts = t.get("ArtistItems") or []
         a0 = arts[0] if arts else {}
         art_id = jf_artist.get(a0.get("Id") or "")
+        if art_id is not None and conn.execute(
+                "SELECT 1 FROM items WHERE id=?", (art_id,)).fetchone() is None:
+            # a later artist's resolve merged this one away; its jf
+            # identity followed the winner — chase the current owner
+            art_id = db.lookup_item(conn, "artist", "jellyfin", str(a0["Id"]))
+            if art_id is not None:
+                jf_artist[a0["Id"]] = art_id
         if art_id is None:
             name = (a0.get("Name") or "").strip()
             if not name:

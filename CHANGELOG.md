@@ -33,6 +33,26 @@ All notable changes to Gustarr are documented here. The format follows
   interim merge-on-collision behaviour folded Michael Jackson into
   Wolfgang Amadeus Mozart. Name merges only ever absorb name-only twins,
   the cross-script healing case they exist for.
+- The v3 migration is genuinely atomic, DDL included: an interrupted
+  upgrade (Ctrl-C, power loss, a second process hitting the lock
+  timeout) rolls back to the intact v2 store and simply retries on the
+  next start. Two v2 rows claiming the same external id now merge during
+  migration exactly as the runtime would (instead of one silently losing
+  its identity), the user's approved recommendation survives such a
+  merge, v2 event dedup markers follow their items so the first
+  post-upgrade sync re-emits nothing, series cursors carry over onto
+  merge-proof Jellyfin-id keys, and stale taste-model state is dropped
+  for retraining.
+- A retagged Jellyfin library entry (provider ids corrected in Jellyfin)
+  moves its Jellyfin id to the newly-identified item instead of merging
+  the wrong item's history into the right one.
+- Track name keys keep the artist/title boundary (unit separator), so
+  two different tracks whose concatenated spelling collides stay two
+  tracks — and they match what v2 stores migrated in with.
+- Collectors no longer trip over their own merges: a mid-sync merge that
+  deletes a cached artist id made the Jellyfin and ListenBrainz stages
+  crash with foreign-key errors; a name-collision refusal in the
+  candidate pool no longer inherits the *other* artist's rejection.
 
 ## [0.2.2] - 2026-07-12
 

@@ -11,6 +11,7 @@ from gustarr import config as C
 from gustarr import db
 from gustarr import http as ghttp
 from gustarr.collect import lastfm
+from gustarr.ids import SEP
 
 RH_MBID = "a74b1b7f-71a5-4011-9441-d0b5e4122711"
 PA_MBID = "0d5b91d1-aaaa-bbbb-cccc-1234567890ab"
@@ -118,9 +119,10 @@ def test_first_sync_items_events_cursor(conn, cfg):
     rh = iid(conn, "artist", "mbid", RH_MBID)
     wlb = iid(conn, "artist", "name", "Weird Local Band")
     pa = iid(conn, "track", "mbid", PA_MBID)
-    # name-keyed tracks resolve on "<artist> <title>" in one flat key
-    ss = iid(conn, "track", "name", "Weird Local Band Some Song")
-    kp = iid(conn, "track", "name", "Radiohead Karma Police")
+    # name-keyed tracks join artist and title with the unit separator,
+    # keeping the boundary so shifted splits can never collide
+    ss = iid(conn, "track", "name", f"Weird Local Band{SEP}Some Song")
+    kp = iid(conn, "track", "name", f"Radiohead{SEP}Karma Police")
     assert None not in {rh, wlb, pa, ss, kp}
     assert conn.execute("SELECT COUNT(*) c FROM items").fetchone()["c"] == 5
     # mbid rows teach the spelling too, so both names land on one item
@@ -137,7 +139,7 @@ def test_first_sync_items_events_cursor(conn, cfg):
     ssrow = conn.execute("SELECT * FROM items WHERE id=?", (ss,)).fetchone()
     assert json.loads(ssrow["meta"])["artist_id"] == wlb
     # spelling-only track: no authoritative identity yet (enrich's job)
-    assert db.identities_of(conn, ss) == {"name": "weird local band some song"}
+    assert db.identities_of(conn, ss) == {"name": f"weird local band{SEP}some song"}
 
     events = all_events(conn)
     # 3 scrobbles + 1 loved, each mirrored onto the artist item
@@ -152,7 +154,7 @@ def test_first_sync_items_events_cursor(conn, cfg):
     assert (rh, "loved") in kinds
     assert (wlb, "scrobble") in kinds
     # nowplaying row produced no item and no event
-    assert iid(conn, "track", "name", "Radiohead Let Down") is None
+    assert iid(conn, "track", "name", f"Radiohead{SEP}Let Down") is None
     scrobble_ts = {e["ts"] for e in events if e["kind"] == "scrobble"}
     assert "2023-11-14T22:15:00Z" in scrobble_ts  # UTS_NEW as ISO
 
@@ -240,7 +242,7 @@ def test_same_second_scrobbles_of_different_tracks_both_count(conn, cfg):
     by_kind: dict[str, set[str]] = {}
     for e in conn.execute("SELECT kind, dedup FROM events WHERE item_id=?", (rh,)):
         by_kind.setdefault(e["kind"], set()).add(e["dedup"])
-    airbag = iid(conn, "track", "name", "Radiohead Airbag")
+    airbag = iid(conn, "track", "name", f"Radiohead{SEP}Airbag")
     pa = iid(conn, "track", "mbid", PA_MBID)
     expected = {str(airbag), str(pa)}
     assert by_kind["scrobble"] == expected
