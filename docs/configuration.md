@@ -216,8 +216,8 @@ is the container's `TZ`.
 
 Duplicate repair has no config keys, only CLI flags. `gustarr dedupe`
 merges items that are the same thing under different spellings: it
-re-normalizes name-keyed fallback ids and registers MusicBrainz alias
-spellings against the canonical artist, so history split across
+re-normalizes name identities and attaches MusicBrainz alias spellings
+to the artist that owns the MBID, so history split across
 width/case/script variants (romaji vs. kana/kanji) lands on one item.
 `--fetch` additionally pulls alias lists from MusicBrainz for played
 artists that lack them (~1 request/second; `--limit` caps lookups per

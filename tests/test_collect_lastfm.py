@@ -104,6 +104,10 @@ def all_events(conn):
         "SELECT ts, item_id, kind, source FROM events ORDER BY ts, item_id, kind").fetchall()
 
 
+def iid(conn, domain, ns, key):
+    return db.lookup_item(conn, domain, ns, key)
+
+
 def test_first_sync_items_events_cursor(conn, cfg):
     calls = []
     stats = lastfm.sync(conn, cfg, transport=make_transport(calls))
@@ -111,25 +115,29 @@ def test_first_sync_items_events_cursor(conn, cfg):
     assert stats == {"scrobbles": 3, "loved": 1, "items": 5, "pages": 3,
                      "profiles": 1, "profiles_skipped": 0}
 
-    items = {r["id"]: r for r in conn.execute("SELECT * FROM items")}
-    assert set(items) == {
-        f"artist:mbid:{RH_MBID}",
-        "artist:lastfm:weird local band",
-        f"track:mbid:{PA_MBID}",
-        "track:lastfm:weird local band\x1fsome song",
-        "track:lastfm:radiohead\x1fkarma police",
-    }
-    pa = items[f"track:mbid:{PA_MBID}"]
-    assert pa["title"] == "Paranoid Android"
-    assert json.loads(pa["ids"]) == {"mbid": PA_MBID}
-    assert json.loads(pa["meta"]) == {
+    rh = iid(conn, "artist", "mbid", RH_MBID)
+    wlb = iid(conn, "artist", "name", "Weird Local Band")
+    pa = iid(conn, "track", "mbid", PA_MBID)
+    # name-keyed tracks resolve on "<artist> <title>" in one flat key
+    ss = iid(conn, "track", "name", "Weird Local Band Some Song")
+    kp = iid(conn, "track", "name", "Radiohead Karma Police")
+    assert None not in {rh, wlb, pa, ss, kp}
+    assert conn.execute("SELECT COUNT(*) c FROM items").fetchone()["c"] == 5
+    # mbid rows teach the spelling too, so both names land on one item
+    assert iid(conn, "artist", "name", "Radiohead") == rh
+
+    parow = conn.execute("SELECT * FROM items WHERE id=?", (pa,)).fetchone()
+    assert parow["title"] == "Paranoid Android"
+    assert db.identities_of(conn, pa)["mbid"] == PA_MBID
+    assert json.loads(parow["meta"]) == {
         "artist": "Radiohead",
-        "artist_id": f"artist:mbid:{RH_MBID}",
+        "artist_id": rh,
         "album": "OK Computer",
     }
-    fallback = items["track:lastfm:weird local band\x1fsome song"]
-    assert json.loads(fallback["meta"])["artist_id"] == "artist:lastfm:weird local band"
-    assert json.loads(fallback["ids"]) == {}
+    ssrow = conn.execute("SELECT * FROM items WHERE id=?", (ss,)).fetchone()
+    assert json.loads(ssrow["meta"])["artist_id"] == wlb
+    # spelling-only track: no authoritative identity yet (enrich's job)
+    assert db.identities_of(conn, ss) == {"name": "weird local band some song"}
 
     events = all_events(conn)
     # 3 scrobbles + 1 loved, each mirrored onto the artist item
@@ -138,13 +146,13 @@ def test_first_sync_items_events_cursor(conn, cfg):
     # legacy single-user config: everything lands on the synthesized default
     assert {r["profile"] for r in conn.execute("SELECT profile FROM events")} == {"default"}
     kinds = {(e["item_id"], e["kind"]) for e in events}
-    assert (f"track:mbid:{PA_MBID}", "scrobble") in kinds
-    assert (f"artist:mbid:{RH_MBID}", "scrobble") in kinds
-    assert (f"track:mbid:{PA_MBID}", "loved") in kinds
-    assert (f"artist:mbid:{RH_MBID}", "loved") in kinds
-    assert ("artist:lastfm:weird local band", "scrobble") in kinds
-    # nowplaying row produced no event
-    assert not any("let down" in e["item_id"] for e in events)
+    assert (pa, "scrobble") in kinds
+    assert (rh, "scrobble") in kinds
+    assert (pa, "loved") in kinds
+    assert (rh, "loved") in kinds
+    assert (wlb, "scrobble") in kinds
+    # nowplaying row produced no item and no event
+    assert iid(conn, "track", "name", "Radiohead Let Down") is None
     scrobble_ts = {e["ts"] for e in events if e["kind"] == "scrobble"}
     assert "2023-11-14T22:15:00Z" in scrobble_ts  # UTS_NEW as ISO
 
@@ -228,11 +236,13 @@ def test_same_second_scrobbles_of_different_tracks_both_count(conn, cfg):
     assert stats["scrobbles"] == 2 and stats["loved"] == 2
 
     # both tracks' plays survive on the artist item, discriminated by dedup
+    rh = iid(conn, "artist", "mbid", RH_MBID)
     by_kind: dict[str, set[str]] = {}
-    for e in conn.execute("SELECT kind, dedup FROM events WHERE item_id=?",
-                          (f"artist:mbid:{RH_MBID}",)):
+    for e in conn.execute("SELECT kind, dedup FROM events WHERE item_id=?", (rh,)):
         by_kind.setdefault(e["kind"], set()).add(e["dedup"])
-    expected = {"track:lastfm:radiohead\x1fairbag", f"track:mbid:{PA_MBID}"}
+    airbag = iid(conn, "track", "name", "Radiohead Airbag")
+    pa = iid(conn, "track", "mbid", PA_MBID)
+    expected = {str(airbag), str(pa)}
     assert by_kind["scrobble"] == expected
     assert by_kind["loved"] == expected
 
@@ -263,22 +273,24 @@ def test_mbid_scrobble_merges_existing_name_keyed_artist(conn, cfg):
         return httpx.Response(200, json=LOVED_EMPTY)
 
     transport = httpx.MockTransport(handler)
-    fallback, canonical = "artist:lastfm:radiohead", f"artist:mbid:{RH_MBID}"
 
-    lastfm.sync(conn, cfg, transport=transport)  # mbid-less row mints the fallback
-    assert conn.execute("SELECT 1 FROM items WHERE id=?", (fallback,)).fetchone()
+    lastfm.sync(conn, cfg, transport=transport)  # mbid-less row mints a name item
+    fallback = iid(conn, "artist", "name", "Radiohead")
+    assert fallback is not None
 
-    # a later row carrying the mbid folds the fallback into the mbid item
+    # a later row carrying the mbid folds the name item into the mbid item
     phase["page"] = one_track_page(new_row)
     lastfm.sync(conn, cfg, transport=transport)
+    canonical = iid(conn, "artist", "mbid", RH_MBID)
+    assert iid(conn, "artist", "name", "Radiohead") == canonical
     assert conn.execute("SELECT 1 FROM items WHERE id=?", (fallback,)).fetchone() is None
-    assert db.canonical_id(conn, fallback) == canonical
     moved = conn.execute(
         "SELECT ts FROM events WHERE item_id=? AND kind='scrobble'", (canonical,)).fetchall()
-    assert len(moved) == 2  # the fallback's event moved onto the mbid item
+    assert len(moved) == 2  # the name item's event moved onto the mbid item
 
-    # full re-walk re-mints the name-keyed id; the alias redirects it, so
-    # nothing is resurrected and no event duplicates
+    # full re-walk re-encounters the name spelling; the taught identity
+    # resolves it to the winner, so nothing is resurrected and no event
+    # duplicates
     phase["page"] = one_track_page(new_row, old_row)
     before = all_events(conn)
     stats = lastfm.sync(conn, cfg, full=True, transport=transport)

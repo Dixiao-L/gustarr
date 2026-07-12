@@ -82,11 +82,14 @@ def _sync_one(
         if not key:
             stats["skipped"] += 1
             continue
-        item_id = ids.make(spec["domain"], spec["ns"], str(key))
-        ext_ids = {ns: entry[f] for f, ns in spec["id_fields"].items() if entry.get(f)}
-        db.upsert_item(conn, item_id, spec["domain"], title=entry.get(spec["title"]),
-                       year=entry.get("year"), ids=ext_ids,
-                       meta={"genres": entry.get("genres", [])})
+        item = db.resolve_item(conn, spec["domain"], spec["ns"], str(key),
+                               title=entry.get(spec["title"]), year=entry.get("year"),
+                               meta={"genres": entry.get("genres", [])})
+        for field, ns in spec["id_fields"].items():
+            # a secondary id can reveal a twin another source minted first;
+            # attach_identity merges them and hands back the survivor
+            if ns != spec["ns"] and entry.get(field):
+                item = db.attach_identity(conn, item, ns, str(entry[field]))
         stats["items"] += 1
 
         is_gustarr = gustarr_tag is not None and gustarr_tag in (entry.get("tags") or [])
@@ -97,7 +100,7 @@ def _sync_one(
             " VALUES (?,?,?,?,?,?)"
             " ON CONFLICT(item_id) DO UPDATE SET arr=excluded.arr, arr_id=excluded.arr_id,"
             " status=excluded.status, added_at=excluded.added_at, meta=excluded.meta",
-            (item_id, name, entry.get("id"), status, added,
+            (item, name, entry.get("id"), status, added,
              json.dumps({"gustarr": True} if is_gustarr else {})),
         )
         stats["library"] += 1
@@ -109,16 +112,25 @@ def _sync_one(
         # library_add weight keeps the shared attribution harmless.
         if not is_gustarr and added:
             for profile in profiles:
-                if db.add_event(conn, added, item_id, "library_add", WEIGHTS["library_add"],
+                if db.add_event(conn, added, item, "library_add", WEIGHTS["library_add"],
                                 "arr", {"arr": name}, profile=profile):
                     stats["events"] += 1
-        current[item_id] = entry.get("id")
+        current[ids.normalize_key(str(key))] = entry.get("id")
 
     state_key = f"arr:known:{name}"
     known = json.loads(db.get_state(conn, state_key, "{}"))
-    for item_id in set(known) - set(current):
+    # Known keys are the *arr's own external ids — merge-proof, unlike item
+    # ids. v2 stores held full text item ids (domain:ns:key); reading just
+    # the key tail keeps the first post-upgrade sync from mass-"removing"
+    # (and mass-rejecting) the whole library once.
+    gone = {ids.normalize_key(str(k).rsplit(":", 1)[-1]) for k in known} - set(current)
+    for key in gone:
+        stats["removed"] += 1
+        item = db.lookup_item(conn, spec["domain"], spec["ns"], key)
+        if item is None:
+            continue
         row = conn.execute(
-            "SELECT meta FROM library WHERE item_id=? AND arr=?", (item_id, name)).fetchone()
+            "SELECT meta FROM library WHERE item_id=? AND arr=?", (item, name)).fetchone()
         if row and json.loads(row["meta"]).get("gustarr"):
             # user deleted a gustarr add: the strongest negative we ever
             # see. Unlike adds, this IS usually attributable — the
@@ -132,14 +144,13 @@ def _sync_one(
             owner = conn.execute(
                 "SELECT profile FROM recommendations WHERE item_id=?"
                 " AND status IN ('added','auto_added')"
-                " ORDER BY acted_at DESC, id DESC LIMIT 1", (item_id,)).fetchone()
+                " ORDER BY acted_at DESC, id DESC LIMIT 1", (item,)).fetchone()
             targets = [owner["profile"]] if owner else profiles
             weight = WEIGHTS["reject"] if owner else WEIGHTS["reject"] * 0.3
             meta = {"deleted": True} if owner else {"deleted": True, "shared": True}
             for profile in targets:
-                if db.add_event(conn, db.now(), item_id, "reject", weight, "arr",
+                if db.add_event(conn, db.now(), item, "reject", weight, "arr",
                                 meta, profile=profile):
                     stats["rejects"] += 1
-        conn.execute("DELETE FROM library WHERE item_id=? AND arr=?", (item_id, name))
-        stats["removed"] += 1
+        conn.execute("DELETE FROM library WHERE item_id=? AND arr=?", (item, name))
     db.set_state(conn, state_key, json.dumps(current))

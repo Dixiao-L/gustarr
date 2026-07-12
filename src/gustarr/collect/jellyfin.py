@@ -2,8 +2,12 @@
 
 Four passes — library state, played episodes rolled up to series, played
 audio rolled up to artists, and (best-effort) the Playback Reporting
-plugin. Progress signals go through state cursors so re-running the sync
-adds zero events until something new is watched or played.
+plugin. Every API object resolves through db.resolve_item on its
+strongest provider id and also learns its Jellyfin id as an identity, so
+later passes land on the same item even when provider tags change.
+Progress cursors key on Jellyfin ids — identity merges move item ids,
+Jellyfin ids never move — so re-running the sync adds zero events until
+something new is watched or played.
 """
 
 from __future__ import annotations
@@ -13,7 +17,7 @@ from typing import Any, Iterator
 
 import httpx
 
-from .. import db, http, ids
+from .. import db, http
 from ..config import Config
 from ..signals import WEIGHTS
 
@@ -107,27 +111,41 @@ def _fetch_by_ids(base: str, uid: str, jf_ids: list[str], headers: dict[str, str
     return found
 
 
-def _canonical(raw: dict[str, Any]) -> tuple[str | None, str, dict[str, Any]]:
-    """(canonical id | None, domain, provider ids worth keeping)."""
+def _resolve(conn: sqlite3.Connection, raw: dict[str, Any]) -> int | None:
+    """Land one Jellyfin API object on its store item, or None when it
+    carries nothing to identify it by. Resolves on the strongest provider
+    id (spelling for artists without one), then teaches the weaker
+    provider ids and the Jellyfin id itself — the next pass lands here
+    even if provider tags vanish. attach_identity may reveal two items
+    were one; every step continues with the returned winner."""
     pids = {k.lower(): str(v).strip() for k, v in (raw.get("ProviderIds") or {}).items()
             if v and str(v).strip()}
     name = (raw.get("Name") or "").strip()
     jf_type = raw.get("Type") or ""
+    year = raw.get("ProductionYear")
     if jf_type == "MusicArtist":
         if mbid := pids.get("musicbrainzartist"):
-            return ids.make("artist", "mbid", mbid), "artist", {"mbid": mbid}
-        if name:
-            return ids.make("artist", "lastfm", name), "artist", {}
-        return None, "artist", {}
-    if jf_type in _VIDEO_NS:
+            item = db.resolve_item(conn, "artist", "mbid", mbid, title=name or None, year=year)
+            if name:  # teach the spelling so name-keyed twins converge
+                item = db.attach_identity(conn, item, "name", name)
+        elif name:
+            item = db.resolve_item(conn, "artist", "name", name, title=name, year=year)
+        else:
+            return None
+    elif jf_type in _VIDEO_NS:
         domain, order = _VIDEO_NS[jf_type]
-        known = {ns: (int(pids[ns]) if pids[ns].isdigit() else pids[ns])
-                 for ns in order if ns in pids}
-        if known:
-            ns, val = next(iter(known.items()))
-            return ids.make(domain, ns, str(val)), domain, known
-        return None, domain, known
-    return None, "", {}
+        known = [(ns, pids[ns]) for ns in order if ns in pids]
+        if not known:
+            return None  # a provider-tagless video is unmatchable for recommendations
+        item = db.resolve_item(conn, domain, known[0][0], known[0][1],
+                               title=name or None, year=year)
+        for ns, key in known[1:]:
+            item = db.attach_identity(conn, item, ns, key)
+    else:
+        return None
+    if jf_id := raw.get("Id"):
+        item = db.attach_identity(conn, item, "jellyfin", str(jf_id))
+    return item
 
 
 def _norm_ts(raw: str | None) -> str:
@@ -138,31 +156,29 @@ def _norm_ts(raw: str | None) -> str:
     return db.now()
 
 
-def _merged_state(conn: sqlite3.Connection, profile: str, key: str,
-                  pre_merge_key: str) -> str | None:
-    """Profile-scoped state lookup that survives an id merge: a cursor written
-    before enrich merged the minted id away lives under the old key; reading it
-    there keeps the first post-merge sync from re-emitting counted events."""
-    val = db.pget_state(conn, profile, key)
-    if val is None and pre_merge_key != key:
-        val = db.pget_state(conn, profile, pre_merge_key)
-    return val
-
-
-def _flag_event(conn: sqlite3.Connection, profile: str, item_id: str,
-                kind: str, ts: str) -> bool:
-    """Favorite/complete are persistent flags, not occurrences: one event per
-    (profile, item, kind) ever, so a drifting fallback ts can't break
-    idempotency. Checked against the canonical id — after enrich merges the
-    minted id away the flag event lives under the canonical item, and missing
-    it here would re-append the flag with a fresh ts every sync."""
-    item_id = db.canonical_id(conn, item_id)
+def _flag_event(conn: sqlite3.Connection, profile: str, item_id: int,
+                kind: str, ts: str, meta: dict[str, Any] | None = None) -> bool:
+    """Favorite/complete are persistent flags, not occurrences: one event
+    per (profile, item, kind) ever. Deduping on event existence rather
+    than the uniqueness key means a drifting fallback ts can't re-append
+    the flag; merges repoint events, so the check follows the item."""
     row = conn.execute(
         "SELECT 1 FROM events WHERE profile=? AND item_id=? AND kind=? AND source=? LIMIT 1",
         (profile, item_id, kind, SOURCE)).fetchone()
     if row:
         return False
-    return db.add_event(conn, ts, item_id, kind, WEIGHTS[kind], SOURCE, profile=profile)
+    return db.add_event(conn, ts, item_id, kind, WEIGHTS[kind], SOURCE, meta, profile=profile)
+
+
+def _has_history(conn: sqlite3.Connection, profile: str, item_id: int) -> bool:
+    """Any prior jellyfin listening evidence for the item. A cursorless
+    series WITH history is one whose plays are already counted (a store
+    upgraded from the old cursor scheme, or PBR wrote them moments ago),
+    not pre-plugin backlog."""
+    return conn.execute(
+        "SELECT 1 FROM events WHERE profile=? AND item_id=? AND source=?"
+        " AND kind IN ('play', 'complete') LIMIT 1",
+        (profile, item_id, SOURCE)).fetchone() is not None
 
 
 def _sync_library(conn: sqlite3.Connection, profile: str, base: str, uid: str,
@@ -171,22 +187,19 @@ def _sync_library(conn: sqlite3.Connection, profile: str, base: str, uid: str,
     params = {"Recursive": "true", "IncludeItemTypes": "Movie,Series,MusicArtist",
               "Fields": "ProviderIds,UserData,ProductionYear", "EnableImages": "false"}
     for raw in _paged(f"{base}/Users/{uid}/Items", params, headers, transport):
-        item_id, domain, known = _canonical(raw)
-        if item_id is None:
+        item = _resolve(conn, raw)
+        if item is None:
             stats["skipped"] += 1
             continue
-        db.upsert_item(conn, item_id, domain, title=raw.get("Name"),
-                       year=raw.get("ProductionYear"), ids=known,
-                       meta={"jellyfin_id": raw.get("Id")})
         stats["items"] += 1
         ud = raw.get("UserData") or {}
         ts = _norm_ts(ud.get("LastPlayedDate"))
-        if ud.get("IsFavorite") and _flag_event(conn, profile, item_id, "favorite", ts):
+        if ud.get("IsFavorite") and _flag_event(conn, profile, item, "favorite", ts):
             stats["favorites"] += 1
         # A Series reads Played when every *downloaded* episode is watched,
         # which over-reports partly-synced shows — episode counts decide.
-        if domain == "movie" and ud.get("Played") \
-                and _flag_event(conn, profile, item_id, "complete", ts):
+        if raw.get("Type") == "Movie" and ud.get("Played") \
+                and _flag_event(conn, profile, item, "complete", ts):
             stats["completes"] += 1
 
 
@@ -205,35 +218,31 @@ def _sync_series(conn: sqlite3.Connection, profile: str, base: str, uid: str,
         if not fetched:
             continue
         series = fetched[0]
-        minted, domain, known = _canonical({**series, "Type": series.get("Type") or "Series"})
-        if minted is None:
+        item = _resolve(conn, {**series, "Type": series.get("Type") or "Series"})
+        if item is None:
             stats["skipped"] += 1
             continue
-        db.upsert_item(conn, minted, domain, title=series.get("Name"),
-                       year=series.get("ProductionYear"), ids=known, meta={"jellyfin_id": sid})
-        # enrich may have merged the minted id away; cursors must follow the
-        # canonical id or a merge would reset them and duplicate the events
-        item_id = db.canonical_id(conn, minted)
-        pkey = f"jellyfin:series_played:{item_id}"
-        prev = _merged_state(conn, profile, pkey, f"jellyfin:series_played:{minted}")
+        # the cursor keys on the Jellyfin series id: identity merges move
+        # item ids but never jf ids, so a merge can't reset counted progress
+        key = f"jellyfin:series_played:{sid}"
+        prev = db.pget_state(conn, profile, key)
         if count > int(prev or 0):
-            # First-ever sight of the series is pre-plugin backlog that
-            # Playback Reporting can't know about — emit it regardless.
-            if (emit_plays or prev is None) and db.add_event(
-                    conn, db.now(), item_id, "play", WEIGHTS["play"],
+            # No cursor + no stored history is pre-plugin backlog that
+            # Playback Reporting can't know about — emit regardless. No
+            # cursor WITH history means the plays are already counted
+            # (upgraded cursor scheme, or PBR just wrote them): seed the
+            # cursor silently instead of re-emitting the backlog as one play.
+            quiet = prev is None and _has_history(conn, profile, item)
+            if not quiet and (emit_plays or prev is None) and db.add_event(
+                    conn, db.now(), item, "play", WEIGHTS["play"],
                     SOURCE, {"episodes_played": count}, profile=profile):
                 stats["series_plays"] += 1
-            db.pset_state(conn, profile, pkey, str(count))
+            db.pset_state(conn, profile, key, str(count))
         total = int(series.get("RecursiveItemCount") or 0)
-        ckey = f"jellyfin:series_complete:{item_id}"
         if total and count >= SERIES_COMPLETE_FRAC * total \
-                and _merged_state(conn, profile, ckey,
-                                  f"jellyfin:series_complete:{minted}") is None:
-            if db.add_event(conn, db.now(), item_id, "complete", WEIGHTS["complete"], SOURCE,
-                            {"episodes_played": count, "episodes_total": total},
-                            profile=profile):
-                stats["series_completes"] += 1
-            db.pset_state(conn, profile, ckey, db.now())
+                and _flag_event(conn, profile, item, "complete", db.now(),
+                                {"episodes_played": count, "episodes_total": total}):
+            stats["series_completes"] += 1
 
 
 def _sync_audio(conn: sqlite3.Connection, profile: str, base: str, uid: str,
@@ -245,27 +254,25 @@ def _sync_audio(conn: sqlite3.Connection, profile: str, base: str, uid: str,
     order = list(dict.fromkeys(
         t["ArtistItems"][0]["Id"] for t in tracks
         if t.get("ArtistItems") and t["ArtistItems"][0].get("Id")))
-    jf_artist: dict[str, str] = {}
+    jf_artist: dict[str, int] = {}
     for art in _fetch_by_ids(base, uid, order, headers, transport):
-        art_id, domain, known = _canonical({**art, "Type": art.get("Type") or "MusicArtist"})
-        if art_id is None:
-            continue
-        db.upsert_item(conn, art_id, domain, title=art.get("Name"),
-                       year=art.get("ProductionYear"), ids=known,
-                       meta={"jellyfin_id": art.get("Id")})
-        jf_artist[art["Id"]] = db.canonical_id(conn, art_id)
+        item = _resolve(conn, {**art, "Type": art.get("Type") or "MusicArtist"})
+        if item is not None:
+            jf_artist[art["Id"]] = item
     for t in tracks:
         arts = t.get("ArtistItems") or []
         a0 = arts[0] if arts else {}
         art_id = jf_artist.get(a0.get("Id") or "")
-        if not art_id:
+        if art_id is None:
             name = (a0.get("Name") or "").strip()
             if not name:
                 stats["skipped"] += 1
                 continue
-            art_id = ids.make("artist", "lastfm", name)
-            db.upsert_item(conn, art_id, "artist", title=name)
-            art_id = db.canonical_id(conn, art_id)
+            # credit not in the artist library: resolve by spelling, still
+            # teach the jf id so a later library pass lands on this item
+            art_id = db.resolve_item(conn, "artist", "name", name, title=name)
+            if a0.get("Id"):
+                art_id = db.attach_identity(conn, art_id, "jellyfin", str(a0["Id"]))
         ud = t.get("UserData") or {}
         # IsPlayed-filtered rows can still carry PlayCount 0 on some servers
         plays = max(int(ud.get("PlayCount") or 0), 1)
@@ -280,10 +287,10 @@ def _sync_audio(conn: sqlite3.Connection, profile: str, base: str, uid: str,
             db.pset_state(conn, profile, key, str(plays))
             continue
         weight = WEIGHTS["scrobble"] * min(delta, SCROBBLE_DELTA_CAP)
-        # dedup=track id: two tracks by one artist played the same second are
-        # distinct listens, not one re-synced event. A False return is then a
-        # genuine replay of an already-stored row, so the cursor must hold —
-        # advancing it would silently discard the still-pending plays.
+        # dedup=jf track id: two tracks by one artist played the same second
+        # are distinct listens, not one re-synced event. A False return is
+        # then a genuine replay of an already-stored row, so the cursor must
+        # hold — advancing it would silently discard the still-pending plays.
         if db.add_event(conn, _norm_ts(ud.get("LastPlayedDate")), art_id, "scrobble", weight,
                         SOURCE, {"delta": delta, "track": t.get("Name"), "album": t.get("Album")},
                         dedup=str(t.get("Id") or ""), profile=profile):
@@ -361,20 +368,17 @@ def _pbr_row(conn: sqlite3.Connection, profile: str, base: str, uid: str,
     if kind == "Audio":
         arts = item.get("ArtistItems") or []
         a0 = arts[0] if arts else {}
+        art_id = None
         if a0.get("Id"):
             fetched = _fetch_by_ids(base, uid, [a0["Id"]], headers, transport)
-            art = fetched[0] if fetched else {}
-            art_id, domain, known = _canonical(
-                {**art, "Type": art.get("Type") or "MusicArtist"})
-            if art_id:
-                db.upsert_item(conn, art_id, domain, title=art.get("Name"), ids=known,
-                               meta={"jellyfin_id": a0["Id"]})
-        elif name := (a0.get("Name") or "").strip():
-            art_id = ids.make("artist", "lastfm", name)
-            db.upsert_item(conn, art_id, "artist", title=name)
-        else:
-            return
-        art_id = db.canonical_id(conn, art_id)
+            if fetched:
+                art_id = _resolve(
+                    conn, {**fetched[0], "Type": fetched[0].get("Type") or "MusicArtist"})
+        if art_id is None:
+            name = (a0.get("Name") or "").strip()
+            if not name:
+                return
+            art_id = db.resolve_item(conn, "artist", "name", name, title=name)
         if db.add_event(conn, ts, art_id, "scrobble", WEIGHTS["scrobble"], SOURCE,
                         {"track": item.get("Name"), "album": item.get("Album"),
                          "seconds": duration}, dedup=f"pbr{rowid}", profile=profile):
@@ -386,20 +390,13 @@ def _pbr_row(conn: sqlite3.Connection, profile: str, base: str, uid: str,
         if not fetched:
             return
         series = fetched[0]
-        minted, domain, known = _canonical(
-            {**series, "Type": series.get("Type") or "Series"})
-        if minted is None:
+        target = _resolve(conn, {**series, "Type": series.get("Type") or "Series"})
+        if target is None:
             return
-        db.upsert_item(conn, minted, domain, title=series.get("Name"), ids=known,
-                       meta={"jellyfin_id": sid})
-        target = db.canonical_id(conn, minted)
     elif kind == "Movie":
-        minted, domain, known = _canonical({**item, "Type": "Movie"})
-        if minted is None:
+        target = _resolve(conn, {**item, "Type": "Movie"})
+        if target is None:
             return
-        db.upsert_item(conn, minted, domain, title=item.get("Name"), ids=known,
-                       meta={"jellyfin_id": item.get("Id")})
-        target = db.canonical_id(conn, minted)
         runtime = int(item.get("RunTimeTicks") or 0) // 10_000_000
         if runtime and duration >= PBR_COMPLETE_FRAC * runtime \
                 and _flag_event(conn, profile, target, "complete", ts):

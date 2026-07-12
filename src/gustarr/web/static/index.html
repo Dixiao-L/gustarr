@@ -624,7 +624,10 @@
       nbs.every(n => n && !Array.isArray(n) && n.title);
     if (nbs.length && !resolved) return null;
     const sources = w.sources || [];
+    // seeds are surrogate int item ids since schema v3; only the server can
+    // name those, so any non-string seed defers the whole panel to /why
     const seeds = w.seeds || [];
+    if (seeds.some(s => typeof s !== 'string')) return null;
     if (!resolved && !sources.length && !seeds.length) return null;
     const parts = [];
     if (resolved) parts.push('<div class="nbs">' + nbs.map(n =>

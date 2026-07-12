@@ -34,10 +34,10 @@ def _b64(arr: np.ndarray) -> str:
     return base64.b64encode(arr.astype(np.float32).tobytes()).decode("ascii")
 
 
-def _item_labels(conn: sqlite3.Connection, profile: str, domain: str) -> dict[str, float]:
+def _item_labels(conn: sqlite3.Connection, profile: str, domain: str) -> dict[int, float]:
     # Labels are one person's taste: only that profile's events count, or
     # a housemate's rejects would poison everyone's heads.
-    per_item: dict[str, list[tuple[str, str, float]]] = {}
+    per_item: dict[int, list[tuple[str, str, float]]] = {}
     for r in conn.execute(
         "SELECT e.item_id, e.ts, e.kind, e.weight FROM events e"
         " JOIN items i ON i.id = e.item_id WHERE i.domain = ? AND e.profile = ?",
@@ -47,7 +47,7 @@ def _item_labels(conn: sqlite3.Connection, profile: str, domain: str) -> dict[st
     return {item: signals.aggregate_label(evts) for item, evts in per_item.items()}
 
 
-def _vectors(conn: sqlite3.Connection, model: str, item_ids: list[str]) -> dict[str, np.ndarray]:
+def _vectors(conn: sqlite3.Connection, model: str, item_ids: list[int]) -> dict[int, np.ndarray]:
     return {
         item_id: np.frombuffer(vec, dtype=np.float16).astype(np.float32)
         for item_id, _dim, vec in db.iter_embeddings(conn, model, item_ids)
@@ -57,7 +57,7 @@ def _vectors(conn: sqlite3.Connection, model: str, item_ids: list[str]) -> dict[
 def _weak_negatives(
     conn: sqlite3.Connection, profile: str, domain: str, model: str, n: int,
     rng: np.random.Generator,
-) -> list[str]:
+) -> list[int]:
     """Unlabelled candidates as soft negatives: most of the pool is stuff
     the user never chose, which is weak evidence against. Both the pool
     and the "unlabelled" test are per profile — an item another profile

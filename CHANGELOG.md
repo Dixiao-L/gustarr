@@ -4,6 +4,36 @@ All notable changes to Gustarr are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/).
 
+## [0.3.0] - 2026-07-12
+
+### Changed
+- **Identity layer redesigned** (store schema v3; existing stores migrate
+  automatically in one transaction). Items now carry a surrogate integer
+  id, and every external id or name an item is known by lives in one
+  `identities` table (`domain, ns, key → item`, with
+  ns ∈ `tmdb`/`tvdb`/`imdb`/`mbid`/`jellyfin`/`name`). One resolver
+  (`resolve_item`) is the single write path and one operation
+  (`attach_identity`) teaches an item a new name, merging with the
+  authoritative-namespace holder when the collision proves both rows are
+  the same entity. This replaces the three overlapping v2 mechanisms —
+  namespaced id-string minting, `item_aliases` redirects, and the
+  enrich/dedupe merge passes — that the architecture docs carried as
+  design debt: "what id does this thing have?" now has one answer.
+- Jellyfin item ids are first-class identities: re-syncs and collection
+  updates resolve directly by Jellyfin id, with no metadata round-trip.
+- Sync cursors and *arr inventory state key on external ids instead of
+  item ids, so identity merges can never strand or replay a cursor.
+
+### Fixed
+- A name spelling shared by two artists that each hold their own
+  MusicBrainz id is treated as proof they are *different* — the attach is
+  refused and surfaced as `alias_conflicts` in enrich/dedupe stats.
+  MusicBrainz alias lists legitimately carry other entities' names
+  (former band names, personas, tributes); during pre-release testing the
+  interim merge-on-collision behaviour folded Michael Jackson into
+  Wolfgang Amadeus Mozart. Name merges only ever absorb name-only twins,
+  the cross-script healing case they exist for.
+
 ## [0.2.2] - 2026-07-12
 
 ### Fixed

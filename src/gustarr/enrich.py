@@ -1,14 +1,15 @@
 """Metadata enrichment: TMDb for movies/series, MusicBrainz + Last.fm for music.
 
 Second pipeline stage. Besides filling items.meta for the embedder, this
-is where weak ids get upgraded: imdb-only movies, tmdb-only series and
-Last.fm name-keyed artists resolve to their authoritative namespace and
-merge (db.merge_item) so accumulated events/candidates follow the item.
-Permanent per-item failures (bad/missing ids, 4xx) stamp enriched_at
-with an enrich_error note so one bad item can never wedge the queue;
-transient failures (outages, rate limits, bad credentials) leave
-enriched_at NULL so the item retries next run, and a later success
-clears the stale enrich_error note.
+is where items learn their authoritative external ids: imdb-only movies,
+tmdb-only series and name-only artists resolve to tmdb/tvdb/mbid and the
+new id is attached via db.attach_identity — when another item already
+holds it, the two merge and enrichment continues on the survivor, with
+accumulated events/candidates following it. Permanent per-item failures
+(bad/missing ids, 4xx) stamp enriched_at with an enrich_error note so
+one bad item can never wedge the queue; transient failures (outages,
+rate limits, bad credentials) leave enriched_at NULL so the item retries
+next run, and a later success clears the stale enrich_error note.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ DEEZER = "https://api.deezer.com"
 CAA = "https://coverartarchive.org"
 
 # Below this MusicBrainz search score a name match is too fuzzy to
-# auto-merge; keeping the fallback id beats pointing someone's scrobble
+# adopt; keeping the name-only item beats pointing someone's scrobble
 # history at the wrong artist.
 MB_MERGE_SCORE = 90
 
@@ -42,7 +43,7 @@ def run(
     domain: str | None = None,
     limit: int | None = None,
 ) -> dict[str, int]:
-    stats = {"enriched": 0, "merged": 0, "skipped": 0, "errors": 0, "alias_conflicts": 0}
+    stats = {"enriched": 0, "merged": 0, "alias_conflicts": 0, "skipped": 0, "errors": 0}
     sql = (
         "SELECT * FROM items WHERE enriched_at IS NULL"
         + (" AND domain=?" if domain else "")
@@ -75,13 +76,13 @@ def run(
             permanent = isinstance(exc, LookupError) or (
                 isinstance(exc, http.ApiError) and exc.status is not None
                 and 400 <= exc.status < 500 and exc.status not in (401, 403, 429))
-            db.upsert_item(conn, eff["id"], row["domain"],
-                           meta={"enrich_error": str(exc)}, enriched=permanent)
+            db.upsert_item_fields(conn, eff["id"],
+                                  meta={"enrich_error": str(exc)}, enriched=permanent)
             stats["errors"] += 1
         else:
             # a retried item that just succeeded must not keep advertising
             # its last transient failure — drop the stale note in place
-            # (upsert_item merges meta key-wise, so it would survive).
+            # (upsert_item_fields merges meta key-wise, so it would survive).
             conn.execute(
                 "UPDATE items SET meta=json_remove(meta, '$.enrich_error')"
                 " WHERE id=? AND enriched_at IS NOT NULL"
@@ -94,37 +95,52 @@ def _enrich_one(
     conn: sqlite3.Connection,
     cfg: Config,
     row: sqlite3.Row,
-    eff: dict[str, str],
+    eff: dict[str, int],
     stats: dict[str, int],
 ) -> None:
     item_id = row["id"]
-    ids_map = json.loads(row["ids"])
-    _, ns, key = ids.parse(item_id)
-    if ns != "lastfm":  # the id's own namespace is an external id too
-        ids_map.setdefault(ns, key)
+    idents = db.identities_of(conn, item_id)
     domain = row["domain"]
     if domain == "movie":
-        _movie(conn, cfg, item_id, ids_map, eff, stats)
+        _movie(conn, cfg, item_id, idents, eff, stats)
     elif domain == "series":
-        _series(conn, cfg, item_id, ids_map, eff, stats)
+        _series(conn, cfg, item_id, idents, eff, stats)
     elif domain == "artist":
-        _artist(conn, cfg, item_id, row["title"], ids_map, eff, stats)
+        _artist(conn, cfg, item_id, row["title"], idents, eff, stats)
     else:  # album | track
-        _release_or_recording(conn, item_id, domain, row["title"], ids_map,
-                              json.loads(row["meta"] or "{}"), stats)
+        _release_or_recording(conn, item_id, domain, row["title"], idents,
+                              json.loads(row["meta"] or "{}"), eff, stats)
+
+
+def _attach(conn, domain: str, item_id: int, ns: str, key: str, eff, stats) -> int:
+    """attach_identity plus the enrich bookkeeping: when the new id
+    reveals a twin, the merge is counted — whichever of the two survived
+    — and enrichment continues on the survivor (also the id errors are
+    attributed to from here on). A refused name attach (two authoritative
+    entities sharing a spelling: former band names, personas) counts as a
+    conflict instead; the spelling stays with its current owner."""
+    holder = db.lookup_item(conn, domain, ns, key)
+    winner = db.attach_identity(conn, item_id, ns, key)
+    if holder is not None and holder != item_id:
+        if winner == item_id and db.lookup_item(conn, domain, ns, key) != item_id:
+            stats["alias_conflicts"] += 1
+        else:
+            stats["merged"] += 1
+    eff["id"] = winner
+    return winner
 
 
 # ── movies / series (TMDb) ───────────────────────────────────────────
 
 
-def _movie(conn, cfg, item_id, ids_map, eff, stats) -> None:
+def _movie(conn, cfg, item_id, idents, eff, stats) -> None:
     api_key = cfg.tmdb.get("api_key")
     if not api_key:
         stats["skipped"] += 1
         return
-    tmdb_id = ids_map.get("tmdb")
+    tmdb_id = idents.get("tmdb")
     if not tmdb_id:
-        imdb = ids_map.get("imdb")
+        imdb = idents.get("imdb")
         if not imdb:
             raise LookupError("movie has neither tmdb nor imdb id")
         found = http.get_json(f"{TMDB}/find/{imdb}",
@@ -133,11 +149,7 @@ def _movie(conn, cfg, item_id, ids_map, eff, stats) -> None:
         if not results:
             raise LookupError(f"tmdb /find: no movie for imdb {imdb}")
         tmdb_id = results[0]["id"]
-        canonical = ids.make("movie", "tmdb", str(tmdb_id))
-        if canonical != item_id:
-            db.merge_item(conn, item_id, canonical)
-            stats["merged"] += 1
-            item_id = eff["id"] = canonical
+        item_id = _attach(conn, "movie", item_id, "tmdb", str(tmdb_id), eff, stats)
     data = http.get_json(
         f"{TMDB}/movie/{tmdb_id}",
         params={"api_key": api_key, "append_to_response": "keywords,videos",
@@ -157,20 +169,19 @@ def _movie(conn, cfg, item_id, ids_map, eff, stats) -> None:
     trailer = _trailer_key(data)
     if trailer:
         meta["trailer"] = trailer
-    db.upsert_item(conn, item_id, "movie", title=data.get("title"),
-                   year=_year(data.get("release_date")), ids={**ids_map, "tmdb": tmdb_id},
-                   meta=meta, enriched=True)
+    db.upsert_item_fields(conn, item_id, title=data.get("title"),
+                          year=_year(data.get("release_date")), meta=meta, enriched=True)
     stats["enriched"] += 1
 
 
-def _series(conn, cfg, item_id, ids_map, eff, stats) -> None:
+def _series(conn, cfg, item_id, idents, eff, stats) -> None:
     api_key = cfg.tmdb.get("api_key")
     if not api_key:
         stats["skipped"] += 1
         return
-    tmdb_id = ids_map.get("tmdb")
+    tmdb_id = idents.get("tmdb")
     if not tmdb_id:
-        tvdb = ids_map.get("tvdb")
+        tvdb = idents.get("tvdb")
         if not tvdb:
             raise LookupError("series has neither tvdb nor tmdb id")
         found = http.get_json(f"{TMDB}/find/{tvdb}",
@@ -183,17 +194,14 @@ def _series(conn, cfg, item_id, ids_map, eff, stats) -> None:
         f"{TMDB}/tv/{tmdb_id}",
         params={"api_key": api_key, "append_to_response": "keywords,external_ids,videos",
                 "language": "en-US"})
-    # Sonarr can only add by tvdb id, so tmdb-keyed candidates must
-    # upgrade to the canonical tvdb namespace (mirrors _movie's
-    # imdb→tmdb path) or actuation can never reach them.
-    tvdb_id = (data.get("external_ids") or {}).get("tvdb_id") or ids_map.get("tvdb")
+    # Sonarr can only add by tvdb id, so a tmdb-keyed candidate series
+    # must learn its tvdb identity (mirrors _movie's imdb→tmdb path) or
+    # actuation can never reach it. Both attaches can reveal a twin that
+    # arrived under the other namespace — the survivor carries on.
+    tvdb_id = (data.get("external_ids") or {}).get("tvdb_id") or idents.get("tvdb")
     if tvdb_id:
-        ids_map["tvdb"] = tvdb_id
-        canonical = ids.make("series", "tvdb", str(tvdb_id))
-        if canonical != item_id:
-            db.merge_item(conn, item_id, canonical)
-            stats["merged"] += 1
-            item_id = eff["id"] = canonical
+        item_id = _attach(conn, "series", item_id, "tvdb", str(tvdb_id), eff, stats)
+    item_id = _attach(conn, "series", item_id, "tmdb", str(tmdb_id), eff, stats)
     kw = data.get("keywords") or {}
     meta = {
         "genres": [g["name"] for g in data.get("genres") or []],
@@ -211,9 +219,8 @@ def _series(conn, cfg, item_id, ids_map, eff, stats) -> None:
         meta["trailer"] = trailer
     if not tvdb_id:
         meta["no_tvdb"] = True  # un-addable in Sonarr; apply reports why
-    db.upsert_item(conn, item_id, "series", title=data.get("name"),
-                   year=_year(data.get("first_air_date")), ids={**ids_map, "tmdb": tmdb_id},
-                   meta=meta, enriched=True)
+    db.upsert_item_fields(conn, item_id, title=data.get("name"),
+                          year=_year(data.get("first_air_date")), meta=meta, enriched=True)
     stats["enriched"] += 1
 
 
@@ -234,27 +241,25 @@ def _trailer_key(data: dict[str, Any]) -> str | None:
 # ── artists (MusicBrainz + Last.fm) ──────────────────────────────────
 
 
-def _artist(conn, cfg, item_id, title, ids_map, eff, stats) -> None:
-    name = title or ids.parse(item_id)[2]
-    mbid = ids_map.get("mbid")
+def _artist(conn, cfg, item_id, title, idents, eff, stats) -> None:
+    name = title or idents.get("name")
+    mbid = idents.get("mbid")
     if not mbid:
+        if not name:
+            raise LookupError("artist has neither mbid nor name")
         hit = _mb_search_artist(name)
         if hit is None:
-            # No confident MB match: enrich the fallback item from
+            # No confident MB match: enrich the name-only item from
             # Last.fm alone so it still leaves the queue.
             meta = _lastfm_artist_meta(cfg, None, name)
             image = _deezer_artist_image(name)
             if image:
                 meta["image"] = image
-            db.upsert_item(conn, item_id, "artist", meta=meta, enriched=True)
+            db.upsert_item_fields(conn, item_id, meta=meta, enriched=True)
             stats["enriched"] += 1
             return
         mbid = hit["id"]
-        canonical = ids.make("artist", "mbid", mbid)
-        if canonical != item_id:
-            db.merge_item(conn, item_id, canonical)
-            stats["merged"] += 1
-            item_id = eff["id"] = canonical
+        item_id = _attach(conn, "artist", item_id, "mbid", mbid, eff, stats)
     data = http.get_json(f"{MB}/artist/{mbid}",
                          params={"inc": "tags+genres+aliases", "fmt": "json"})
     # Some artists carry hundreds of locale aliases; 30 covers every real
@@ -272,18 +277,18 @@ def _artist(conn, cfg, item_id, title, ids_map, eff, stats) -> None:
         # already-fetched marker, sparing a 1.1s MB round-trip per artist
         "aliases": alias_names,
     }
-    # Bridge before the enriched write: a merged-in fallback twin drags
+    # Bridge before the enriched write: a merged-in name-keyed twin drags
     # its stale title/meta along, and MB's authoritative values must land
     # last so they win the upsert merge.
-    _bridge_artist_aliases(conn, item_id, [data.get("name") or name, *alias_names], stats)
-    db.upsert_item(conn, item_id, "artist", title=data.get("name"),
-                   ids={**ids_map, "mbid": mbid}, meta=meta, enriched=True)
+    item_id = _bridge_artist_aliases(
+        conn, item_id, [data.get("name") or name, *alias_names], eff, stats)
+    db.upsert_item_fields(conn, item_id, title=data.get("name"), meta=meta, enriched=True)
     lf = _lastfm_artist_meta(cfg, mbid, data.get("name") or name)
     image = _deezer_artist_image(data.get("name") or name)
     if image:
         lf["image"] = image
     if lf:
-        db.upsert_item(conn, item_id, "artist", meta=lf)
+        db.upsert_item_fields(conn, item_id, meta=lf)
     stats["enriched"] += 1
 
 
@@ -314,43 +319,28 @@ def _mb_search_artist(name: str) -> dict[str, Any] | None:
     return None
 
 
-def _bridge_artist_aliases(conn, canonical: str, names: list[str],
-                           stats: dict[str, int]) -> None:
-    """Point every spelling MB knows for this artist at its canonical mbid
-    item. Cross-script variants (romaji vs kana/kanji) mint different
-    fallback ids that normalize_key cannot fold, so the alias list is the
-    only bridge: a fallback twin that already accumulated events (months
-    of romaji scrobbles) merges in now, and the item_aliases row makes any
-    future encounter of that spelling land on the canonical id on arrival.
-    dedupe.py runs the same registration offline for pre-existing stores.
-    """
-    fallback_ids = set()
+def _bridge_artist_aliases(conn, item_id: int, names: list[str],
+                           eff, stats: dict[str, int]) -> int:
+    """Teach the mbid item every spelling MB knows for it. Cross-script
+    variants (romaji vs kana/kanji) arrive as different name identities
+    that normalize_key cannot fold, so the alias list is the only bridge:
+    a name-keyed twin that already accumulated events (months of romaji
+    scrobbles) merges in now, and the identity row makes any future
+    encounter of that spelling land on this item on arrival. A spelling
+    claimed by a name-only twin merges the two; one claimed by another
+    artist with its OWN mbid is refused and counted as a conflict — MB
+    alias lists carry other entities' names (The Kinks list "The Ravens"),
+    and a shared spelling between two authoritative entities is proof of
+    difference, not sameness. dedupe.py runs the same registration offline
+    for pre-existing stores."""
     for raw in names:
-        if not raw or not isinstance(raw, str):
+        # aliases are stored raw; attach_identity normalizes on write, so
+        # this is exactly the identity a collector would mint for that
+        # spelling. Names folding to nothing can never be looked up.
+        if not raw or not isinstance(raw, str) or not ids.normalize_key(raw):
             continue
-        try:
-            # aliases are stored raw; ids.make is the normalizer, so this
-            # is exactly the id a collector would mint for that spelling
-            fallback_ids.add(ids.make("artist", "lastfm", raw))
-        except ValueError:
-            continue  # name normalizes to nothing
-    fallback_ids.discard(canonical)
-    for fid in sorted(fallback_ids):  # deterministic conflict attribution
-        row = conn.execute(
-            "SELECT canonical_id FROM item_aliases WHERE alias_id=?", (fid,)).fetchone()
-        if row is not None:
-            if row["canonical_id"] != canonical:
-                # first-writer-wins: two artists genuinely sharing a
-                # spelling would ping-pong the mapping forever otherwise
-                stats["alias_conflicts"] += 1
-            continue
-        if conn.execute("SELECT 1 FROM items WHERE id=?", (fid,)).fetchone() is not None:
-            db.merge_item(conn, fid, canonical)  # records the alias row itself
-            stats["merged"] += 1
-        else:
-            conn.execute(
-                "INSERT OR IGNORE INTO item_aliases (alias_id, canonical_id) VALUES (?,?)",
-                (fid, canonical))
+        item_id = _attach(conn, "artist", item_id, "name", raw, eff, stats)
+    return item_id
 
 
 def _lastfm_artist_meta(cfg: Config, mbid: str | None, name: str | None) -> dict[str, Any]:
@@ -410,14 +400,14 @@ def _deezer_artist_image(name: str) -> str | None:
 # ── albums / tracks (MusicBrainz) ────────────────────────────────────
 
 
-def _release_or_recording(conn, item_id, domain, title, ids_map, meta, stats) -> None:
-    mbid = ids_map.get("mbid")
+def _release_or_recording(conn, item_id, domain, title, idents, meta, eff, stats) -> None:
+    mbid = idents.get("mbid")
     if domain == "album" and mbid and (not title or not meta.get("tags")):
         # Albums rank and actuate in their own slots now, so unlike
         # tracks they earn a real lookup. Missing tags also qualifies
         # so rows fast-stamped before albums ranked get upgraded when
         # requeued; titled+tagged albums stay on the cheap path below.
-        _album(conn, item_id, mbid, ids_map, stats)
+        _album(conn, item_id, mbid, eff, stats)
         return
     if not mbid or title:
         # Tracks feed artist aggregation, not ranking, and the
@@ -425,7 +415,7 @@ def _release_or_recording(conn, item_id, domain, title, ids_map, meta, stats) ->
         # at the mandatory 1.1s spacing turns a first Last.fm sync (10k+
         # tracks) into hours of grind for metadata nothing consumes —
         # only title-less mbid items are worth the round-trip.
-        db.upsert_item(conn, item_id, domain, enriched=True)
+        db.upsert_item_fields(conn, item_id, enriched=True)
         stats["skipped"] += 1
         return
     data = http.get_json(f"{MB}/recording/{mbid}",
@@ -434,17 +424,18 @@ def _release_or_recording(conn, item_id, domain, title, ids_map, meta, stats) ->
         "artists": _credit_names(data),
         "tags": _top_tag_names(data.get("tags")),
     }
-    db.upsert_item(conn, item_id, domain, title=data.get("title"),
-                   year=_year(data.get("date") or data.get("first-release-date")),
-                   meta=meta, enriched=True)
+    db.upsert_item_fields(conn, item_id, title=data.get("title"),
+                          year=_year(data.get("date") or data.get("first-release-date")),
+                          meta=meta, enriched=True)
     stats["enriched"] += 1
 
 
-def _album(conn, item_id, mbid, ids_map, stats) -> None:
-    # An album mbid is a RELEASE-GROUP id — that is the namespace
+def _album(conn, item_id, mbid, eff, stats) -> None:
+    # An album mbid should be a RELEASE-GROUP id — that is the namespace
     # Lidarr's foreignAlbumId speaks, and it carries the first-release
     # date instead of one pressing's date.
     rg_params = {"inc": "artist-credits+tags+genres", "fmt": "json"}
+    rg_id = mbid
     try:
         data = http.get_json(f"{MB}/release-group/{mbid}", params=rg_params)
     except http.ApiError as exc:
@@ -458,13 +449,13 @@ def _album(conn, item_id, mbid, ids_map, stats) -> None:
         rg_id = ((rel or {}).get("release-group") or {}).get("id")
         if not rg_id:
             raise  # true double-404 (or group-less release): permanent
-        canonical = ids.make("album", "mbid", rg_id)
-        if canonical != item_id:
-            db.merge_item(conn, item_id, canonical)
-            stats["merged"] += 1
-            item_id = canonical
-        mbid = rg_id
-        ids_map = {**ids_map, "mbid": rg_id}
+        # The release mbid identity stays (collectors will hand it over
+        # again) and the group id is attached as a second mbid key, so
+        # either id lands on this item on arrival. identities_of returns
+        # the FIRST mbid by rowid — the original release id — so the
+        # group id actuation needs travels in meta.release_group_mbid
+        # below, which apply reads before falling back to identities.
+        item_id = _attach(conn, "album", item_id, "mbid", rg_id, eff, stats)
         data = http.get_json(f"{MB}/release-group/{rg_id}", params=rg_params)
     artists = _credit_names(data)
     meta = {
@@ -472,20 +463,23 @@ def _album(conn, item_id, mbid, ids_map, stats) -> None:
         "tags": _top_tag_names(data.get("tags")),
         "genres": _top_tag_names(data.get("genres"), cap=None),
         "type": data.get("primary-type"),
+        "release_group_mbid": rg_id,
         # Stored unprobed: CAA 404s for coverless groups, but the UI
         # paints the monogram under the image, so a dead URL costs
         # nothing while probing would cost a round-trip per album.
-        "image": f"{CAA}/release-group/{mbid}/front-250",
+        "image": f"{CAA}/release-group/{rg_id}/front-250",
     }
     if artists:
         meta["artist"] = artists[0]
-    new_ids = {**ids_map, "mbid": mbid}
     artist_mbid = _credit_artist_mbid(data)
     if artist_mbid:
-        new_ids["artist_mbid"] = artist_mbid  # lets actuation add the artist to Lidarr too
-    db.upsert_item(conn, item_id, "album", title=data.get("title"),
-                   year=_year(data.get("first-release-date")),
-                   ids=new_ids, meta=meta, enriched=True)
+        # a relation to another item, not a name of this one, so it lives
+        # in meta (lets actuation add the artist to Lidarr too) — never
+        # in identities.
+        meta["artist_mbid"] = artist_mbid
+    db.upsert_item_fields(conn, item_id, title=data.get("title"),
+                          year=_year(data.get("first-release-date")),
+                          meta=meta, enriched=True)
     stats["enriched"] += 1
 
 
