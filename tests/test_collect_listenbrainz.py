@@ -285,3 +285,51 @@ def test_rerun_is_idempotent_and_refreshes_last_seen(conn, cfg, monkeypatch):
 def test_missing_user_skips(conn, tmp_path):
     cfg = C._build({"core": {"data_dir": str(tmp_path)}})
     assert listenbrainz.sync(conn, cfg) == {"skipped": "listenbrainz not configured"}
+
+
+def test_cf_artist_flush_survives_mid_loop_merge(conn, cfg, monkeypatch):
+    """First recording credits its artist by bare name; the second carries
+    the mbid plus the same spelling, so the attach merges the name-keyed
+    item away mid-loop. The post-loop flush must re-resolve the external
+    ref instead of writing a candidate against the deleted item id."""
+    rec_1 = "12121212-1212-4121-8121-121212121212"
+    rec_2 = "34343434-3434-4343-8343-343434343434"
+    artist_mb = "56565656-5656-4565-8565-565656565656"
+    cf = {"payload": {"mbids": [
+        {"recording_mbid": rec_1, "score": 0.4},
+        {"recording_mbid": rec_2, "score": 0.9},
+    ]}}
+    metadata = {
+        rec_1: {"recording": {"name": "Song 1"},
+                "artist": {"name": "Twinly", "artists": []}},
+        rec_2: {"recording": {"name": "Song 2"},
+                "artist": {"name": "Twinly",
+                           "artists": [{"artist_mbid": artist_mb, "name": "Twinly"}]}},
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/1/cf/recommendation/user/alice/recording":
+            return httpx.Response(200, json=cf)
+        if path == "/1/metadata/recording/":
+            return httpx.Response(200, json=metadata)
+        if path == "/1/user/alice/playlists/createdfor":
+            return httpx.Response(200, json={"playlists": []})
+        return httpx.Response(404)
+
+    install(monkeypatch, handler)
+    stats = listenbrainz.sync(conn, cfg)
+
+    assert stats["cf_tracks"] == 2
+    # the name-minted twin merged into the mbid holder: one artist item
+    survivor = db.lookup_item(conn, "artist", "mbid", artist_mb)
+    assert survivor is not None
+    assert db.lookup_item(conn, "artist", "name", "Twinly") == survivor
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM items WHERE domain='artist'").fetchone()["c"] == 1
+    # exactly one artist candidate row, on the survivor, at the max score
+    rows = conn.execute(
+        "SELECT * FROM candidates WHERE source='listenbrainz_cf_artist'").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["item_id"] == survivor
+    assert rows[0]["external_score"] == pytest.approx(0.9)

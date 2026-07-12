@@ -438,6 +438,56 @@ def test_pbr_rows_become_precise_events(tmp_path):
     assert db.pget_state(conn, "default", "jellyfin:track_plays:t1") == "9"
 
 
+def test_stale_artist_credit_chases_merged_survivor(tmp_path):
+    """The audio pass caches jf-artist-id → item ints up front; resolving a
+    later artist (mbid + the same spelling) merges an earlier name-only one
+    away mid-loop. A track credited to the first artist must not crash on
+    the stale int — the scrobble chases the jellyfin identity, which the
+    merge repointed at the survivor."""
+    conn = db.connect(tmp_path / "t.db")
+    state = server_state()
+    state["pbr_available"] = False
+    mbid2 = "f22942a1-6f70-4f48-866e-238cb2308fbd"
+    state["library"] = []
+    state["episodes"] = []
+    # a3 carries no mbid; a4 holds one AND the same spelling, so resolving
+    # a4 merges a3's freshly-minted name-keyed item into the mbid holder
+    state["by_id"] = {
+        "a3": {"Id": "a3", "Type": "MusicArtist", "Name": "Aphex Twin",
+               "ProviderIds": {}},
+        "a4": {"Id": "a4", "Type": "MusicArtist", "Name": "Aphex Twin",
+               "ProviderIds": {"MusicBrainzArtist": mbid2}},
+    }
+    state["audio"] = [
+        {"Id": "t8", "Type": "Audio", "Name": "Xtal", "Album": "SAW 85-92",
+         "ArtistItems": [{"Id": "a3", "Name": "Aphex Twin"}],
+         "UserData": {"PlayCount": 1, "LastPlayedDate": "2024-06-05T10:00:00.0000000Z"}},
+        {"Id": "t9", "Type": "Audio", "Name": "Ageispolis", "Album": "SAW 85-92",
+         "ArtistItems": [{"Id": "a4", "Name": "Aphex Twin"}],
+         "UserData": {"PlayCount": 1, "LastPlayedDate": "2024-06-06T10:00:00.0000000Z"}},
+    ]
+
+    stats = jellyfin.sync(conn, make_cfg(tmp_path), transport=make_transport(state))
+
+    survivor = db.lookup_item(conn, "artist", "mbid", mbid2)
+    assert survivor is not None
+    # one artist item left; the spelling and BOTH jellyfin ids point at it
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM items WHERE domain='artist'").fetchone()["c"] == 1
+    assert db.lookup_item(conn, "artist", "name", "Aphex Twin") == survivor
+    assert db.lookup_item(conn, "artist", "jellyfin", "a3") == survivor
+    assert db.lookup_item(conn, "artist", "jellyfin", "a4") == survivor
+    # the stale-credited track's scrobble landed on the survivor, none lost
+    rows = conn.execute(
+        "SELECT item_id, dedup FROM events WHERE kind='scrobble'").fetchall()
+    assert {r["dedup"] for r in rows} == {"t8", "t9"}
+    assert all(r["item_id"] == survivor for r in rows)
+    assert stats["scrobbles"] == 2
+    # cursors advanced under the survivor: the re-sync stays a noop
+    stats2 = jellyfin.sync(conn, make_cfg(tmp_path), transport=make_transport(state))
+    assert stats2["scrobbles"] == 0
+
+
 # ── multi-profile ────────────────────────────────────────────────────
 
 

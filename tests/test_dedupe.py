@@ -375,3 +375,110 @@ def test_attach_authoritative_key_still_merges(conn):
     assert winner == by_tmdb
     assert gone(conn, by_imdb)
     assert db.identities_of(conn, by_tmdb)["imdb"] == "tt0133093"
+
+
+def add_rec(conn, item_id, status, run_id):
+    conn.execute(
+        "INSERT INTO recommendations (profile, run_id, ts, domain, item_id, score, status)"
+        " VALUES ('default', ?, ?, 'movie', ?, 0.5, ?)",
+        (run_id, db.now(), item_id, status))
+
+
+def recs(conn, item_id):
+    return [(r["status"], r["run_id"]) for r in conn.execute(
+        "SELECT status, run_id FROM recommendations WHERE item_id=? ORDER BY id", (item_id,))]
+
+
+def item_year(conn, item_id):
+    return conn.execute("SELECT year FROM items WHERE id=?", (item_id,)).fetchone()["year"]
+
+
+def test_empty_key_is_refused_at_both_write_paths(conn):
+    """A key that folds to nothing must raise, never resolve: a shared ''
+    identity row would fuse every blank-named item into one."""
+    iid = db.resolve_item(conn, "artist", "mbid", MBID, title=KANA)
+    for key in ("", "  ", "　"):  # empty, spaces, ideographic space
+        with pytest.raises(ValueError):
+            db.resolve_item(conn, "artist", "name", key)
+        with pytest.raises(ValueError):
+            db.attach_identity(conn, iid, "name", key)
+
+
+def test_attach_jellyfin_between_authoritative_items_moves_the_pointer(conn):
+    """A jellyfin key is a library pointer, not an immutable identity: when
+    the entry is retagged from movie A to movie B (each holding its own
+    tmdb id), the pointer MOVES — no merge, A survives, and the events it
+    earned under the old identification stay put."""
+    a = db.resolve_item(conn, "movie", "tmdb", "1", title="A")
+    db.attach_identity(conn, a, "jellyfin", "jf-1")
+    db.add_event(conn, "2026-01-01T00:00:00Z", a, "play", 1.0, "jellyfin")
+    b = db.resolve_item(conn, "movie", "tmdb", "2", title="B")
+
+    assert db.attach_identity(conn, b, "jellyfin", "jf-1") == b
+
+    assert db.lookup_item(conn, "movie", "jellyfin", "jf-1") == b
+    assert not gone(conn, a) and not gone(conn, b)
+    assert event_items(conn) == [a]
+    assert db.identities_of(conn, a)["tmdb"] == "1"
+
+
+def test_attach_jellyfin_still_merges_pending_item(conn):
+    """The enrichment path stays a merge: a jellyfin-only item (no
+    authoritative id yet) holding the key IS the same entry, so the tmdb
+    holder attaching that key absorbs it, events included."""
+    a = db.resolve_item(conn, "movie", "jellyfin", "jf-1", title="A")
+    db.add_event(conn, "2026-01-01T00:00:00Z", a, "play", 1.0, "jellyfin")
+    b = db.resolve_item(conn, "movie", "tmdb", "2", title="B")
+
+    assert db.attach_identity(conn, b, "jellyfin", "jf-1") == b
+
+    assert gone(conn, a)
+    assert event_items(conn) == [b]
+    assert db.lookup_item(conn, "movie", "jellyfin", "jf-1") == b
+
+
+def test_merge_keeps_losers_approved_rec_over_winners_proposal(conn):
+    """When a merge folds two open recommendations onto one item, the
+    user's verdict outranks the standing proposal: the winner's proposed
+    row must yield so the loser's approved one is not IGNOREd away."""
+    winner = db.resolve_item(conn, "movie", "tmdb", "603", title="The Matrix")
+    loser = db.resolve_item(conn, "movie", "imdb", "tt0133093", title="The Matrix")
+    add_rec(conn, winner, "proposed", "run-w")
+    add_rec(conn, loser, "approved", "run-l")
+
+    db.merge_items(conn, loser, winner)
+
+    assert recs(conn, winner) == [("approved", "run-l")]
+    assert recs(conn, loser) == []
+
+
+def test_merge_keeps_winners_approved_rec_over_losers_proposal(conn):
+    """Same rule, verdict on the other side: the winner's approved row
+    stands and the loser's proposal is the one that dies."""
+    winner = db.resolve_item(conn, "movie", "tmdb", "603", title="The Matrix")
+    loser = db.resolve_item(conn, "movie", "imdb", "tt0133093", title="The Matrix")
+    add_rec(conn, winner, "approved", "run-w")
+    add_rec(conn, loser, "proposed", "run-l")
+
+    db.merge_items(conn, loser, winner)
+
+    assert recs(conn, winner) == [("approved", "run-w")]
+    assert recs(conn, loser) == []
+
+
+def test_merge_keeps_winners_year(conn):
+    winner = db.resolve_item(conn, "movie", "tmdb", "603", title="The Matrix", year=1999)
+    loser = db.resolve_item(conn, "movie", "imdb", "tt0133093", title="The Matrix", year=2001)
+
+    db.merge_items(conn, loser, winner)
+
+    assert item_year(conn, winner) == 1999
+
+
+def test_merge_fills_winners_null_year_from_loser(conn):
+    winner = db.resolve_item(conn, "movie", "tmdb", "603", title="The Matrix")
+    loser = db.resolve_item(conn, "movie", "imdb", "tt0133093", title="The Matrix", year=2001)
+
+    db.merge_items(conn, loser, winner)
+
+    assert item_year(conn, winner) == 2001

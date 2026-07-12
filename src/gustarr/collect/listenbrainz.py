@@ -87,7 +87,10 @@ def _sync_cf(conn: sqlite3.Connection, profile: str, user: str, headers: dict[st
 
     metadata = _fetch_metadata(list(scores), headers)
     ts = db.now()
-    artist_best: dict[int, float] = {}
+    # keyed by the stable external ref, not the item id: a later row's
+    # attach can merge an earlier artist away, and a stale int would make
+    # the post-loop upsert write against a deleted item
+    artist_best: dict[tuple[str, str], tuple[str | None, float]] = {}
     # release mbid → (title, artist name, artist mbid, best track score):
     # several CF tracks off one record are a stronger album signal than any
     # single track, so the album inherits the max.
@@ -111,9 +114,10 @@ def _sync_cf(conn: sqlite3.Connection, profile: str, user: str, headers: dict[st
         stats["cf_tracks"] += 1
         numeric = float(score) if isinstance(score, (int, float)) else 0.0
         if artist_id is not None:
-            prev = artist_best.get(artist_id)
-            if prev is None or numeric > prev:
-                artist_best[artist_id] = numeric
+            ref = ("mbid", artist_mbid) if artist_mbid else ("name", artist_name or "")
+            prev = artist_best.get(ref)
+            if prev is None or numeric > prev[1]:
+                artist_best[ref] = (artist_name, numeric)
         if release.get("mbid") and release.get("name"):
             # LB hands back RELEASE mbids, not release-groups; store as-is,
             # enrich owns upgrading them to the release-group Lidarr wants.
@@ -122,7 +126,9 @@ def _sync_cf(conn: sqlite3.Connection, profile: str, user: str, headers: dict[st
                 album_best[release["mbid"]] = (release["name"], artist_name,
                                                artist_mbid, numeric)
 
-    for artist_id, best in artist_best.items():
+    for (ns, key), (artist_name, best) in artist_best.items():
+        # re-resolve at flush: the loop's merges may have repointed the ref
+        artist_id = db.resolve_item(conn, "artist", ns, key, title=artist_name)
         _upsert_candidate(conn, profile, artist_id, "listenbrainz_cf_artist", best, ts)
         stats["cf_artists"] += 1
 

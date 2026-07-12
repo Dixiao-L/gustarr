@@ -519,6 +519,53 @@ def test_rejected_artist_stays_excluded_when_mbid_appears(conn, cfg, router):
     assert ev["item_id"] == winner
 
 
+def test_refused_name_attach_does_not_inherit_rejection(conn, cfg, router):
+    """Last.fm names a NEW artist (own mbid) with a spelling a rejected
+    artist already holds. Both sides are authoritative, so the attach is
+    refused — the newcomer must enter the pool, not be swallowed by the
+    reject. A rejected name-only twin, by contrast, genuinely merges in,
+    and its exclusion must follow the winner."""
+    mb = "5b11f4ce-a62d-471e-81fc-a69a8278c7da"
+    seed = db.resolve_item(conn, "artist", "mbid", mb, title="Nirvana")
+    db.add_event(conn, iso(1), seed, "loved", 1.0, "lastfm")
+    # rejected artist with its own mbid AND the contested spelling
+    rejected = db.resolve_item(conn, "artist", "mbid", "m2", title="Bush")
+    db.attach_identity(conn, rejected, "name", "Bush")
+    db.add_event(conn, iso(2), rejected, "reject", -1.0, "user")
+    # rejected name-only twin: no authoritative id of its own
+    twin = db.resolve_item(conn, "artist", "name", "Lush", title="Lush")
+    db.add_event(conn, iso(3), twin, "reject", -1.0, "user")
+
+    def similar(params):
+        if params["limit"] == 20:  # hop-2 serendipity fan-out, covered elsewhere
+            return {"similarartists": {"artist": []}}
+        assert params.get("mbid") == mb
+        return {"similarartists": {"artist": [
+            {"name": "Bush", "mbid": "m1", "match": "0.8"},
+            {"name": "Lush", "mbid": "m3", "match": "0.6"},
+        ]}}
+
+    router.route("lastfm:artist.getsimilar", similar)
+    stats = run(conn, cfg, domain="artist")
+
+    rows = candidate_rows(conn)
+    # refused attach: the spelling stays with its owner, the newcomer
+    # keeps only its mbid and still becomes a candidate
+    newcomer = item(conn, "artist", "mbid", "m1")
+    assert newcomer != rejected
+    assert (newcomer, "lastfm_similar") in rows
+    assert db.identities_of(conn, newcomer) == {"mbid": "m1"}
+    assert db.lookup_item(conn, "artist", "name", "Bush") == rejected
+    assert not any(k[0] == rejected for k in rows)
+    # merged twin: its reject followed the winner and blocks the pool
+    winner = item(conn, "artist", "mbid", "m3")
+    assert conn.execute("SELECT 1 FROM items WHERE id=?", (twin,)).fetchone() is None
+    assert db.lookup_item(conn, "artist", "name", "Lush") == winner
+    assert not any(k[0] == winner for k in rows)
+    assert stats["new"] == {"lastfm_similar": 1}
+    assert stats["skipped"] == 1
+
+
 # ── top albums ───────────────────────────────────────────────────────
 
 

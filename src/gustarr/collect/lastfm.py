@@ -16,7 +16,7 @@ from typing import Any, Iterator
 
 import httpx
 
-from .. import db
+from .. import db, ids
 from ..http import get_json
 from ..signals import WEIGHTS
 
@@ -91,8 +91,11 @@ def _resolve_pair(conn: sqlite3.Connection, t: dict) -> tuple[int, int]:
         track_id = db.resolve_item(conn, "track", "mbid", track_mbid,
                                    title=track_name or None, meta=meta)
     elif artist_name and track_name:
-        # the artist name disambiguates covers; normalize_key folds spacing
-        track_id = db.resolve_item(conn, "track", "name", f"{artist_name} {track_name}",
+        # the artist name disambiguates covers; the unit separator keeps
+        # the artist/title boundary so shifted splits can't collide, and
+        # matches the keys v2 stores migrated in with
+        track_id = db.resolve_item(conn, "track", "name",
+                                   f"{artist_name}{ids.SEP}{track_name}",
                                    title=track_name, meta=meta)
     else:
         raise ValueError("row has no track mbid or name")

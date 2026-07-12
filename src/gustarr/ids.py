@@ -13,6 +13,10 @@ import unicodedata
 
 DOMAINS = ("movie", "series", "artist", "album", "track")
 
+# Multipart-key separator (tracks: artist SEP title). Never occurs in
+# artist or track names; normalize_key preserves it as a part boundary.
+SEP = "\x1f"
+
 # Authority order per domain, strongest first. When identities of two
 # namespaces claim the same item during a merge, the holder of the
 # stronger namespace wins; an item whose identities include none of the
@@ -35,5 +39,13 @@ def normalize_key(s: str) -> str:
     vs romaji is a different *script*, not a width/case variant — those
     are bridged by MusicBrainz aliases arriving as extra 'name'
     identities, not folded here.
+
+    The unit separator (\\x1f) survives as a part boundary: track name
+    keys are "artist\\x1ftitle", and folding it into a space would let
+    two different tracks collide whenever the artist/title split shifts
+    ("A B"+"C" vs "A"+"B C"). Python counts \\x1f as whitespace, hence
+    the explicit part-wise fold.
     """
-    return " ".join(unicodedata.normalize("NFKC", s).casefold().split())
+    parts = [" ".join(unicodedata.normalize("NFKC", part).casefold().split())
+             for part in s.split(SEP)]
+    return SEP.join(parts) if any(parts) else ""
