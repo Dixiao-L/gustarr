@@ -1,0 +1,47 @@
+name: Bug report
+description: Something is broken or behaving unexpectedly
+labels: ["bug"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Gustarr version
+      description: "`gustarr --version`, the Docker tag, or the flake rev"
+      placeholder: "0.3.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How is it running?
+      options:
+        - Docker / compose
+        - NixOS module
+        - pip / uv install
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: >
+        Output from the failing command or unit (journalctl / docker logs).
+        Please strip API keys — config values resolved from env never appear
+        in logs, but paste carefully anyway.
+      render: text
+  - type: textarea
+    id: config
+    attributes:
+      label: Config shape (secrets removed)
+      description: >
+        The structure of your TOML helps a lot — which sections, which
+        profiles, autonomy modes. Replace every key/token with `…`.
+      render: toml

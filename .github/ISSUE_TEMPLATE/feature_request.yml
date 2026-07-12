@@ -1,0 +1,23 @@
+name: Feature request
+description: An idea that would make Gustarr more useful
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: >
+        The situation you're in, before any particular solution — this is
+        the most useful part.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What could it look like?
+      description: Optional — a rough sketch of the behaviour you'd want.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Workarounds you've tried
+      description: Optional.
