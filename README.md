@@ -10,15 +10,16 @@ autonomy) drives Sonarr / Radarr / Lidarr. Music, TV, movies.**
 
 ## Why Gustarr
 
-Built after a survey of the existing ecosystem found no mature project that
-genuinely learns an *individual* user's taste: request portals
-(Jellyseerr/Ombi) have no learning, "AI" recommenders are LLM-prompt wrappers,
-and collaborative filtering engines (Gorse) structurally need a user
-*population*. Gustarr adopts the mature periphery — TMDb/MusicBrainz metadata,
-ListenBrainz's open collaborative filtering, Jellyfin Playback Reporting — and
-builds only the missing core: a content-embedding taste model with a small
-learned preference head, which stays useful from ~50 interactions where
-classic CF collapses, and scores brand-new releases from metadata alone.
+Gustarr focuses on a gap in the self-hosted ecosystem: learning an
+*individual* person's taste from their own history. Request portals solve a
+different problem (multi-user request management), and collaborative
+filtering needs a large user population to work. Gustarr instead builds on
+content embeddings with a small per-person preference head — an approach
+that becomes useful from roughly 50 interactions and can score brand-new
+releases from metadata alone. It reuses mature building blocks wherever
+they exist — TMDb and MusicBrainz metadata, ListenBrainz's open
+collaborative filtering, Jellyfin's Playback Reporting — and implements
+only the taste-learning piece itself.
 Households get one such model per person ([profiles](#profiles)), never a
 population average.
 
@@ -51,11 +52,12 @@ population average.
   model nothing and the item comes back after 30 days. Rejected by mistake?
   Forgiving deletes the reject event so training stops penalising the item.
 - **Unix philosophy.** Atomic subcommands (`sync`, `enrich`, `candidates`,
-  `embed`, `train`, `rank`, `apply`), one shared SQLite store, no daemons
-  except the optional web UI. Composition is `gustarr run nightly|weekly` or
+  `embed`, `train`, `rank`, `apply`, `dedupe`), one shared SQLite store, no
+  daemons except the optional web UI and the optional `gustarr schedule`
+  clock process. Composition is `gustarr run nightly|weekly` or
   your own cron/systemd timers.
-- **First-class NixOS module** with hardened systemd timers, agenix-friendly
-  secrets, and optional GPU passthrough — plus Docker and plain pip/uv installs.
+- **NixOS module** with systemd timers, `EnvironmentFile=` secrets, and
+  optional GPU — plus Docker and plain pip/uv installs.
 - **Grafana-ready stats.** `GET /api/stats` (same JSON as `gustarr stats`)
   exposes event counts, queue states, model freshness, embedding coverage and
   the diversity metrics — scrape it with Telegraf/Prometheus and graph your
@@ -104,19 +106,28 @@ $ cp gustarr.example.toml gustarr.toml     # set [web] bind = "0.0.0.0:8790",
 $                                          # [model] device = "cpu", and
 $                                          # [scheduler] nightly = "04:30"
 $ cat > gustarr.env <<'EOF'
+JELLYFIN_API_KEY=...
 TMDB_API_KEY=...
 LASTFM_API_KEY=...
 SONARR_API_KEY=...
+RADARR_API_KEY=...
+LIDARR_API_KEY=...
 EOF
-$ docker compose up -d gustarr             # web UI on :8790 — that's it
+$ docker compose up -d                     # web UI on :8790 + the scheduler
 ```
+
+`gustarr.env` must define every `env:VAR` the TOML references — the example
+TOML uses all six keys above; or delete the sections for services you don't
+run — unset `env:` references fail fast on purpose. `docker compose up -d`
+starts both services: the web UI and the scheduler.
 
 With `[scheduler] nightly = "HH:MM"` set, the scheduler service (a dedicated
 `gustarr schedule` process from the same image — the web UI never runs the
-pipeline) fires it every night; no host cron needed. Kick a run manually with
-the UI's **Run Now**, or `docker compose run --rm gustarr run nightly`. The
-image ships CPU-only torch (works everywhere, ~2 GB); GPU embedding is what
-the NixOS module is for. See [docs/deployment.md](docs/deployment.md).
+pipeline) fires it every night; no host cron needed. The scheduler also
+watches for the web UI's **Run Now** button, so a manual kick works too —
+or use `docker compose run --rm gustarr run nightly`. The image ships
+CPU-only torch (works everywhere, ~2 GB); GPU embedding is what the NixOS
+module is for. See [docs/deployment.md](docs/deployment.md).
 
 ### 2. pip / uv
 
@@ -134,13 +145,23 @@ $ uv run gustarr web             # or approve in the browser at 127.0.0.1:8790
 ```
 
 `pip install .[ml]` works the same way if you're not a uv person. Schedule
-`gustarr run nightly` with cron/systemd, or set `[scheduler] nightly` and let
-`gustarr web` do it.
+`gustarr run nightly` with cron/systemd, or set `[scheduler] nightly` and run
+`gustarr schedule` alongside.
+
+One more command worth knowing: `gustarr dedupe` merges items that are the
+same thing under different spellings — the same CJK artist arriving
+romanized from one source and in kana/kanji from another otherwise splits
+one person's history across duplicate items. It re-normalizes name-keyed
+ids and folds MusicBrainz alias spellings into the canonical artist; add
+`--fetch` to pull missing alias lists from MusicBrainz (rate-limited,
+capped by `--limit`). Not a pipeline stage — run it once after upgrading
+Gustarr or after importing history from a new source; every pass is
+idempotent.
 
 ### 3. NixOS flake module
 
-What the author runs in production: hardened systemd timers, agenix secrets,
-GPU embedding.
+Runs the pipeline on systemd timers; secrets come from any
+`EnvironmentFile=` source; GPU embedding works out of the box.
 
 ```nix
 {
@@ -166,7 +187,7 @@ GPU embedding.
 }
 ```
 
-This gives you hardened oneshot systemd timers (`gustarr-nightly`,
+This sets up oneshot systemd timers (`gustarr-nightly`,
 `gustarr-weekly`), the web UI as a service, state in `/var/lib/gustarr`, and
 secrets exclusively via `EnvironmentFile=` — the generated TOML never contains
 key material. Full option reference in [docs/deployment.md](docs/deployment.md).
@@ -223,7 +244,7 @@ resolved from the environment at load time, so the file is safe to commit.
 | `[autonomy]` | `music_mode` | `"auto"` | `auto` or `queue` |
 | `[autonomy]` | `video_mode` | `"queue"` | `auto` or `queue` |
 | `[autonomy]` | `music_max_artists_per_week` | `3` | auto-add budget |
-| `[autonomy]` | `music_max_albums_per_week` | `10` | reserved for future album recs |
+| `[autonomy]` | `music_max_albums_per_week` | `10` | weekly auto-add budget for album recs |
 | `[autonomy]` | `video_queue_max_pending` | `20` | queue cap (and auto-mode per-run cap) |
 | `[autonomy]` | `proposal_ttl_days` | `30` | stale proposals expire |
 | `[model]` | `embed_model` | `"BAAI/bge-m3"` | any sentence-transformers model |
@@ -295,6 +316,14 @@ filtering feeds the music candidate pool (raw CF recs plus your "Weekly
 Exploration" playlist), which carries the music side through cold start. Reads
 are anonymous — a token only lifts rate limits.
 
+**What does the web UI talk to besides Gustarr?** Your browser loads
+poster and portrait images directly from TMDb- and Deezer-hosted URLs,
+queries the keyless iTunes Search API for artist previews (the query is
+just the artist name) and streams the returned Apple-hosted audio clips,
+and trailer/preview-fallback buttons link out to YouTube. No API keys or
+personal data are sent — the Gustarr server never proxies these, and
+everything else (approve/reject, settings, stats) stays on your host.
+
 **Does it delete things from my *arrs?** No. Gustarr tags everything it adds
 (default tag: `gustarr`) and never removes or modifies anything that doesn't
 carry that tag.
@@ -305,9 +334,9 @@ prefer the NixOS module (or install CUDA wheels in a venv).
 
 ## Screenshots
 
-Screenshots of the approval queue, trailer/preview cards and the settings
-panel live in [`docs/screenshots/`](docs/screenshots/). *(Placeholder:
-maintainers drop PNGs there — the directory ships empty in source checkouts.)*
+None yet — the approval queue, trailer/preview cards and the settings panel
+are best seen live (the Docker quickstart above takes about two minutes).
+Screenshot contributions are welcome.
 
 ## Documentation
 

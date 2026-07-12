@@ -60,8 +60,8 @@ Values are validated and coerced (`"3"` → `3`, `"true"` → `true`);
 one store, one set of caps and budgets, shared by every profile — the web
 UI's settings dialog says so out loud. Everything else requires editing the
 TOML — which takes effect on the next command; nothing long-running caches
-config except the web UI (restart it after changing `[web]` or
-`[scheduler]`).
+config except the web UI and the scheduler (restart the web UI after
+changing `[web]`, the `gustarr schedule` process after `[scheduler]`).
 
 ## Full key reference
 
@@ -154,7 +154,7 @@ recommendations that are ready stay queued until the *arr appears.
 | `music_mode` | `"auto"` | `auto`: add proposed artists within the weekly budget; `queue`: everything waits for approval |
 | `video_mode` | `"queue"` | `auto`: add top proposed video without approval (capped per run by `video_queue_max_pending`) |
 | `music_max_artists_per_week` | `3` | weekly auto-add budget, counted per ISO week; approvals don't consume it |
-| `music_max_albums_per_week` | `10` | reserved for future album-level recommendations |
+| `music_max_albums_per_week` | `10` | weekly auto-add budget for album recommendations, counted per ISO week like the artist budget |
 | `video_queue_max_pending` | `20` | max open movie/series proposals; rank stops proposing at the cap, apply expires overflow |
 | `proposal_ttl_days` | `30` | proposals older than this expire so the queue never silts up |
 
@@ -196,14 +196,30 @@ header is trusted as-is, a multi-profile instance must only be reachable
 through the proxy that sets it. `GET /api/profile` returns the resolved name
 and the configured list.
 
-### `[scheduler]` — optional; built-in nightly scheduler
+### `[scheduler]` — optional; the dedicated `gustarr schedule` process
 
 | key | default | meaning |
 |---|---|---|
-| `nightly` | unset | `"HH:MM"` **local time**; `gustarr web` runs `gustarr run nightly` as a subprocess once a day |
+| `nightly` | unset | `"HH:MM"` **local time**; the dedicated `gustarr schedule` process runs `gustarr run nightly` as a subprocess once a day |
 
-Meant for containers, where there is no systemd. Off by default — when
-unset, `gustarr web` schedules nothing and you keep cron/systemd timers. The
-pipeline runs as a subprocess (it never blocks the web UI), a slot that comes
-up while the previous run is still alive is skipped, and start/exit are
-logged to stdout. In containers, "local time" is the container's `TZ`.
+Meant for containers, where there is no systemd: run `gustarr schedule` as
+its own long-running service (the compose example ships it as a second
+service from the same image). The web process **never** runs the pipeline —
+one process, one job. Off by default — when unset, `gustarr schedule`
+refuses to start and you keep cron/systemd timers. The pipeline runs as a
+subprocess of the scheduler (a pipeline crash never takes the scheduler
+down), a slot that comes up while the previous run is still alive is
+skipped, and start/exit are logged to stdout. In containers, "local time"
+is the container's `TZ`.
+
+## Not in the TOML: `gustarr dedupe`
+
+Duplicate repair has no config keys, only CLI flags. `gustarr dedupe`
+merges items that are the same thing under different spellings: it
+re-normalizes name-keyed fallback ids and registers MusicBrainz alias
+spellings against the canonical artist, so history split across
+width/case/script variants (romaji vs. kana/kanji) lands on one item.
+`--fetch` additionally pulls alias lists from MusicBrainz for played
+artists that lack them (~1 request/second; `--limit` caps lookups per
+run, default 500). Run it after upgrading Gustarr or after importing
+history from a new source; every pass is idempotent.

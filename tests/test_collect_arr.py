@@ -145,9 +145,10 @@ def test_deleted_gustarr_item_becomes_reject(conn, cfg, fake_http, responses):
     assert len(rejects) == 1
     rej = rejects[0]
     assert rej["item_id"] == "movie:tmdb:949"
-    assert rej["weight"] == WEIGHTS["reject"]
+    # no recommendations row owns the add: damped household evidence
+    assert rej["weight"] == WEIGHTS["reject"] * 0.3
     assert rej["source"] == "arr"
-    assert json.loads(rej["meta"]) == {"deleted": True}
+    assert json.loads(rej["meta"]) == {"deleted": True, "shared": True}
 
     assert conn.execute("SELECT COUNT(*) FROM library WHERE arr='radarr'").fetchone()[0] == 0
     assert json.loads(db.get_state(conn, "arr:known:radarr")) == {}
@@ -187,10 +188,49 @@ def test_events_fan_out_to_every_profile(conn, tmp_path, fake_http, responses):
     # library stays global: one row, no profile dimension
     assert conn.execute("SELECT COUNT(*) FROM library").fetchone()[0] == 2
 
-    # deleting the gustarr-tagged movie rejects for the whole household too
+    # deleting the gustarr-tagged movie with no rec on record falls back
+    # to the household fan-out — damped and flagged shared, since it says
+    # little about any one person's taste
     responses[f"{RADARR}/api/v3/movie"] = []
     stats = arr.sync(conn, cfg)
     assert stats["rejects"] == 2
     rejects = {(r["profile"], r["item_id"]) for r in conn.execute(
         "SELECT profile, item_id FROM events WHERE kind='reject'")}
     assert rejects == {("alice", "movie:tmdb:949"), ("bob", "movie:tmdb:949")}
+    for r in conn.execute("SELECT weight, meta FROM events WHERE kind='reject'"):
+        assert r["weight"] == WEIGHTS["reject"] * 0.3
+        assert json.loads(r["meta"]) == {"deleted": True, "shared": True}
+
+
+def test_deleted_gustarr_item_reject_hits_owning_profile_only(
+        conn, tmp_path, fake_http, responses):
+    """The rec that landed the add names whose taste the deletion judges:
+    the reject must hit that profile alone, at full weight, newest owner
+    winning when the item was recommended more than once."""
+    cfg = C._build({
+        "core": {"data_dir": str(tmp_path)},
+        "radarr": {"url": RADARR, "api_key": "rk"},
+        "profiles": {"alice": {}, "bob": {}},
+    })
+    arr.sync(conn, cfg)
+
+    def add_rec(profile, status, acted_at):
+        conn.execute(
+            "INSERT INTO recommendations (profile, run_id, ts, domain, item_id, score,"
+            " status, acted_at) VALUES (?,?,?,?,?,?,?,?)",
+            (profile, "test", acted_at, "movie", "movie:tmdb:949", 0.5, status, acted_at))
+
+    add_rec("bob", "added", "2024-01-01T00:00:00Z")  # superseded by alice's newer add
+    add_rec("alice", "auto_added", "2024-06-01T00:00:00Z")
+
+    responses[f"{RADARR}/api/v3/movie"] = []
+    stats = arr.sync(conn, cfg)
+
+    assert stats["rejects"] == 1
+    rejects = conn.execute("SELECT * FROM events WHERE kind='reject'").fetchall()
+    assert len(rejects) == 1
+    rej = rejects[0]
+    assert rej["item_id"] == "movie:tmdb:949"
+    assert rej["profile"] == "alice"  # the newest owner, nobody else
+    assert rej["weight"] == WEIGHTS["reject"]  # her own add: full strength
+    assert json.loads(rej["meta"]) == {"deleted": True}

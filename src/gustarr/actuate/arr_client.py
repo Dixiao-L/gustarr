@@ -13,8 +13,16 @@ from ..config import ArrConfig
 
 
 class ArrError(Exception):
-    """Actuation failure that is not a transport error: bad config
-    (unknown quality profile), empty lookup, missing profiles."""
+    """Actuation failure that is not a transport error: empty lookup,
+    unusable add payload — a deterministic verdict on the item."""
+
+
+class ArrConfigError(ArrError):
+    """Operator config that doesn't resolve against the arr (typo'd
+    quality profile or root folder, an arr with no profiles yet).
+    Service-level like a bad api key, not a verdict on the item: apply
+    treats it as transient so approved recs survive until the config is
+    fixed and the next run succeeds."""
 
 
 def _is_duplicate_add(exc: http.ApiError) -> bool:
@@ -83,7 +91,7 @@ class ArrClient:
         if self._profile_id is None:
             profiles = self._get("qualityprofile")
             if not profiles:
-                raise ArrError(f"{self.name} at {self.base} has no quality profiles")
+                raise ArrConfigError(f"{self.name} at {self.base} has no quality profiles")
             want = self.cfg.quality_profile
             if not want:
                 self._profile_id = profiles[0]["id"]
@@ -91,8 +99,9 @@ class ArrClient:
                 by_name = {p["name"].lower(): p["id"] for p in profiles}
                 if want.lower() not in by_name:
                     names = ", ".join(p["name"] for p in profiles)
-                    raise ArrError(
-                        f"{self.name} quality profile {want!r} not found; available: {names}")
+                    raise ArrConfigError(
+                        f"{self.name} config: quality profile {want!r} not found;"
+                        f" available: {names}")
                 self._profile_id = by_name[want.lower()]
         return self._profile_id
 
@@ -100,7 +109,7 @@ class ArrClient:
         if self._root is None:
             folders = self._get("rootfolder")
             if not folders:
-                raise ArrError(f"{self.name} at {self.base} has no root folders")
+                raise ArrConfigError(f"{self.name} at {self.base} has no root folders")
             paths = [f["path"] for f in folders]
             want = self.cfg.root_folder.rstrip("/")
             if not want:
@@ -110,8 +119,8 @@ class ArrClient:
                 if match is None:
                     # an explicit setting silently ignored would download
                     # into the wrong place — fail like quality_profile does
-                    raise ArrError(
-                        f"{self.name} root folder {self.cfg.root_folder!r} not found;"
+                    raise ArrConfigError(
+                        f"{self.name} config: root folder {self.cfg.root_folder!r} not found;"
                         f" available: {', '.join(paths)}")
                 self._root = match
         return self._root
@@ -184,7 +193,7 @@ class LidarrClient(ArrClient):
         if self._metadata_profile_id is None:
             profiles = self._get("metadataprofile")
             if not profiles:
-                raise ArrError(f"lidarr at {self.base} has no metadata profiles")
+                raise ArrConfigError(f"lidarr at {self.base} has no metadata profiles")
             self._metadata_profile_id = profiles[0]["id"]
         return self._metadata_profile_id
 

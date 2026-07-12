@@ -1,12 +1,13 @@
 # Architecture
 
 Gustarr follows one rule: **atomic commands, one shared SQLite store, no
-daemons except the optional web UI.** Every stage does one thing and
-communicates with the others only through the store. Composition is
+daemons except the optional web UI and the optional `gustarr schedule`
+clock.** Every stage does one thing and communicates with the others only
+through the store. Composition is
 `gustarr run nightly|weekly` — or your own cron/systemd timers calling the
-atomic commands directly (the web process can optionally host a minimal
-in-container scheduler for exactly that composition; see
-[deployment](deployment.md)).
+atomic commands directly (containers run the dedicated `gustarr schedule`
+process as a second service for exactly that composition — the web process
+never runs the pipeline; see [deployment](deployment.md)).
 
 ```
   signals in                     the store (SQLite)                  actions out
@@ -200,6 +201,36 @@ unless that's engineered against. The guards, per profile, end to end:
   exploration share, and the exploration approval rate — exposed via
   `gustarr stats` and `GET /api/stats` so narrowing shows up on a Grafana
   dashboard, not as a feeling.
+
+## Design debt
+
+Known structural shortcuts, documented so nobody has to discover them the
+hard way. None is load-bearing for correctness today; all have a planned
+fix.
+
+- **Item identity is spread across three mechanisms**: namespaced id
+  minting with per-domain priority (`ids.py`), `item_aliases` redirects
+  consulted via `db.canonical_id` at write time, and the merge/upgrade
+  passes in `enrich` and `dedupe`. Each is individually sound, but "what
+  id does this thing have?" has three answers depending on where you ask.
+  Planned: consolidation behind a single resolver.
+- **Recommendation status transitions are written from several call
+  sites**: `queue.set_status`/`forgive` (approve/reject/snooze/un-reject),
+  `apply` (added/auto_added/failed, TTL and overflow expiry) and `rank`
+  (TTL and snooze-lapse expiry) each update `recommendations.status`
+  directly. The legal-transition rules live in `queue.py` but are only
+  enforced there. Planned: a single transition owner every writer goes
+  through.
+- **Event weights are frozen at write time**: collectors store each
+  event's label contribution in `events.weight`, and
+  `signals.aggregate_label` treats the stored value as authoritative — so
+  tuning `signals.WEIGHTS` only affects events written afterwards.
+  Planned: weight recomputation from `kind` at training time.
+- **Cross-profile budget ordering favors profiles with saturated heads**:
+  the shared weekly music budgets are spent in one score-ordered pass
+  across every profile's queue, and a profile with a well-trained
+  (confident, higher-scoring) head systematically outbids a cold-start
+  one. Planned: round-robin allocation across profiles.
 
 ## HTTP discipline
 

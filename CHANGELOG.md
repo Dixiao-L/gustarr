@@ -4,7 +4,33 @@ All notable changes to Gustarr are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/).
 
+## [0.2.2] - 2026-07-12
+
+### Fixed
+- Cross-profile authorization: acting on another profile's recommendation
+  by id now returns 403 (approve/reject/snooze/forgive/why).
+- Run Now works in containers: gustarr schedule consumes the sentinel.
+- An arr deletion attributes its reject to the profile whose approval
+  added the item; ownerless deletions fan out at reduced weight.
+- Config-level *arr errors (bad quality profile / root folder) and
+  401/403 no longer terminally fail approved recommendations.
+- Docker quickstart env example lists every key the example TOML uses;
+  docs no longer describe the pre-0.2.1 in-web scheduler.
+
 ## [0.2.1] - 2026-07-12
+
+### Added
+- **Album recommendations**: Last.fm top albums of liked artists and
+  ListenBrainz CF albums feed an album candidate pool, ranked like artists
+  (scored against the artist-domain model until album-level feedback
+  accumulates) and auto-added to Lidarr under the
+  `autonomy.music_max_albums_per_week` weekly budget.
+- **`gustarr dedupe`**: merges items that are the same thing under
+  different spellings — re-normalizes name-keyed fallback ids and registers
+  MusicBrainz alias spellings against the canonical artist, healing history
+  split across width/case/script variants (romaji vs. kana/kanji).
+  `--fetch` pulls missing alias lists from MusicBrainz (capped by
+  `--limit`). Idempotent; run after upgrades or new-source imports.
 
 ### Changed
 - Scheduling is a dedicated process (gustarr schedule) — never a thread

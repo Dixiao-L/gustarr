@@ -7,7 +7,8 @@ merge (db.merge_item) so accumulated events/candidates follow the item.
 Permanent per-item failures (bad/missing ids, 4xx) stamp enriched_at
 with an enrich_error note so one bad item can never wedge the queue;
 transient failures (outages, rate limits, bad credentials) leave
-enriched_at NULL so the item retries next run.
+enriched_at NULL so the item retries next run, and a later success
+clears the stale enrich_error note.
 """
 
 from __future__ import annotations
@@ -77,6 +78,15 @@ def run(
             db.upsert_item(conn, eff["id"], row["domain"],
                            meta={"enrich_error": str(exc)}, enriched=permanent)
             stats["errors"] += 1
+        else:
+            # a retried item that just succeeded must not keep advertising
+            # its last transient failure — drop the stale note in place
+            # (upsert_item merges meta key-wise, so it would survive).
+            conn.execute(
+                "UPDATE items SET meta=json_remove(meta, '$.enrich_error')"
+                " WHERE id=? AND enriched_at IS NOT NULL"
+                " AND json_extract(meta, '$.enrich_error') IS NOT NULL",
+                (eff["id"],))
     return stats
 
 
