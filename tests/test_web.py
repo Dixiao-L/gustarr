@@ -1,14 +1,16 @@
-"""Web approval UI: FastAPI layer over a fabricated store."""
+"""Web approval UI: FastAPI layer over a fabricated store — plus the
+built-in scheduler that `gustarr web` optionally hosts."""
 
 from __future__ import annotations
 
 import json
+from datetime import datetime
 
 import pytest
 from fastapi.testclient import TestClient
 
 from gustarr import config as C
-from gustarr import db
+from gustarr import db, scheduler
 from gustarr.web.app import create_app
 
 MATRIX = "movie:tmdb:603"
@@ -172,7 +174,7 @@ def test_index_served(web):
     assert "/api/recs" in resp.text
     for symbol in ("i-check", "i-x", "i-info", "i-compass", "i-sparkle",
                    "i-film", "i-tv", "i-music", "i-clock", "i-chart",
-                   "i-play", "i-external", "i-gear"):
+                   "i-play", "i-external", "i-gear", "i-user"):
         assert f'id="{symbol}"' in resp.text
     for label in ("All", "Movies", "Series", "Music", "History"):
         assert label in resp.text
@@ -199,6 +201,18 @@ def test_index_head_and_controls(web):
     assert "/api/settings" in text
     assert "/api/run" in text
     assert "<dialog" in text
+    # the settings dialog says out loud that it is not per-profile
+    assert "Operator-level" in text
+
+
+def test_index_profile_chip_plumbing(web):
+    text = web[0].get("/").text
+    # the page asks who it is serving and propagates ?profile= to API calls
+    assert "/api/profile" in text
+    assert "'profile'" in text
+    # the chip renders only for multi-profile instances
+    assert ".length > 1" in text
+    assert "chip('user', 'Profile'" in text
 
 
 def test_index_album_and_music_markup(web):
@@ -360,6 +374,161 @@ def test_no_origin_and_allowlisted_origin_posts_allowed(web):
     resp = client.post(f"/api/recs/{movie_rec}/approve",
                        headers={"Origin": "http://localhost:8790"})
     assert resp.status_code == 200
+
+
+# ── profiles ─────────────────────────────────────────────────────────
+
+
+def _profiles_cfg(tmp_path, **web_extra):
+    return C._build({
+        "core": {"data_dir": str(tmp_path)},
+        "web": {"allowed_hosts": ["testserver"], **web_extra},
+        "profiles": {"alice": {"jellyfin_user": "alice"},
+                     "bob": {"lastfm_user": "bob-fm"}},
+    })
+
+
+@pytest.fixture
+def multi(tmp_path):
+    cfg = _profiles_cfg(tmp_path)
+    conn = db.connect(cfg.db_path)
+    db.upsert_item(conn, MATRIX, "movie", "The Matrix", 1999, {"tmdb": 603}, {})
+    db.upsert_item(conn, BLADE, "movie", "Blade Runner", 1982, {"tmdb": 78}, {})
+    # Same-item recs under two profiles are legal: the open-rec unique
+    # index is (profile, item_id) — each person gets their own verdict.
+    alice_rec = conn.execute(
+        "INSERT INTO recommendations (profile, run_id, ts, domain, item_id, score, why)"
+        " VALUES ('alice','r1',?,?,?,?,?)", (db.now(), "movie", MATRIX, 0.9, "{}")).lastrowid
+    bob_rec = conn.execute(
+        "INSERT INTO recommendations (profile, run_id, ts, domain, item_id, score, why)"
+        " VALUES ('bob','r1',?,?,?,?,?)", (db.now(), "movie", BLADE, 0.8, "{}")).lastrowid
+    conn.commit()
+    conn.close()
+    return TestClient(create_app(cfg)), alice_rec, bob_rec
+
+
+def test_profile_from_forward_auth_header(multi):
+    client, *_ = multi
+    resp = client.get("/api/profile", headers={"Remote-User": "alice"})
+    assert resp.status_code == 200
+    assert resp.json() == {"name": "alice", "profiles": ["alice", "bob"]}
+
+
+def test_profile_from_query_param(multi):
+    client, *_ = multi
+    assert client.get("/api/profile", params={"profile": "bob"}).json()["name"] == "bob"
+    # the auth proxy's header outranks the query param
+    resp = client.get("/api/profile", params={"profile": "bob"},
+                      headers={"Remote-User": "alice"})
+    assert resp.json()["name"] == "alice"
+
+
+def test_profile_sole_configured_fallback(web):
+    # Legacy configs synthesize a single 'default' profile; no header or
+    # param is needed for anything to work.
+    client, *_ = web
+    assert client.get("/api/profile").json() == {"name": "default", "profiles": ["default"]}
+
+
+def test_profile_multi_without_hint_is_default(multi):
+    client, *_ = multi
+    assert client.get("/api/profile").json()["name"] == "default"
+
+
+def test_unknown_profile_403(multi):
+    client, *_ = multi
+    for req in ({"headers": {"Remote-User": "mallory"}},
+                {"params": {"profile": "mallory"}}):
+        resp = client.get("/api/profile", **req)
+        assert resp.status_code == 403
+        assert "mallory" in resp.json()["detail"]
+    assert client.get("/api/recs", params={"profile": "mallory"}).status_code == 403
+    assert client.get("/api/stats", headers={"Remote-User": "mallory"}).status_code == 403
+
+
+def test_profile_header_name_configurable(tmp_path):
+    cfg = _profiles_cfg(tmp_path, profile_header="X-Forwarded-User")
+    client = TestClient(create_app(cfg))
+    assert client.get("/api/profile",
+                      headers={"X-Forwarded-User": "bob"}).json()["name"] == "bob"
+    # the default header name carries no meaning once another is configured
+    resp = client.get("/api/profile", headers={"Remote-User": "nobody"})
+    assert resp.status_code == 200
+    assert resp.json()["name"] == "default"
+
+
+def test_recs_scoped_to_active_profile(multi):
+    client, alice_rec, bob_rec = multi
+    rows = client.get("/api/recs", headers={"Remote-User": "alice"}).json()
+    assert [r["id"] for r in rows] == [alice_rec]
+    rows = client.get("/api/recs", params={"profile": "bob"}).json()
+    assert [r["id"] for r in rows] == [bob_rec]
+
+
+# ── built-in scheduler ───────────────────────────────────────────────
+
+
+class FakeProc:
+    def __init__(self):
+        self.pid = 4242
+        self.returncode = None
+
+    def poll(self):
+        return self.returncode
+
+
+def test_scheduler_fires_once_and_skips_while_running():
+    procs = []
+
+    def popen(cmd):
+        assert cmd[-2:] == ["run", "nightly"]
+        procs.append(FakeProc())
+        return procs[-1]
+
+    sched = scheduler.Scheduler("04:30", popen=popen)
+    assert sched.tick(datetime(2026, 7, 12, 4, 29)) is False
+    assert sched.tick(datetime(2026, 7, 12, 4, 30)) is True
+    # same minute / later the same day: one fire per day, ever
+    assert sched.tick(datetime(2026, 7, 12, 4, 30)) is False
+    assert sched.tick(datetime(2026, 7, 12, 18, 0)) is False
+    assert len(procs) == 1
+    # next day's slot arrives while the run is still alive: skip, don't queue
+    assert sched.tick(datetime(2026, 7, 13, 4, 30)) is False
+    assert len(procs) == 1
+    # run finished → the following day fires again
+    procs[0].returncode = 0
+    assert sched.tick(datetime(2026, 7, 14, 4, 30)) is True
+    assert len(procs) == 2
+    # a tick that drifted past the target minute still fires that day
+    procs[1].returncode = 1
+    assert sched.tick(datetime(2026, 7, 15, 4, 47)) is True
+    assert len(procs) == 3
+
+
+def test_scheduler_prime_spends_todays_past_slot():
+    # Booting the web UI at noon must not instantly fire an 04:30 pipeline.
+    sched = scheduler.Scheduler("04:30", popen=lambda cmd: FakeProc())
+    sched.prime(datetime(2026, 7, 12, 12, 0))
+    assert sched.tick(datetime(2026, 7, 12, 12, 1)) is False
+    assert sched.tick(datetime(2026, 7, 13, 4, 30)) is True
+
+
+def test_scheduler_off_by_default_and_validates(tmp_path):
+    cfg = C._build({"core": {"data_dir": str(tmp_path)}})
+    assert scheduler.start(cfg) is None
+    for bad in ("4pm", "25:00", "04:60", "0430"):
+        with pytest.raises(C.ConfigError):
+            scheduler.Scheduler(bad)
+
+
+def test_create_app_wires_scheduler(tmp_path, monkeypatch):
+    started = []
+    monkeypatch.setattr("gustarr.web.app.scheduler.start",
+                        lambda cfg: started.append(cfg))
+    cfg = C._build({"core": {"data_dir": str(tmp_path)},
+                    "web": {"allowed_hosts": ["testserver"]}})
+    create_app(cfg)
+    assert started == [cfg]
 
 
 def test_configured_allowed_hosts_honored(tmp_path):

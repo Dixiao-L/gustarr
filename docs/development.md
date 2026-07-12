@@ -62,7 +62,7 @@ One test module per source module, flat in `tests/`:
 | `test_ml.py` | embed doc building, head/centroid training, ranking + exploration |
 | `test_queue_pipeline.py` | approve/reject/snooze/forgive, recipe runner stage isolation |
 | `test_actuate.py` | caps, budgets, dry-run, transient-vs-permanent failures |
-| `test_web.py` | API endpoints, Host/Origin guard, runtime settings |
+| `test_web.py` | API endpoints, Host/Origin guard, runtime settings, profile resolution, the built-in scheduler |
 
 Run a slice with `uv run pytest tests/test_enrich.py -q` or `-k pattern`.
 

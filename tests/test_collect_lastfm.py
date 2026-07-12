@@ -108,7 +108,8 @@ def test_first_sync_items_events_cursor(conn, cfg):
     calls = []
     stats = lastfm.sync(conn, cfg, transport=make_transport(calls))
 
-    assert stats == {"scrobbles": 3, "loved": 1, "items": 5, "pages": 3}
+    assert stats == {"scrobbles": 3, "loved": 1, "items": 5, "pages": 3,
+                     "profiles": 1, "profiles_skipped": 0}
 
     items = {r["id"]: r for r in conn.execute("SELECT * FROM items")}
     assert set(items) == {
@@ -134,6 +135,8 @@ def test_first_sync_items_events_cursor(conn, cfg):
     # 3 scrobbles + 1 loved, each mirrored onto the artist item
     assert len(events) == 8
     assert all(e["source"] == "lastfm" for e in events)
+    # legacy single-user config: everything lands on the synthesized default
+    assert {r["profile"] for r in conn.execute("SELECT profile FROM events")} == {"default"}
     kinds = {(e["item_id"], e["kind"]) for e in events}
     assert (f"track:mbid:{PA_MBID}", "scrobble") in kinds
     assert (f"artist:mbid:{RH_MBID}", "scrobble") in kinds
@@ -145,7 +148,7 @@ def test_first_sync_items_events_cursor(conn, cfg):
     scrobble_ts = {e["ts"] for e in events if e["kind"] == "scrobble"}
     assert "2023-11-14T22:15:00Z" in scrobble_ts  # UTS_NEW as ISO
 
-    assert db.get_state(conn, lastfm.CURSOR_KEY) == str(UTS_NEW)
+    assert db.pget_state(conn, "default", lastfm.CURSOR_KEY) == str(UTS_NEW)
 
 
 def test_second_sync_uses_cursor_and_adds_nothing(conn, cfg):
@@ -159,7 +162,7 @@ def test_second_sync_uses_cursor_and_adds_nothing(conn, cfg):
     assert recent_calls[0]["from"] == str(UTS_NEW + 1)
     assert stats["scrobbles"] == 0 and stats["loved"] == 0
     assert all_events(conn) == before
-    assert db.get_state(conn, lastfm.CURSOR_KEY) == str(UTS_NEW)
+    assert db.pget_state(conn, "default", lastfm.CURSOR_KEY) == str(UTS_NEW)
 
 
 def test_full_rewalks_but_stays_idempotent(conn, cfg):
@@ -174,7 +177,7 @@ def test_full_rewalks_but_stays_idempotent(conn, cfg):
     assert all("from" not in c for c in recent_calls)
     assert stats["scrobbles"] == 0 and stats["loved"] == 0
     assert all_events(conn) == before
-    assert db.get_state(conn, lastfm.CURSOR_KEY) == str(UTS_NEW)
+    assert db.pget_state(conn, "default", lastfm.CURSOR_KEY) == str(UTS_NEW)
 
 
 def test_empty_history(conn, cfg):
@@ -184,8 +187,9 @@ def test_empty_history(conn, cfg):
         return httpx.Response(200, json=body)
 
     stats = lastfm.sync(conn, cfg, transport=httpx.MockTransport(handler))
-    assert stats == {"scrobbles": 0, "loved": 0, "items": 0, "pages": 2}
-    assert db.get_state(conn, lastfm.CURSOR_KEY) is None
+    assert stats == {"scrobbles": 0, "loved": 0, "items": 0, "pages": 2,
+                     "profiles": 1, "profiles_skipped": 0}
+    assert db.pget_state(conn, "default", lastfm.CURSOR_KEY) is None
     assert conn.execute("SELECT COUNT(*) c FROM events").fetchone()["c"] == 0
 
 

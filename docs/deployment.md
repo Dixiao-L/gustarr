@@ -1,10 +1,12 @@
 # Deployment
 
-Three supported shapes, in order of polish:
+Three supported shapes:
 
-1. **NixOS module** — hardened systemd timers, agenix-friendly secrets, GPU
-   support. The reference deployment.
-2. **Docker / compose** — CPU-only image, scheduling via host cron.
+1. **Docker / compose** — CPU-only image, self-contained: the built-in
+   scheduler runs the nightly pipeline from inside the web container. The
+   easiest way to run Gustarr.
+2. **NixOS module** — hardened systemd timers, agenix-friendly secrets, GPU
+   support. What the author runs in production.
 3. **Bare pip/uv + your own cron** — it's just a CLI; nothing stops you.
 
 In every shape the moving parts are the same: a *nightly* pipeline run, an
@@ -25,7 +27,9 @@ optional distinct *weekly* run, and the long-running approval web UI.
 The module runs no thinking daemon: `gustarr-nightly` and `gustarr-weekly`
 are oneshot services on timers, and the only long-running process is the web
 UI. Units are hardened (`ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`,
-`NoNewPrivileges`) and run as the `gustarr` system user.
+`NoNewPrivileges`) and run as the `gustarr` system user. Leave `[scheduler]`
+unset here — the built-in scheduler exists for containers; systemd timers
+are the better privilege boundary and survive web-service restarts.
 
 ### Option reference (`services.gustarr.*`)
 
@@ -103,12 +107,30 @@ Container specifics:
 - The container runs as a non-root `gustarr` user (uid 1000). If you bind-mount
   a host directory instead of a named volume, `chown 1000` it.
 
-### Scheduling: host cron instead of timers
+### Scheduling: the built-in scheduler
 
-There is deliberately **no scheduler in the container** — same Unix
-philosophy as everywhere else. The web service is the only long-running
-process; pipelines are one-shot `run` invocations of the same image. From the
-host's crontab:
+The primary path for containers is the **built-in scheduler**: set
+
+```toml
+[scheduler]
+nightly = "04:30"          # local time — set TZ on the container
+```
+
+and the web container runs `gustarr run nightly` itself, once a day. No host
+cron, no sidecar. Properties worth knowing:
+
+- The pipeline runs as a **subprocess** of the web process — it never blocks
+  the UI, and a pipeline crash never takes the UI down. Start and exit code
+  are logged to the container's stdout (`docker compose logs gustarr`).
+- One fire per day; if a slot comes up while the previous run is still
+  alive, it is skipped, not queued.
+- "Local time" means the container's clock: set `TZ=Europe/Berlin` (or
+  similar) in the compose `environment:`, or your 04:30 is 04:30 UTC.
+- Off by default — without a `[scheduler]` section, `gustarr web` schedules
+  nothing, so systemd/cron deployments are unaffected.
+
+If you prefer the pipeline outside the web container (separate logs,
+resource limits, one-process-per-container purism), host cron still works:
 
 ```cron
 # nightly at 04:30, weekly Saturday 09:00 (paths: wherever your compose file lives)
@@ -122,7 +144,8 @@ The compose example also contains a commented one-shot `pipeline` service if
 you prefer `docker compose run pipeline`.
 
 SQLite is in WAL mode and the pipeline commits between stages, so a pipeline
-run and the web UI sharing the volume is the normal, supported arrangement.
+run and the web UI sharing the volume is the normal, supported arrangement —
+whichever scheduler starts the run.
 
 ### Secrets guidance
 
@@ -133,6 +156,33 @@ run and the web UI sharing the volume is the normal, supported arrangement.
   in the process environment satisfies the `env:` convention.
 - Never put keys in `docker-compose.yml` `environment:` blocks that get
   committed, and never in the image.
+
+---
+
+## Multi-user profiles behind a reverse proxy
+
+With `[profiles.NAME]` sections configured, the web UI resolves the active
+profile per request from the header named by `[web] profile_header` (default
+`Remote-User`). That is exactly the header Authelia's forward-auth mode
+injects, so the whole mapping is: **name your Gustarr profiles after your
+Authelia usernames** and put the UI behind the proxy. Traefik sketch:
+
+```yaml
+# Authelia verifies the session, then forwards the identity header upstream.
+http.middlewares.authelia.forwardAuth:
+  address: "http://authelia:9091/api/authz/forward-auth"
+  authResponseHeaders: ["Remote-User"]
+# gustarr router: websecure + TLS + the authelia middleware, as usual.
+```
+
+Remember `[web] allowed_hosts = ["gustarr.example.net"]` for the Host/Origin
+guard, and that the header is trusted as-is: a multi-profile instance must
+**only** be reachable through the proxy that sets it (container network /
+firewall — not a port map next to the proxy). Header-less access still
+works for quick checks: `?profile=NAME` selects a profile explicitly, and a
+name that matches no profile is refused with a 403 rather than falling back
+to someone else's queue. Runtime settings remain global (operator-level) —
+the settings dialog is labelled accordingly.
 
 ---
 

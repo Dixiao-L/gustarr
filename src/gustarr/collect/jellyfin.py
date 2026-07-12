@@ -34,26 +34,38 @@ _VIDEO_NS = {
 
 def sync(conn: sqlite3.Connection, cfg: Config,
          transport: httpx.BaseTransport | None = None) -> dict[str, Any]:
-    """Pull Jellyfin state into the store; returns per-signal counts."""
+    """Pull Jellyfin state into the store, one pass per profile with a
+    jellyfin_user; returns per-signal counts (flat totals across profiles —
+    the split isn't actionable in a pipeline log line)."""
     jf = cfg.jellyfin
-    for field in ("url", "api_key", "user"):
+    for field in ("url", "api_key"):
         if not jf.get(field):
             raise ValueError(f"jellyfin config missing {field!r}")
+    users = {name: p.jellyfin_user for name, p in cfg.profiles.items() if p.jellyfin_user}
+    if not users:
+        # same strictness as the old top-level 'user' check: a configured
+        # server nobody watches is a config mistake, not a no-op
+        raise ValueError("jellyfin config missing 'user' (no profile has jellyfin_user)")
     base = jf["url"].rstrip("/")
     headers = {"X-Emby-Token": jf["api_key"]}
-    uid = _resolve_user(base, jf["user"], headers, transport)
     stats: dict[str, Any] = {"items": 0, "skipped": 0, "favorites": 0, "completes": 0,
                              "series_plays": 0, "series_completes": 0, "scrobbles": 0,
                              "playback_reporting": 0, "pbr_scrobbles": 0, "pbr_plays": 0,
-                             "pbr_completes": 0}
-    _sync_library(conn, base, uid, headers, transport, stats)
-    # Playback Reporting rows carry real per-play timestamps and durations;
-    # when the plugin answers, they are the listening history and the
-    # count-delta paths below only maintain their cursors (so removing the
-    # plugin later can't burst-emit the whole backlog as one fake listen).
-    pbr_active = _sync_playback_reporting(conn, base, uid, headers, transport, stats)
-    _sync_series(conn, base, uid, headers, transport, stats, emit_plays=not pbr_active)
-    _sync_audio(conn, base, uid, headers, transport, stats, emit=not pbr_active)
+                             "pbr_completes": 0, "profiles": 0,
+                             "profiles_skipped": len(cfg.profiles) - len(users)}
+    for profile, user in users.items():
+        stats["profiles"] += 1
+        uid = _resolve_user(base, user, headers, transport)
+        _sync_library(conn, profile, base, uid, headers, transport, stats)
+        # Playback Reporting rows carry real per-play timestamps and durations;
+        # when the plugin answers, they are the listening history and the
+        # count-delta paths below only maintain their cursors (so removing the
+        # plugin later can't burst-emit the whole backlog as one fake listen).
+        pbr_active = _sync_playback_reporting(conn, profile, base, uid, headers,
+                                              transport, stats)
+        _sync_series(conn, profile, base, uid, headers, transport, stats,
+                     emit_plays=not pbr_active)
+        _sync_audio(conn, profile, base, uid, headers, transport, stats, emit=not pbr_active)
     return stats
 
 
@@ -126,33 +138,36 @@ def _norm_ts(raw: str | None) -> str:
     return db.now()
 
 
-def _merged_state(conn: sqlite3.Connection, key: str, pre_merge_key: str) -> str | None:
-    """State lookup that survives an id merge: a cursor written before enrich
-    merged the minted id away lives under the old key; reading it there keeps
-    the first post-merge sync from re-emitting already-counted events."""
-    val = db.get_state(conn, key)
+def _merged_state(conn: sqlite3.Connection, profile: str, key: str,
+                  pre_merge_key: str) -> str | None:
+    """Profile-scoped state lookup that survives an id merge: a cursor written
+    before enrich merged the minted id away lives under the old key; reading it
+    there keeps the first post-merge sync from re-emitting counted events."""
+    val = db.pget_state(conn, profile, key)
     if val is None and pre_merge_key != key:
-        val = db.get_state(conn, pre_merge_key)
+        val = db.pget_state(conn, profile, pre_merge_key)
     return val
 
 
-def _flag_event(conn: sqlite3.Connection, item_id: str, kind: str, ts: str) -> bool:
+def _flag_event(conn: sqlite3.Connection, profile: str, item_id: str,
+                kind: str, ts: str) -> bool:
     """Favorite/complete are persistent flags, not occurrences: one event per
-    (item, kind) ever, so a drifting fallback ts can't break idempotency.
-    Checked against the canonical id — after enrich merges the minted id away
-    the flag event lives under the canonical item, and missing it here would
-    re-append the flag with a fresh ts every sync."""
+    (profile, item, kind) ever, so a drifting fallback ts can't break
+    idempotency. Checked against the canonical id — after enrich merges the
+    minted id away the flag event lives under the canonical item, and missing
+    it here would re-append the flag with a fresh ts every sync."""
     item_id = db.canonical_id(conn, item_id)
     row = conn.execute(
-        "SELECT 1 FROM events WHERE item_id=? AND kind=? AND source=? LIMIT 1",
-        (item_id, kind, SOURCE)).fetchone()
+        "SELECT 1 FROM events WHERE profile=? AND item_id=? AND kind=? AND source=? LIMIT 1",
+        (profile, item_id, kind, SOURCE)).fetchone()
     if row:
         return False
-    return db.add_event(conn, ts, item_id, kind, WEIGHTS[kind], SOURCE)
+    return db.add_event(conn, ts, item_id, kind, WEIGHTS[kind], SOURCE, profile=profile)
 
 
-def _sync_library(conn: sqlite3.Connection, base: str, uid: str, headers: dict[str, str],
-                  transport: httpx.BaseTransport | None, stats: dict[str, Any]) -> None:
+def _sync_library(conn: sqlite3.Connection, profile: str, base: str, uid: str,
+                  headers: dict[str, str], transport: httpx.BaseTransport | None,
+                  stats: dict[str, Any]) -> None:
     params = {"Recursive": "true", "IncludeItemTypes": "Movie,Series,MusicArtist",
               "Fields": "ProviderIds,UserData,ProductionYear", "EnableImages": "false"}
     for raw in _paged(f"{base}/Users/{uid}/Items", params, headers, transport):
@@ -166,17 +181,18 @@ def _sync_library(conn: sqlite3.Connection, base: str, uid: str, headers: dict[s
         stats["items"] += 1
         ud = raw.get("UserData") or {}
         ts = _norm_ts(ud.get("LastPlayedDate"))
-        if ud.get("IsFavorite") and _flag_event(conn, item_id, "favorite", ts):
+        if ud.get("IsFavorite") and _flag_event(conn, profile, item_id, "favorite", ts):
             stats["favorites"] += 1
         # A Series reads Played when every *downloaded* episode is watched,
         # which over-reports partly-synced shows — episode counts decide.
-        if domain == "movie" and ud.get("Played") and _flag_event(conn, item_id, "complete", ts):
+        if domain == "movie" and ud.get("Played") \
+                and _flag_event(conn, profile, item_id, "complete", ts):
             stats["completes"] += 1
 
 
-def _sync_series(conn: sqlite3.Connection, base: str, uid: str, headers: dict[str, str],
-                 transport: httpx.BaseTransport | None, stats: dict[str, Any],
-                 emit_plays: bool = True) -> None:
+def _sync_series(conn: sqlite3.Connection, profile: str, base: str, uid: str,
+                 headers: dict[str, str], transport: httpx.BaseTransport | None,
+                 stats: dict[str, Any], emit_plays: bool = True) -> None:
     params = {"IncludeItemTypes": "Episode", "Filters": "IsPlayed", "Recursive": "true",
               "Fields": "SeriesId,ProviderIds", "EnableImages": "false"}
     played: dict[str, int] = {}
@@ -199,28 +215,30 @@ def _sync_series(conn: sqlite3.Connection, base: str, uid: str, headers: dict[st
         # canonical id or a merge would reset them and duplicate the events
         item_id = db.canonical_id(conn, minted)
         pkey = f"jellyfin:series_played:{item_id}"
-        prev = _merged_state(conn, pkey, f"jellyfin:series_played:{minted}")
+        prev = _merged_state(conn, profile, pkey, f"jellyfin:series_played:{minted}")
         if count > int(prev or 0):
             # First-ever sight of the series is pre-plugin backlog that
             # Playback Reporting can't know about — emit it regardless.
             if (emit_plays or prev is None) and db.add_event(
                     conn, db.now(), item_id, "play", WEIGHTS["play"],
-                    SOURCE, {"episodes_played": count}):
+                    SOURCE, {"episodes_played": count}, profile=profile):
                 stats["series_plays"] += 1
-            db.set_state(conn, pkey, str(count))
+            db.pset_state(conn, profile, pkey, str(count))
         total = int(series.get("RecursiveItemCount") or 0)
         ckey = f"jellyfin:series_complete:{item_id}"
         if total and count >= SERIES_COMPLETE_FRAC * total \
-                and _merged_state(conn, ckey, f"jellyfin:series_complete:{minted}") is None:
+                and _merged_state(conn, profile, ckey,
+                                  f"jellyfin:series_complete:{minted}") is None:
             if db.add_event(conn, db.now(), item_id, "complete", WEIGHTS["complete"], SOURCE,
-                            {"episodes_played": count, "episodes_total": total}):
+                            {"episodes_played": count, "episodes_total": total},
+                            profile=profile):
                 stats["series_completes"] += 1
-            db.set_state(conn, ckey, db.now())
+            db.pset_state(conn, profile, ckey, db.now())
 
 
-def _sync_audio(conn: sqlite3.Connection, base: str, uid: str, headers: dict[str, str],
-                transport: httpx.BaseTransport | None, stats: dict[str, Any],
-                emit: bool = True) -> None:
+def _sync_audio(conn: sqlite3.Connection, profile: str, base: str, uid: str,
+                headers: dict[str, str], transport: httpx.BaseTransport | None,
+                stats: dict[str, Any], emit: bool = True) -> None:
     params = {"IncludeItemTypes": "Audio", "Filters": "IsPlayed", "Recursive": "true",
               "Fields": "ProviderIds,ArtistItems,Album,AlbumId", "EnableImages": "false"}
     tracks = list(_paged(f"{base}/Users/{uid}/Items", params, headers, transport))
@@ -252,14 +270,14 @@ def _sync_audio(conn: sqlite3.Connection, base: str, uid: str, headers: dict[str
         # IsPlayed-filtered rows can still carry PlayCount 0 on some servers
         plays = max(int(ud.get("PlayCount") or 0), 1)
         key = f"jellyfin:track_plays:{t.get('Id')}"
-        prev = db.get_state(conn, key)
+        prev = db.pget_state(conn, profile, key)
         delta = plays - int(prev or 0)
         if delta <= 0:
             continue
         # A track with no cursor yet is pre-plugin backlog Playback
         # Reporting can't cover — bootstrap it even when PBR owns events.
         if not emit and prev is not None:
-            db.set_state(conn, key, str(plays))
+            db.pset_state(conn, profile, key, str(plays))
             continue
         weight = WEIGHTS["scrobble"] * min(delta, SCROBBLE_DELTA_CAP)
         # dedup=track id: two tracks by one artist played the same second are
@@ -268,9 +286,9 @@ def _sync_audio(conn: sqlite3.Connection, base: str, uid: str, headers: dict[str
         # advancing it would silently discard the still-pending plays.
         if db.add_event(conn, _norm_ts(ud.get("LastPlayedDate")), art_id, "scrobble", weight,
                         SOURCE, {"delta": delta, "track": t.get("Name"), "album": t.get("Album")},
-                        dedup=str(t.get("Id") or "")):
+                        dedup=str(t.get("Id") or ""), profile=profile):
             stats["scrobbles"] += 1
-            db.set_state(conn, key, str(plays))
+            db.pset_state(conn, profile, key, str(plays))
 
 
 def _pbr_ts(raw: str) -> str:
@@ -284,15 +302,17 @@ def _pbr_ts(raw: str) -> str:
 PBR_COMPLETE_FRAC = 0.85
 
 
-def _sync_playback_reporting(conn: sqlite3.Connection, base: str, uid: str,
+def _sync_playback_reporting(conn: sqlite3.Connection, profile: str, base: str, uid: str,
                              headers: dict[str, str],
                              transport: httpx.BaseTransport | None,
                              stats: dict[str, Any]) -> bool:
     """Emit per-play events from the Playback Reporting plugin (the precise
     listening history: real timestamps + play durations). Returns True when
     the plugin answered, which demotes the count-delta passes to cursor
-    maintenance. Rows from other Jellyfin users are ignored."""
-    cursor = int(db.get_state(conn, "jellyfin:pbr_rowid", "0") or 0)
+    maintenance. Each profile walks the shared activity table under its own
+    cursor and keeps only its own user's rows — rows from Jellyfin users no
+    profile claims are simply dropped by every walk."""
+    cursor = int(db.pget_state(conn, profile, "jellyfin:pbr_rowid", "0") or 0)
     seen = 0
     uid_norm = uid.replace("-", "").lower()
     try:
@@ -314,24 +334,25 @@ def _sync_playback_reporting(conn: sqlite3.Connection, base: str, uid: str,
                 base, uid, list({str(r[3]) for r in mine}), headers, transport,
                 fields="ProviderIds,ArtistItems,SeriesId,Type,RunTimeTicks,Name,Album")}
             for r in mine:
-                _pbr_row(conn, base, uid, headers, transport, r,
+                _pbr_row(conn, profile, base, uid, headers, transport, r,
                          resolved.get(str(r[3])), stats)
             top = max(int(r[0]) for r in rows)
             if top <= cursor:  # server ignored the WHERE; don't loop forever
                 break
             cursor = top
-            db.set_state(conn, "jellyfin:pbr_rowid", str(cursor))
+            db.pset_state(conn, profile, "jellyfin:pbr_rowid", str(cursor))
             if len(rows) < 1000:
                 break
     except (http.ApiError, TypeError, ValueError):
         stats["playback_reporting"] = "unavailable"
         return False
-    stats["playback_reporting"] = seen
+    if isinstance(stats["playback_reporting"], int):  # accumulate across profiles
+        stats["playback_reporting"] += seen
     return True
 
 
-def _pbr_row(conn: sqlite3.Connection, base: str, uid: str, headers: dict[str, str],
-             transport: httpx.BaseTransport | None, row: list,
+def _pbr_row(conn: sqlite3.Connection, profile: str, base: str, uid: str,
+             headers: dict[str, str], transport: httpx.BaseTransport | None, row: list,
              item: dict[str, Any] | None, stats: dict[str, Any]) -> None:
     if item is None:  # deleted since it was played; nothing to attribute
         return
@@ -356,7 +377,7 @@ def _pbr_row(conn: sqlite3.Connection, base: str, uid: str, headers: dict[str, s
         art_id = db.canonical_id(conn, art_id)
         if db.add_event(conn, ts, art_id, "scrobble", WEIGHTS["scrobble"], SOURCE,
                         {"track": item.get("Name"), "album": item.get("Album"),
-                         "seconds": duration}, dedup=f"pbr{rowid}"):
+                         "seconds": duration}, dedup=f"pbr{rowid}", profile=profile):
             stats["pbr_scrobbles"] += 1
         return
     if kind == "Episode":
@@ -381,11 +402,11 @@ def _pbr_row(conn: sqlite3.Connection, base: str, uid: str, headers: dict[str, s
         target = db.canonical_id(conn, minted)
         runtime = int(item.get("RunTimeTicks") or 0) // 10_000_000
         if runtime and duration >= PBR_COMPLETE_FRAC * runtime \
-                and _flag_event(conn, target, "complete", ts):
+                and _flag_event(conn, profile, target, "complete", ts):
             stats["pbr_completes"] += 1
     else:
         return
     if db.add_event(conn, ts, target, "play", WEIGHTS["play"], SOURCE,
                     {"episode": item.get("Name")} if kind == "Episode"
-                    else {"seconds": duration}, dedup=f"pbr{rowid}"):
+                    else {"seconds": duration}, dedup=f"pbr{rowid}", profile=profile):
         stats["pbr_plays"] += 1

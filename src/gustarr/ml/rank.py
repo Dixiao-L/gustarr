@@ -1,4 +1,4 @@
-"""Score the candidate pool and queue proposals.
+"""Score each profile's candidate pool and queue proposals for them.
 
 MMR keeps a run's picks from clustering on one taste mode; a slice of
 each run is reserved for exploration so ranking never goes fully
@@ -42,8 +42,9 @@ SEREN_FLOOR_PCT = 10.0
 NOVELTY_PCT = 60.0
 
 
-def _state_json(conn: sqlite3.Connection, key: str) -> dict | None:
-    raw = db.get_state(conn, key)
+def _state_json(conn: sqlite3.Connection, profile: str, key: str) -> dict | None:
+    # train writes heads/centroids under the profile namespace now.
+    raw = db.pget_state(conn, profile, key)
     return json.loads(raw) if raw else None
 
 
@@ -62,21 +63,27 @@ def _unit_rows(x: np.ndarray) -> np.ndarray:
     return x / norms
 
 
-def _pool(conn: sqlite3.Connection, domain: str) -> dict[str, dict]:
-    """Candidates still worth proposing: not owned, not already queued,
-    not actively snoozed, never explicitly rejected."""
-    # The partial unique index only guards proposed/approved, so the
-    # active-snooze block must live in this query, not in the schema.
+def _pool(conn: sqlite3.Connection, profile: str, domain: str) -> dict[str, dict]:
+    """Candidates still worth proposing to this profile: not owned, not
+    already queued for them, not actively snoozed by them, never
+    explicitly rejected by them. The library block stays global (one
+    disk); the verdict blocks are personal — another profile's reject or
+    open rec must not veto this one's proposal."""
+    # The partial unique index only guards (profile,item_id) over
+    # proposed/approved, so the active-snooze block must live in this
+    # query, not in the schema.
     rows = conn.execute(
         "SELECT c.item_id, c.source, c.external_score, c.seed_item_id"
         " FROM candidates c JOIN items i ON i.id = c.item_id"
-        " WHERE i.domain = ?"
+        " WHERE i.domain = ? AND c.profile = ?"
         "   AND c.item_id NOT IN (SELECT item_id FROM library)"
         "   AND c.item_id NOT IN (SELECT item_id FROM recommendations"
-        "                         WHERE status IN ('proposed','approved')"
-        "                            OR (status='snoozed' AND acted_at >= ?))"
-        "   AND c.item_id NOT IN (SELECT item_id FROM events WHERE kind='reject')",
-        (domain, snooze_cutoff()),
+        "                         WHERE profile = ?"
+        "                           AND (status IN ('proposed','approved')"
+        "                                OR (status='snoozed' AND acted_at >= ?)))"
+        "   AND c.item_id NOT IN (SELECT item_id FROM events"
+        "                         WHERE profile = ? AND kind='reject')",
+        (domain, profile, profile, snooze_cutoff(), profile),
     )
     info: dict[str, dict] = {}
     for r in rows:
@@ -118,22 +125,27 @@ def _base_scores(
 
 def _rescore_open(
     conn: sqlite3.Connection,
+    profile: str,
     domain: str,
     model_name: str,
     head: dict | None,
     centroid: dict | None,
 ) -> int:
-    """Put still-open proposals on the current scorer's scale.
+    """Put this profile's still-open proposals on its current scorer's
+    scale.
 
     Frozen scores from earlier runs are not comparable to fresh ones
     (head sigmoid vs centroid (s+1)/2, plus drift across retrains), yet
     apply ranks the whole open queue numerically for the weekly budget
     and overflow expiry. Base score only: the source/ext bonus is
     normalised against a single run's pool, so it has no comparable
-    value here. Items without embeddings keep their old score."""
+    value here. Items without embeddings keep their old score. Scoped
+    per profile because each profile's scorer is a different function —
+    rescoring alice's queue with bob's head would be nonsense."""
     rows = conn.execute(
-        "SELECT id, item_id FROM recommendations WHERE domain=? AND status='proposed'",
-        (domain,),
+        "SELECT id, item_id FROM recommendations"
+        " WHERE profile=? AND domain=? AND status='proposed'",
+        (profile, domain),
     ).fetchall()
     if not rows:
         return 0
@@ -215,9 +227,6 @@ def _select(
 
 
 def run(conn: sqlite3.Connection, cfg: Config, top: int = 20) -> dict:
-    model_name = cfg.model.embed_model
-    lam = cfg.model.diversity_lambda
-    explore_frac = settings.get(conn, cfg, "exploration_frac")
     now_dt = datetime.now(timezone.utc)
     run_id = now_dt.strftime("%Y%m%d%H%M%S")
     ts = db.now()
@@ -225,13 +234,39 @@ def run(conn: sqlite3.Connection, cfg: Config, top: int = 20) -> dict:
         "proposed": 0, "expired": 0, "unsnoozed": 0, "unembedded": 0, "rescored": 0,
         "stale_state": 0,
     }
+    ttl_cutoff = (now_dt - timedelta(days=cfg.autonomy.proposal_ttl_days)) \
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+    for profile in cfg.profiles:
+        _rank_profile(conn, cfg, profile, run_id, ts, top, stats)
+        # Expiry/unsnooze run inside the profile loop so a profile removed
+        # from config keeps its rows frozen instead of silently expiring.
+        stats["expired"] += conn.execute(
+            "UPDATE recommendations SET status='expired', acted_at=?"
+            " WHERE profile=? AND status='proposed' AND ts < ?",
+            (ts, profile, ttl_cutoff)).rowcount
+        # A snooze is a timer, not a verdict: once it lapses the rec becomes
+        # 'expired', which candidates/rank treat as re-proposable.
+        stats["unsnoozed"] += conn.execute(
+            "UPDATE recommendations SET status='expired', acted_at=?"
+            " WHERE profile=? AND status='snoozed' AND acted_at < ?",
+            (ts, profile, snooze_cutoff())).rowcount
+    return stats
+
+
+def _rank_profile(
+    conn: sqlite3.Connection, cfg: Config, profile: str,
+    run_id: str, ts: str, top: int, stats: dict,
+) -> None:
+    model_name = cfg.model.embed_model
+    lam = cfg.model.diversity_lambda
+    explore_frac = settings.get(conn, cfg, "exploration_frac")
 
     domains = [r["domain"] for r in conn.execute(
         "SELECT DISTINCT i.domain FROM candidates c JOIN items i ON i.id = c.item_id"
-        " ORDER BY i.domain")]
+        " WHERE c.profile = ? ORDER BY i.domain", (profile,))]
     for domain in domains:
-        head = _state_json(conn, f"model:{domain}")
-        centroid = _state_json(conn, f"centroid:{domain}")
+        head = _state_json(conn, profile, f"model:{domain}")
+        centroid = _state_json(conn, profile, f"centroid:{domain}")
         # State trained in another embedding space scores garbage even when
         # the dims coincide — treat it as absent until train refits.
         if head is not None and head.get("embed_model") != model_name:
@@ -243,18 +278,18 @@ def run(conn: sqlite3.Connection, cfg: Config, top: int = 20) -> dict:
         if head is None and centroid is None and domain == "album":
             # Nothing listens "to an album" in the event stream yet, so the
             # album domain has no labels of its own — score against the
-            # artist taste model (same embedding space, same musical taste)
-            # until album-level feedback accumulates.
-            head = _state_json(conn, "model:artist")
-            centroid = _state_json(conn, "centroid:artist")
+            # profile's artist taste model (same embedding space, same
+            # musical taste) until album-level feedback accumulates.
+            head = _state_json(conn, profile, "model:artist")
+            centroid = _state_json(conn, profile, "centroid:artist")
             if head is not None and head.get("embed_model") != model_name:
                 head = None
             if centroid is not None and centroid.get("embed_model") != model_name:
                 centroid = None
         if head is None and centroid is None:
             continue
-        stats["rescored"] += _rescore_open(conn, domain, model_name, head, centroid)
-        info = _pool(conn, domain)
+        stats["rescored"] += _rescore_open(conn, profile, domain, model_name, head, centroid)
+        info = _pool(conn, profile, domain)
         if not info:
             continue
         vecs = {
@@ -289,11 +324,13 @@ def run(conn: sqlite3.Connection, cfg: Config, top: int = 20) -> dict:
         if domain in ("movie", "series"):
             # Respect the video queue cap here rather than letting apply
             # mass-expire the overflow later — proposing 80 and trimming
-            # to the cap churned 180 enriched items in one night.
+            # to the cap churned 180 enriched items in one night. The cap
+            # bounds each profile's own approval queue, so it counts only
+            # this profile's open video proposals.
             open_video = conn.execute(
                 "SELECT COUNT(*) FROM recommendations"
-                " WHERE status='proposed' AND domain IN ('movie','series')"
-            ).fetchone()[0]
+                " WHERE profile=? AND status='proposed' AND domain IN ('movie','series')",
+                (profile,)).fetchone()[0]
             cap = settings.get(conn, cfg, "video_queue_max_pending")
             slots = max(0, min(slots, cap - open_video))
         slots = min(slots, len(ids))
@@ -326,26 +363,15 @@ def run(conn: sqlite3.Connection, cfg: Config, top: int = 20) -> dict:
             }
             if j in explored and info[item_id]["sources"] & SERENDIPITY_SOURCES:
                 why["serendipity"] = True
-            # OR IGNORE: the partial unique index on open recommendations
-            # is the last line of defence against double-queueing.
+            # OR IGNORE: the partial unique index on (profile, item_id)
+            # over open recommendations is the last line of defence
+            # against double-queueing — per profile, so two profiles may
+            # each hold their own open rec for the same item.
             cur = conn.execute(
                 "INSERT OR IGNORE INTO recommendations"
-                " (run_id, ts, domain, item_id, score, why, status)"
-                " VALUES (?,?,?,?,?,?,'proposed')",
-                (run_id, ts, domain, item_id, float(scores[j]), json.dumps(why)))
+                " (profile, run_id, ts, domain, item_id, score, why, status)"
+                " VALUES (?,?,?,?,?,?,?,'proposed')",
+                (profile, run_id, ts, domain, item_id, float(scores[j]), json.dumps(why)))
             if cur.rowcount:
                 stats["proposed"] += 1
                 stats[domain] = stats.get(domain, 0) + 1
-
-    cutoff = (now_dt - timedelta(days=cfg.autonomy.proposal_ttl_days)) \
-        .strftime("%Y-%m-%dT%H:%M:%SZ")
-    cur = conn.execute(
-        "UPDATE recommendations SET status='expired', acted_at=?"
-        " WHERE status='proposed' AND ts < ?", (ts, cutoff))
-    stats["expired"] = cur.rowcount
-    # A snooze is a timer, not a verdict: once it lapses the rec becomes
-    # 'expired', which candidates/rank treat as re-proposable.
-    stats["unsnoozed"] = conn.execute(
-        "UPDATE recommendations SET status='expired', acted_at=?"
-        " WHERE status='snoozed' AND acted_at < ?", (ts, snooze_cutoff())).rowcount
-    return stats

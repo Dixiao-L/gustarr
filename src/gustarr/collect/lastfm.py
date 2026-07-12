@@ -113,14 +113,35 @@ def sync(
 ) -> dict[str, Any]:
     # api_key alone is a legitimate config (enrich/candidates use it
     # without a user), so skip instead of KeyError-ing the pipeline.
-    api_key, user = cfg.lastfm.get("api_key"), cfg.lastfm.get("user")
-    if not (api_key and user):
+    api_key = cfg.lastfm.get("api_key")
+    users = {name: p.lastfm_user for name, p in cfg.profiles.items() if p.lastfm_user}
+    if not (api_key and users):
         return {"skipped": "lastfm not fully configured"}
-    stats: dict[str, Any] = {"scrobbles": 0, "loved": 0, "items": 0, "pages": 0}
+    # flat totals across profiles: the per-profile split isn't actionable
+    # in a pipeline log line, and single-user setups keep the old shape
+    stats: dict[str, Any] = {"scrobbles": 0, "loved": 0, "items": 0, "pages": 0,
+                             "profiles": 0,
+                             "profiles_skipped": len(cfg.profiles) - len(users)}
+    for profile, user in users.items():
+        stats["profiles"] += 1
+        _sync_profile(conn, profile, user, api_key, full, transport, stats)
+    return stats
+
+
+def _sync_profile(
+    conn: sqlite3.Connection,
+    profile: str,
+    user: str,
+    api_key: str,
+    full: bool,
+    transport: httpx.BaseTransport | None,
+    stats: dict[str, Any],
+) -> None:
+    """One profile's walk: its own uts cursor, events under its profile."""
     seen_items: set[str] = set()
     base = {"api_key": api_key, "user": user, "format": "json", "limit": PAGE_LIMIT}
 
-    cursor = None if full else db.get_state(conn, CURSOR_KEY)
+    cursor = None if full else db.pget_state(conn, profile, CURSOR_KEY)
     recent = {**base, "method": "user.getrecenttracks", "extended": 1}
     if cursor:
         recent["from"] = int(cursor) + 1
@@ -137,12 +158,13 @@ def sync(
         except ValueError:
             continue
         ts = _iso(uts)
-        if db.add_event(conn, ts, track_id, "scrobble", WEIGHTS["scrobble"], "lastfm"):
+        if db.add_event(conn, ts, track_id, "scrobble", WEIGHTS["scrobble"], "lastfm",
+                        profile=profile):
             stats["scrobbles"] += 1
         # dedup=track_id: two different tracks scrobbled the same second
         # must both count on the artist item; re-syncs still collide.
         db.add_event(conn, ts, artist_id, "scrobble", WEIGHTS["scrobble"], "lastfm",
-                     dedup=track_id)
+                     dedup=track_id, profile=profile)
         seen_items.update((track_id, artist_id))
         max_uts = max(max_uts, uts)
 
@@ -155,13 +177,13 @@ def sync(
         except ValueError:
             continue
         ts = _iso(uts)
-        if db.add_event(conn, ts, track_id, "loved", WEIGHTS["loved"], "lastfm"):
+        if db.add_event(conn, ts, track_id, "loved", WEIGHTS["loved"], "lastfm",
+                        profile=profile):
             stats["loved"] += 1
         db.add_event(conn, ts, artist_id, "loved", WEIGHTS["loved"], "lastfm",
-                     dedup=track_id)
+                     dedup=track_id, profile=profile)
         seen_items.update((track_id, artist_id))
 
     if max_uts:
-        db.set_state(conn, CURSOR_KEY, str(max_uts))
-    stats["items"] = len(seen_items)
-    return stats
+        db.pset_state(conn, profile, CURSOR_KEY, str(max_uts))
+    stats["items"] += len(seen_items)

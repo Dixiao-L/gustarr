@@ -141,9 +141,12 @@ def test_cf_candidates_scores_and_artist_aggregation(conn, cfg, monkeypatch):
 
     assert stats["cf_tracks"] == 4
     assert stats["cf_artists"] == 2
+    assert stats["profiles"] == 1 and stats["profiles_skipped"] == 0
 
     row = candidate(conn, f"track:mbid:{MBID_A}", "listenbrainz_cf")
     assert row["external_score"] == pytest.approx(0.9)
+    # legacy single-user config: rows belong to the synthesized default
+    assert row["profile"] == "default"
     item = conn.execute("SELECT * FROM items WHERE id=?", (f"track:mbid:{MBID_A}",)).fetchone()
     assert item["title"] == "Song A"
     assert json.loads(item["meta"])["artist"] == "Artist One"

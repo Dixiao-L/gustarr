@@ -1,4 +1,4 @@
-# gustarr — CPU image. Torch comes from the PyTorch CPU wheel index so the
+# Gustarr — CPU image. Torch comes from the PyTorch CPU wheel index so the
 # image stays ~2 GB and runs on any host. GPU users: prefer the NixOS module
 # (flake ships a CUDA `ml` variant), or build a variant of this image
 # installing the cu13 wheels instead of the cpu ones.
@@ -24,8 +24,8 @@ RUN pip install "/src[ml]"
 # ── runtime ──────────────────────────────────────────────────────────
 FROM python:3.12-slim
 
-LABEL org.opencontainers.image.title="gustarr" \
-      org.opencontainers.image.description="Learns one user's media taste and drives Sonarr/Radarr/Lidarr" \
+LABEL org.opencontainers.image.title="Gustarr" \
+      org.opencontainers.image.description="Learns your media taste, one profile per person, and drives Sonarr/Radarr/Lidarr" \
       org.opencontainers.image.source="https://github.com/Dixiao-L/gustarr" \
       org.opencontainers.image.licenses="MIT"
 
@@ -51,6 +51,8 @@ WORKDIR /var/lib/gustarr
 EXPOSE 8790
 
 ENTRYPOINT ["gustarr"]
-# default: serve the approval UI; override for pipelines, e.g.
+# default: serve the approval UI. With [scheduler] nightly = "HH:MM" in the
+# TOML, this same process also launches the nightly pipeline — no host cron.
+# One-shots still work for manual runs or cron-style scheduling, e.g.
 #   docker compose run --rm gustarr run nightly
 CMD ["web"]

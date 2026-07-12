@@ -113,6 +113,8 @@ def test_first_sync_items_library_events(conn, cfg, fake_http):
     assert ev["kind"] == "library_add" and ev["source"] == "arr"
     assert ev["ts"] == "2024-01-05T10:00:00Z"
     assert ev["weight"] == WEIGHTS["library_add"]
+    # legacy single-user config: the fan-out is exactly the default profile
+    assert ev["profile"] == "default"
     # the gustarr-tagged add produced no event
     assert conn.execute(
         "SELECT COUNT(*) FROM events WHERE item_id='movie:tmdb:949'").fetchone()[0] == 0
@@ -166,3 +168,29 @@ def test_unconfigured_arrs_skipped(conn, tmp_path, monkeypatch, responses):
     stats = arr.sync(conn, cfg)
     assert stats["items"] == 2
     assert urls and all(u.startswith(RADARR) for u in urls)
+
+
+def test_events_fan_out_to_every_profile(conn, tmp_path, fake_http, responses):
+    # the *arr can't say who added or deleted — the whole household gets
+    # the (modest) signal, per the profile contract
+    cfg = C._build({
+        "core": {"data_dir": str(tmp_path)},
+        "radarr": {"url": RADARR, "api_key": "rk"},
+        "profiles": {"alice": {"lastfm_user": "a"}, "bob": {}},
+    })
+    stats = arr.sync(conn, cfg)
+
+    assert stats["events"] == 2  # one library_add per profile (Heat is tagged)
+    adds = {r["profile"] for r in conn.execute(
+        "SELECT profile FROM events WHERE kind='library_add' AND item_id='movie:tmdb:603'")}
+    assert adds == {"alice", "bob"}
+    # library stays global: one row, no profile dimension
+    assert conn.execute("SELECT COUNT(*) FROM library").fetchone()[0] == 2
+
+    # deleting the gustarr-tagged movie rejects for the whole household too
+    responses[f"{RADARR}/api/v3/movie"] = []
+    stats = arr.sync(conn, cfg)
+    assert stats["rejects"] == 2
+    rejects = {(r["profile"], r["item_id"]) for r in conn.execute(
+        "SELECT profile, item_id FROM events WHERE kind='reject'")}
+    assert rejects == {("alice", "movie:tmdb:949"), ("bob", "movie:tmdb:949")}

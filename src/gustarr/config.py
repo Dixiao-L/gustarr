@@ -77,12 +77,23 @@ class ModelConfig:
 
 
 @dataclass
+class ProfileConfig:
+    """One person's identity across the signal sources. The 'default'
+    profile is synthesized from the legacy top-level sections so existing
+    single-user configs keep working unchanged."""
+    jellyfin_user: str = ""
+    lastfm_user: str = ""
+    listenbrainz_user: str = ""
+
+
+@dataclass
 class Config:
     db_path: Path
     data_dir: Path
     jellyfin: dict[str, Any] = field(default_factory=dict)
     lastfm: dict[str, Any] = field(default_factory=dict)
     listenbrainz: dict[str, Any] = field(default_factory=dict)
+    profiles: dict[str, ProfileConfig] = field(default_factory=dict)
     tmdb: dict[str, Any] = field(default_factory=dict)
     sonarr: ArrConfig | None = None
     radarr: ArrConfig | None = None
@@ -118,12 +129,27 @@ def _build(raw: dict[str, Any]) -> Config:
         known = {k: v for k, v in raw[section].items() if k in ArrConfig.__dataclass_fields__}
         return ArrConfig(**known)
 
+    profiles: dict[str, ProfileConfig] = {}
+    for name, p in (raw.get("profiles") or {}).items():
+        profiles[name] = ProfileConfig(
+            jellyfin_user=p.get("jellyfin_user", ""),
+            lastfm_user=p.get("lastfm_user", ""),
+            listenbrainz_user=p.get("listenbrainz_user", ""),
+        )
+    if not profiles:
+        profiles["default"] = ProfileConfig(
+            jellyfin_user=raw.get("jellyfin", {}).get("user", ""),
+            lastfm_user=raw.get("lastfm", {}).get("user", ""),
+            listenbrainz_user=raw.get("listenbrainz", {}).get("user", ""),
+        )
+
     return Config(
         db_path=Path(core.get("db_path", data_dir / "gustarr.db")),
         data_dir=data_dir,
         jellyfin=raw.get("jellyfin", {}),
         lastfm=raw.get("lastfm", {}),
         listenbrainz=raw.get("listenbrainz", {}),
+        profiles=profiles,
         tmdb=raw.get("tmdb", {}),
         sonarr=arr("sonarr"),
         radarr=arr("radarr"),

@@ -248,10 +248,10 @@ def conn(tmp_path):
     c.close()
 
 
-def make_cfg(tmp_path, **autonomy):
+def make_cfg(tmp_path, profiles=None, **autonomy):
     auto = {"music_mode": "auto", "video_mode": "queue"}
     auto.update(autonomy)
-    return C._build({
+    raw = {
         "core": {"data_dir": str(tmp_path)},
         "jellyfin": {"url": "http://jellyfin.test", "api_key": "jk", "user": "u"},
         "radarr": {"url": "http://radarr.test", "api_key": "rk",
@@ -261,16 +261,20 @@ def make_cfg(tmp_path, **autonomy):
         "lidarr": {"url": "http://lidarr.test", "api_key": "lk",
                    "quality_profile": "Standard", "root_folder": "/music"},
         "autonomy": auto,
-    })
+    }
+    if profiles:
+        raw["profiles"] = {name: {} for name in profiles}
+    return C._build(raw)
 
 
 def add_rec(conn, item_id, domain, title, ids_json, status="proposed",
-            score=1.0, acted_at=None, ts=None):
+            score=1.0, acted_at=None, ts=None, profile="default"):
     db.upsert_item(conn, item_id, domain, title=title, ids=ids_json)
     cur = conn.execute(
-        "INSERT INTO recommendations (run_id, ts, domain, item_id, score, why, status, acted_at)"
-        " VALUES (?,?,?,?,?,?,?,?)",
-        ("test", ts or db.now(), domain, item_id, score, "{}", status, acted_at))
+        "INSERT INTO recommendations"
+        " (profile, run_id, ts, domain, item_id, score, why, status, acted_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?)",
+        (profile, "test", ts or db.now(), domain, item_id, score, "{}", status, acted_at))
     return cur.lastrowid
 
 
@@ -395,6 +399,30 @@ def test_music_weekly_cap_respected(conn, tmp_path, net):
         [("auto_add", 0.0, "gustarr")]
     assert "auto_add" not in signals.WEIGHTS
     assert signals.aggregate_label([(e["ts"], e["kind"], e["weight"]) for e in events]) == 0.0
+
+
+def test_music_budget_shared_across_profiles(conn, tmp_path, net):
+    """One disk, one Lidarr: what alice's queue already spent this week
+    is gone for bob — the acted count ignores profile by design."""
+    cfg = make_cfg(tmp_path, profiles=["alice", "bob"], music_max_artists_per_week=2)
+    add_rec(conn, "artist:mbid:aa1", "artist", "Alice Spent", {"mbid": "aa1"},
+            status="auto_added", acted_at=db.now(), profile="alice")
+    b1 = add_rec(conn, "artist:mbid:b1", "artist", "Bob 1", {"mbid": "b1"}, score=0.9,
+                 profile="bob")
+    b2 = add_rec(conn, "artist:mbid:b2", "artist", "Bob 2", {"mbid": "b2"}, score=0.8,
+                 profile="bob")
+
+    stats = apply_mod.run(conn, cfg)
+
+    assert stats["music_budget"] == 1  # cap 2 minus alice's add, not bob's own 2
+    assert stats["music_added"] == 1
+    assert [b["foreignArtistId"] for b in net.lidarr.posted] == ["b1"]
+    assert rec_row(conn, b1)["status"] == "auto_added"
+    assert rec_row(conn, b2)["status"] == "proposed"
+    # the audit event names whose queue the add came from
+    ev = conn.execute(
+        "SELECT profile, kind FROM events WHERE item_id='artist:mbid:b1'").fetchone()
+    assert (ev["profile"], ev["kind"]) == ("bob", "auto_add")
 
 
 def test_music_queue_mode_leaves_proposed(conn, tmp_path, net):
