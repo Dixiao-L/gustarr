@@ -56,6 +56,15 @@ def create_app(cfg: Config) -> FastAPI:
     # No scheduling here by design: the web process serves the approval UI
     # and nothing else. `gustarr schedule` is its own process.
     profiles = list(cfg.profiles) or ["default"]
+    bind_host = _hostname(str(cfg.web.get("bind", "127.0.0.1:8790"))) or "127.0.0.1"
+    if len(profiles) > 1 and bind_host not in ("127.0.0.1", "::1", "localhost"):
+        # Gustarr never authenticates; it maps identities the deployment
+        # vouches for. Say so where the operator will see it.
+        print("gustarr web: multiple profiles on a non-loopback bind — profile"
+              " identity is only as trustworthy as the path to this port"
+              " (authenticating reverse proxy setting"
+              f" {cfg.web.get('profile_header', 'Remote-User')!r}, or network"
+              " isolation). See docs/security.md.", flush=True)
     profile_header = cfg.web.get("profile_header", "Remote-User")
 
     def get_profile(request: Request) -> str:
