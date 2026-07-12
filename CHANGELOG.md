@@ -4,6 +4,13 @@ All notable changes to Gustarr are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/).
 
+## [0.2.1] - 2026-07-12
+
+### Changed
+- Scheduling is a dedicated process (gustarr schedule) — never a thread
+  inside the web UI. Compose runs it as a second service from the same
+  image; the web process serves the approval queue and nothing else.
+
 ## [0.2.0] - 2026-07-12
 
 ### Added

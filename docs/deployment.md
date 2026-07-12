@@ -28,7 +28,7 @@ The module runs no thinking daemon: `gustarr-nightly` and `gustarr-weekly`
 are oneshot services on timers, and the only long-running process is the web
 UI. Units are hardened (`ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`,
 `NoNewPrivileges`) and run as the `gustarr` system user. Leave `[scheduler]`
-unset here — the built-in scheduler exists for containers; systemd timers
+unset here — the `gustarr schedule` service exists for containers; systemd timers
 are the better privilege boundary and survive web-service restarts.
 
 ### Option reference (`services.gustarr.*`)
@@ -107,9 +107,11 @@ Container specifics:
 - The container runs as a non-root `gustarr` user (uid 1000). If you bind-mount
   a host directory instead of a named volume, `chown 1000` it.
 
-### Scheduling: the built-in scheduler
+### Scheduling: the `gustarr schedule` service
 
-The primary path for containers is the **built-in scheduler**: set
+The primary path for containers is the **scheduler service** — `gustarr
+schedule`, a single-purpose foreground process from the same image (the web
+process never runs the pipeline; one process, one job): set
 
 ```toml
 [scheduler]
@@ -119,7 +121,7 @@ nightly = "04:30"          # local time — set TZ on the container
 and the web container runs `gustarr run nightly` itself, once a day. No host
 cron, no sidecar. Properties worth knowing:
 
-- The pipeline runs as a **subprocess** of the web process — it never blocks
+- The pipeline runs as a **subprocess** of the scheduler process — it never blocks
   the UI, and a pipeline crash never takes the UI down. Start and exit code
   are logged to the container's stdout (`docker compose logs gustarr`).
 - One fire per day; if a slot comes up while the previous run is still

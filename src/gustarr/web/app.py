@@ -26,7 +26,7 @@ from urllib.parse import urlsplit
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from .. import db, queue, scheduler, settings
+from .. import db, queue, settings
 from ..config import Config
 
 _INDEX = Path(__file__).parent / "static" / "index.html"
@@ -53,9 +53,8 @@ def _allowed_hosts(cfg: Config) -> set[str]:
 def create_app(cfg: Config) -> FastAPI:
     app = FastAPI(title="Gustarr", docs_url=None, redoc_url=None)
     allowed = _allowed_hosts(cfg)
-    # Container deployments schedule the nightly pipeline from inside the
-    # web process ([scheduler] nightly); start() is a no-op when unset.
-    scheduler.start(cfg)
+    # No scheduling here by design: the web process serves the approval UI
+    # and nothing else. `gustarr schedule` is its own process.
     profiles = list(cfg.profiles) or ["default"]
     profile_header = cfg.web.get("profile_header", "Remote-User")
 

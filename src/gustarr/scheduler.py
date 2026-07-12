@@ -15,7 +15,6 @@ from __future__ import annotations
 import shutil
 import subprocess
 import sys
-import threading
 import time
 from datetime import datetime
 from typing import Any, Callable
@@ -86,13 +85,14 @@ class Scheduler:
             self.tick(clock())
 
 
-def start(cfg: Config) -> Scheduler | None:
-    """Start the daemon thread when ``[scheduler] nightly`` is configured;
-    a no-op (None) otherwise, so timer-based deployments are unaffected."""
+def main(cfg: Config) -> None:
+    """`gustarr schedule`: a single-purpose foreground process — sleep,
+    fire the pipeline at the configured local time, repeat. Scheduling
+    deliberately does NOT live inside the web process: one process, one
+    job. Container users run this as a second service from the same
+    image; systemd/cron users don't run it at all."""
     at = (cfg.raw.get("scheduler") or {}).get("nightly")
     if not at:
-        return None
-    sched = Scheduler(str(at))
-    threading.Thread(target=sched.run_forever, name="gustarr-scheduler", daemon=True).start()
-    print(f"scheduler: nightly pipeline scheduled at {at} local time", flush=True)
-    return sched
+        raise SystemExit("gustarr schedule: [scheduler] nightly = \"HH:MM\" is not configured")
+    print(f"scheduler: nightly pipeline at {at} local time", flush=True)
+    Scheduler(str(at)).run_forever()
