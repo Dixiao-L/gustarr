@@ -25,14 +25,15 @@ def _headers(cfg: Config) -> dict[str, str]:
 
 
 def _upsert_candidate(
-    conn: sqlite3.Connection, item_id: str, source: str, score: float | None, ts: str
+    conn: sqlite3.Connection, profile: str, item_id: str, source: str,
+    score: float | None, ts: str
 ) -> None:
     conn.execute(
-        "INSERT INTO candidates (item_id, source, external_score, first_seen, last_seen)"
-        " VALUES (?,?,?,?,?)"
-        " ON CONFLICT(item_id, source) DO UPDATE SET"
+        "INSERT INTO candidates (profile, item_id, source, external_score,"
+        " first_seen, last_seen) VALUES (?,?,?,?,?,?)"
+        " ON CONFLICT(profile, item_id, source) DO UPDATE SET"
         " last_seen=excluded.last_seen, external_score=excluded.external_score",
-        (item_id, source, score, ts, ts),
+        (profile, item_id, source, score, ts, ts),
     )
 
 
@@ -69,7 +70,7 @@ def _fetch_metadata(mbids: list[str], headers: dict[str, str]) -> dict[str, Any]
     return resolved
 
 
-def _sync_cf(conn: sqlite3.Connection, user: str, headers: dict[str, str],
+def _sync_cf(conn: sqlite3.Connection, profile: str, user: str, headers: dict[str, str],
              stats: dict[str, Any]) -> None:
     data = get_json(f"{API}/1/cf/recommendation/user/{user}/recording",
                     params={"count": 200}, headers=headers)
@@ -106,7 +107,7 @@ def _sync_cf(conn: sqlite3.Connection, user: str, headers: dict[str, str],
         track_id = ids.make("track", "mbid", mbid)
         db.upsert_item(conn, track_id, "track", title=recording.get("name"),
                        ids={"mbid": mbid}, meta=meta)
-        _upsert_candidate(conn, track_id, "listenbrainz_cf", score, ts)
+        _upsert_candidate(conn, profile, track_id, "listenbrainz_cf", score, ts)
         stats["cf_tracks"] += 1
         numeric = float(score) if isinstance(score, (int, float)) else 0.0
         if artist_id:
@@ -123,7 +124,7 @@ def _sync_cf(conn: sqlite3.Connection, user: str, headers: dict[str, str],
                 album_best[album_id] = (release["name"], artist_name, artist_id, numeric)
 
     for artist_id, (_, best) in artist_best.items():
-        _upsert_candidate(conn, artist_id, "listenbrainz_cf_artist", best, ts)
+        _upsert_candidate(conn, profile, artist_id, "listenbrainz_cf_artist", best, ts)
         stats["cf_artists"] += 1
 
     for album_id, (title, artist_name, artist_id, best) in album_best.items():
@@ -136,7 +137,7 @@ def _sync_cf(conn: sqlite3.Connection, user: str, headers: dict[str, str],
                 ids_d["artist_mbid"] = key
                 meta["artist_mbid"] = key
         db.upsert_item(conn, album_id, "album", title=title, ids=ids_d, meta=meta)
-        _upsert_candidate(conn, album_id, "listenbrainz_cf_album", best, ts)
+        _upsert_candidate(conn, profile, album_id, "listenbrainz_cf_album", best, ts)
         stats["cf_albums"] += 1
 
 
@@ -148,7 +149,7 @@ def _recording_mbid(track: dict[str, Any]) -> str | None:
     return mbid or None
 
 
-def _sync_weekly(conn: sqlite3.Connection, user: str, headers: dict[str, str],
+def _sync_weekly(conn: sqlite3.Connection, profile: str, user: str, headers: dict[str, str],
                  stats: dict[str, Any]) -> None:
     listing = get_json(f"{API}/1/user/{user}/playlists/createdfor", headers=headers) or {}
     weekly = [
@@ -175,23 +176,29 @@ def _sync_weekly(conn: sqlite3.Connection, user: str, headers: dict[str, str],
         if creator:
             # JSPF carries no artist MBID; enrich upgrades this later.
             _upsert_artist(conn, ids.make("artist", "lastfm", creator), creator)
-        _upsert_candidate(conn, track_id, "listenbrainz_weekly", None, ts)
+        _upsert_candidate(conn, profile, track_id, "listenbrainz_weekly", None, ts)
         stats["weekly_tracks"] += 1
 
 
 def sync(conn: sqlite3.Connection, cfg: Config) -> dict[str, Any]:
-    """CF recommendations + Weekly Exploration playlist → candidates rows."""
-    user = cfg.listenbrainz.get("user")
-    if not user:
+    """CF recommendations + Weekly Exploration playlist → candidates rows,
+    once per profile with a listenbrainz_user, each under its own profile.
+    Counts stay flat totals across profiles."""
+    users = {name: p.listenbrainz_user
+             for name, p in cfg.profiles.items() if p.listenbrainz_user}
+    if not users:
         return {"skipped": "listenbrainz not configured"}
     headers = _headers(cfg)
     stats: dict[str, Any] = {"cf_tracks": 0, "cf_artists": 0, "cf_albums": 0,
-                             "weekly_tracks": 0}
-    _sync_cf(conn, user, headers, stats)
-    try:
-        _sync_weekly(conn, user, headers, stats)
-    except Exception:
-        # Created-for playlists are a bonus signal; absence or API churn
-        # must never fail the sync.
-        stats["weekly"] = "unavailable"
+                             "weekly_tracks": 0, "profiles": 0,
+                             "profiles_skipped": len(cfg.profiles) - len(users)}
+    for profile, user in users.items():
+        stats["profiles"] += 1
+        _sync_cf(conn, profile, user, headers, stats)
+        try:
+            _sync_weekly(conn, profile, user, headers, stats)
+        except Exception:
+            # Created-for playlists are a bonus signal; absence or API churn
+            # must never fail the sync.
+            stats["weekly"] = "unavailable"
     return stats

@@ -1,24 +1,26 @@
-# gustarr
+# Gustarr
 
-**Learns one user's media taste from what they actually watch, listen to, and
-keep — then recommends and (with configurable autonomy) drives Sonarr / Radarr /
-Lidarr. Music, TV, movies.**
+**Learns your media taste — per person, one profile each — from what you
+actually watch, listen to, and keep, then recommends and (with configurable
+autonomy) drives Sonarr / Radarr / Lidarr. Music, TV, movies.**
 
 [![CI](https://github.com/Dixiao-L/gustarr/actions/workflows/ci.yml/badge.svg)](https://github.com/Dixiao-L/gustarr/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](pyproject.toml)
 
-## Why gustarr
+## Why Gustarr
 
 Built after a survey of the existing ecosystem found no mature project that
-genuinely learns a *single* user's taste: request portals (Jellyseerr/Ombi)
-have no learning, "AI" recommenders are LLM-prompt wrappers, and collaborative
-filtering engines (Gorse) structurally need a user *population*. gustarr adopts
-the mature periphery — TMDb/MusicBrainz metadata, ListenBrainz's open
-collaborative filtering, Jellyfin Playback Reporting — and builds only the
-missing core: a content-embedding taste model with a small learned preference
-head, which stays useful from ~50 interactions where classic CF collapses, and
-scores brand-new releases from metadata alone.
+genuinely learns an *individual* user's taste: request portals
+(Jellyseerr/Ombi) have no learning, "AI" recommenders are LLM-prompt wrappers,
+and collaborative filtering engines (Gorse) structurally need a user
+*population*. Gustarr adopts the mature periphery — TMDb/MusicBrainz metadata,
+ListenBrainz's open collaborative filtering, Jellyfin Playback Reporting — and
+builds only the missing core: a content-embedding taste model with a small
+learned preference head, which stays useful from ~50 interactions where
+classic CF collapses, and scores brand-new releases from metadata alone.
+Households get one such model per person ([profiles](#profiles)), never a
+population average.
 
 ## Features
 
@@ -26,10 +28,14 @@ scores brand-new releases from metadata alone.
   feeds a per-domain preference head over multilingual sentence embeddings.
   Label policy is one reviewable table ([`signals.py`](src/gustarr/signals.py)),
   not scattered heuristics.
+- **Profiles for households.** Each `[profiles.NAME]` gets its own taste
+  model, sync cursors and approval queue over the shared library; the web UI
+  resolves the active profile per request from a reverse-proxy auth header
+  (Authelia-style) or `?profile=`. Single-user setups need zero config.
 - **Anti-echo-chamber engineering, measured.** Serendipity candidates from
   under-represented genres/decades and 2-hop artist neighborhoods, exploration
   slots gated to be genuinely far from your taste centroid, soft rejects for
-  labeled long-shots, zero training weight for gustarr's own automatic adds —
+  labeled long-shots, zero training weight for Gustarr's own automatic adds —
   and `gustarr stats` reports the genre entropy of recent recommendations vs.
   your library so narrowing shows up as a number, not a feeling.
 - **Taste before you approve.** Queue cards in the web UI link the movie/series
@@ -90,7 +96,28 @@ metadata) and a [Last.fm API key](https://www.last.fm/api/account/create)
 (music metadata) — both free. Everything else is optional; see the
 [FAQ](#faq).
 
-### 1. pip / uv
+### 1. Docker (self-contained)
+
+```console
+$ cp docker-compose.example.yml docker-compose.yml
+$ cp gustarr.example.toml gustarr.toml     # set [web] bind = "0.0.0.0:8790",
+$                                          # [model] device = "cpu", and
+$                                          # [scheduler] nightly = "04:30"
+$ cat > gustarr.env <<'EOF'
+TMDB_API_KEY=...
+LASTFM_API_KEY=...
+SONARR_API_KEY=...
+EOF
+$ docker compose up -d gustarr             # web UI on :8790 — that's it
+```
+
+With `[scheduler] nightly = "HH:MM"` set, the web container runs the pipeline
+itself every night — no host cron, no extra services. Kick a run manually with
+the UI's **Run Now**, or `docker compose run --rm gustarr run nightly`. The
+image ships CPU-only torch (works everywhere, ~2 GB); GPU embedding is what
+the NixOS module is for. See [docs/deployment.md](docs/deployment.md).
+
+### 2. pip / uv
 
 ```console
 $ uv sync --extra ml         # full install, embedding included
@@ -105,29 +132,14 @@ $ uv run gustarr approve 12 15   # verdicts feed straight back into training
 $ uv run gustarr web             # or approve in the browser at 127.0.0.1:8790
 ```
 
-`pip install .[ml]` works the same way if you're not a uv person.
-
-### 2. Docker
-
-```console
-$ cp docker-compose.example.yml docker-compose.yml
-$ cp gustarr.example.toml gustarr.toml     # set [web] bind = "0.0.0.0:8790"
-$ cat > gustarr.env <<'EOF'
-TMDB_API_KEY=...
-LASTFM_API_KEY=...
-SONARR_API_KEY=...
-EOF
-$ docker compose up -d gustarr                          # web UI on :8790
-$ docker compose run --rm gustarr run nightly           # pipeline, from cron
-```
-
-The image is CPU-only torch (works everywhere, ~2 GB); GPU embedding is
-what the NixOS module is for. There's no scheduler in the container by
-design — point host cron (or a systemd timer) at
-`docker compose run --rm gustarr run nightly`. See
-[docs/deployment.md](docs/deployment.md).
+`pip install .[ml]` works the same way if you're not a uv person. Schedule
+`gustarr run nightly` with cron/systemd, or set `[scheduler] nightly` and let
+`gustarr web` do it.
 
 ### 3. NixOS flake module
+
+What the author runs in production: hardened systemd timers, agenix secrets,
+GPU embedding.
 
 ```nix
 {
@@ -158,6 +170,34 @@ This gives you hardened oneshot systemd timers (`gustarr-nightly`,
 secrets exclusively via `EnvironmentFile=` — the generated TOML never contains
 key material. Full option reference in [docs/deployment.md](docs/deployment.md).
 
+## Profiles
+
+Multi-user households get one taste model, one approval queue, and one set of
+sync cursors *per person* — over a shared library and shared auto-add budgets
+(one disk, one Lidarr):
+
+```toml
+[profiles.alice]
+jellyfin_user = "alice"
+lastfm_user = "alice-fm"
+
+[profiles.bob]
+jellyfin_user = "bob"
+listenbrainz_user = "bob-lb"
+```
+
+The web UI resolves the active profile on every request, in order: the
+reverse-proxy auth header (`[web] profile_header`, default `Remote-User` —
+exactly what Authelia forward-auth sets, so profile names should match your
+Authelia usernames), then `?profile=NAME`, then the sole configured profile.
+Unknown names are refused with a 403 rather than silently falling back —
+nobody's verdicts should ever train someone else's model. The active profile
+shows as a chip in the header when more than one is configured; runtime
+settings stay operator-global.
+
+No `[profiles]` section means a single implicit `default` profile wired to
+the top-level `user` keys — existing single-user setups work unchanged.
+
 ## Configuration
 
 One TOML file ([`gustarr.example.toml`](gustarr.example.toml) is a complete
@@ -170,6 +210,7 @@ resolved from the environment at load time, so the file is safe to commit.
 | `[core]` | `data_dir` | `/var/lib/gustarr` | store + model cache location |
 | `[core]` | `db_path` | `<data_dir>/gustarr.db` | SQLite store (WAL) |
 | `[jellyfin]` | `url`, `api_key`, `user` | — | watch/listen history, favorites |
+| `[profiles.NAME]` | `jellyfin_user`, `lastfm_user`, `listenbrainz_user` | — | one per household member; omit for single-user |
 | `[lastfm]` | `api_key` | — | required: music metadata + similar artists |
 | `[lastfm]` | `user` | — | optional: enables scrobble/loved sync |
 | `[listenbrainz]` | `user` | — | optional: CF recommendations + weekly playlist |
@@ -177,7 +218,7 @@ resolved from the environment at load time, so the file is safe to commit.
 | `[tmdb]` | `api_key` | — | required: movie/series metadata + candidates |
 | `[sonarr]` `[radarr]` `[lidarr]` | `url`, `api_key` | — | each *arr is optional |
 | ″ | `quality_profile`, `root_folder` | `""` | used when adding items |
-| ″ | `tag` | `"gustarr"` | gustarr only ever touches items with this tag |
+| ″ | `tag` | `"gustarr"` | Gustarr only ever touches items with this tag |
 | `[autonomy]` | `music_mode` | `"auto"` | `auto` or `queue` |
 | `[autonomy]` | `video_mode` | `"queue"` | `auto` or `queue` |
 | `[autonomy]` | `music_max_artists_per_week` | `3` | auto-add budget |
@@ -191,6 +232,8 @@ resolved from the environment at load time, so the file is safe to commit.
 | `[model]` | `diversity_lambda` | `0.3` | MMR trade-off, 0 = pure relevance |
 | `[web]` | `bind` | `"127.0.0.1:8790"` | web UI bind address |
 | `[web]` | `allowed_hosts` | `[]` | extra hostnames past the Host/Origin guard |
+| `[web]` | `profile_header` | `"Remote-User"` | forward-auth header mapped to a profile name |
+| `[scheduler]` | `nightly` | unset | `"HH:MM"` local time — `gustarr web` runs the nightly pipeline itself (for containers) |
 
 A handful of knobs (`paused`, `music_mode`, `music_max_artists_per_week`,
 `video_queue_max_pending`, `exploration_frac`) can also be flipped at runtime
@@ -204,7 +247,7 @@ How raw events become training labels — the single reviewable policy in
 
 | event | weight | source |
 |---|---|---|
-| `approve` | **+1.0** | your verdict on a gustarr recommendation |
+| `approve` | **+1.0** | your verdict on a Gustarr recommendation |
 | `reject` | **−1.0** | ″ (×0.3 if it was a labeled exploration pick) |
 | `loved` / `favorite` | +1.0 | Last.fm loved track / Jellyfin favorite |
 | `complete` | +0.8 | watched ≥85% of runtime |
@@ -216,14 +259,14 @@ How raw events become training labels — the single reviewable policy in
 
 Per-item aggregation applies a 1-year half-life recency decay, log-scales
 repeatable kinds (40 listens ≠ 40× a completed movie), and clips to [−1, 1].
-Items gustarr adds autonomously carry **zero** weight until you actually
+Items Gustarr adds autonomously carry **zero** weight until you actually
 watch, love, or reject them.
 
 ## Honest limitations
 
-- Single-user cold start is real. Until ~50 labeled interactions per domain,
-  rankings lean on external sources (ListenBrainz CF for music, TMDb
-  similarity for video) and your library composition.
+- Cold start is real. Until ~50 labeled interactions per domain (per
+  profile), rankings lean on external sources (ListenBrainz CF for music,
+  TMDb similarity for video) and your library composition.
 - TMDb terms nominally restrict ML use; embeddings stay local and are never
   redistributed.
 - Explanations are nearest liked-neighbours, not causal claims.
@@ -231,27 +274,27 @@ watch, love, or reject them.
 ## FAQ
 
 **Why not Jellyseerr / Ombi / SuggestArr?** Fit, not quality — they solve a
-different problem. Request portals are for households ("anyone can ask for
-anything"); gustarr is for one person who wants the library to quietly grow
-in their taste, with the model held accountable for every pick. If you have
-five users with different tastes, gustarr is the wrong tool: it is
-**single-user by design** — one taste model, one approval queue, no auth
-layer on the web UI (bind it to localhost or put it behind your reverse
-proxy).
+different problem. Request portals answer "anyone can ask for anything";
+Gustarr quietly grows the library in each person's taste, with the model held
+accountable for every pick. It learns **one person per profile** — a
+household is several individually-learned tastes over one library, never a
+blended average — and there is still no auth layer on the web UI (profiles
+are routing, not security: bind it to localhost or put it behind your
+reverse proxy).
 
 **Which API keys do I actually need?** TMDb and Last.fm, both free. You do
 **not** need a TVDB key — series resolve their TVDB ids through Sonarr's own
 inventory and TMDb's external-id mapping. And there's no shared-secret /
-password to configure: the web UI deliberately has no auth (single-user,
-localhost bind, Host/Origin guard); wider exposure is your reverse proxy's
-job.
+password to configure: the web UI deliberately has no auth (localhost bind,
+Host/Origin guard); wider exposure — and, for multi-profile households, the
+identity header — is your reverse proxy's job.
 
 **What does ListenBrainz add?** Optional, and free: its open collaborative
 filtering feeds the music candidate pool (raw CF recs plus your "Weekly
 Exploration" playlist), which carries the music side through cold start. Reads
 are anonymous — a token only lifts rate limits.
 
-**Does it delete things from my *arrs?** No. gustarr tags everything it adds
+**Does it delete things from my *arrs?** No. Gustarr tags everything it adds
 (default tag: `gustarr`) and never removes or modifies anything that doesn't
 carry that tag.
 
@@ -268,8 +311,8 @@ maintainers drop PNGs there — the directory ships empty in source checkouts.)*
 ## Documentation
 
 - [docs/architecture.md](docs/architecture.md) — pipeline stages, store schema, id namespaces, echo-chamber design
-- [docs/configuration.md](docs/configuration.md) — every TOML key, `env:` secrets, runtime-settings precedence
-- [docs/deployment.md](docs/deployment.md) — NixOS module reference, Docker compose + cron, secrets guidance
+- [docs/configuration.md](docs/configuration.md) — every TOML key, profiles, `env:` secrets, runtime-settings precedence
+- [docs/deployment.md](docs/deployment.md) — Docker compose + built-in scheduler, NixOS module reference, Authelia profile mapping, secrets guidance
 - [docs/development.md](docs/development.md) — dev setup, test conventions, how the suite is organized
 
 ## License

@@ -66,11 +66,11 @@ def router(monkeypatch):
     return r
 
 
-def seed_movie(conn, tmdb_id, title, genres=None, ts=None, year=None):
+def seed_movie(conn, tmdb_id, title, genres=None, ts=None, year=None, profile="default"):
     item_id = ids.make("movie", "tmdb", str(tmdb_id))
     db.upsert_item(conn, item_id, "movie", title=title, year=year, ids={"tmdb": tmdb_id},
                    meta={"genres": genres} if genres else None)
-    db.add_event(conn, ts or iso(1), item_id, "complete", 0.8, "jellyfin")
+    db.add_event(conn, ts or iso(1), item_id, "complete", 0.8, "jellyfin", profile=profile)
     return item_id
 
 
@@ -148,6 +148,10 @@ def test_movie_similar_discover_and_exclusions(conn, cfg, router):
     assert stats["updated"] == {"tmdb_similar": 1}
     assert stats["skipped"] == 3
     assert stats["serendipity"] == 0
+    assert stats["profiles"] == 1
+    # legacy single-user path: every row belongs to the synthesized default
+    assert {r["profile"] for r in conn.execute("SELECT profile FROM candidates")} == {"default"}
+    # the genre cache is runtime state, not taste — stays globally keyed
     assert db.get_state(conn, "tmdb:genres:movie") is not None
 
 
@@ -370,7 +374,7 @@ def test_excluded_ids_snooze_window(conn):
     lapsed = ids.make("movie", "tmdb", "801")
     add_snoozed_rec(conn, lapsed, days_ago=SNOOZE_DAYS + 1)
 
-    excluded = _excluded_ids(conn)
+    excluded = _excluded_ids(conn, "default")
 
     assert active in excluded
     assert lapsed not in excluded  # rank will expire it; re-proposable
@@ -406,10 +410,13 @@ def test_excluded_ids_cover_alternate_namespaces(conn):
                    ids={"tmdb": 603, "imdb": "tt0133093"})
     db.add_event(conn, iso(1), rejected, "reject", -1.0, "user")
 
-    excluded = _excluded_ids(conn)
+    excluded = _excluded_ids(conn, "default")
 
     assert {owned, ids.make("series", "tmdb", "1396"),
             rejected, ids.make("movie", "imdb", "tt0133093")} <= excluded
+    # library rows block every profile; the reject only blocks its own
+    assert owned in _excluded_ids(conn, "other")
+    assert rejected not in _excluded_ids(conn, "other")
 
 
 def test_owned_series_excluded_across_namespaces(conn, cfg, router):
@@ -817,3 +824,47 @@ def test_serendipity_honors_domain_filter(conn, cfg, router):
     router.route("/discover/movie", {"results": []})
     run(conn, cfg, domain="movie")
     assert router.calls and not any("audioscrobbler" in u for u, _ in router.calls)
+
+
+# ── multi-profile ────────────────────────────────────────────────────
+
+
+def test_two_profiles_independent_seeds_and_exclusions(conn, tmp_path, router):
+    cfg = C._build({
+        "core": {"data_dir": str(tmp_path)},
+        "tmdb": {"api_key": "tk"},
+        "profiles": {"alice": {"jellyfin_user": "a"}, "bob": {"jellyfin_user": "b"}},
+    })
+    seed_movie(conn, 603, "The Matrix", profile="alice")
+    seed_movie(conn, 700, "Heat", profile="bob")
+    # bob rejected 200; alice holds no grudge, so it may still reach her pool
+    rejected = ids.make("movie", "tmdb", "200")
+    db.upsert_item(conn, rejected, "movie", title="M200")
+    db.add_event(conn, iso(2), rejected, "reject", -1.0, "user", profile="bob")
+
+    router.route("/movie/603/recommendations",
+                 {"results": [movie_result(200), movie_result(201)]})
+    router.route("/movie/700/recommendations",
+                 {"results": [movie_result(200), movie_result(202)]})
+    empty = {"results": []}
+    router.route("/movie/603/similar", empty)
+    router.route("/movie/700/similar", empty)
+    router.route("/genre/movie/list", {"genres": []})
+    router.route("/discover/movie", empty)
+
+    stats = run(conn, cfg, domain="movie")
+
+    rows = {(r["profile"], r["item_id"]) for r in conn.execute(
+        "SELECT profile, item_id FROM candidates WHERE source='tmdb_similar'")}
+    assert rows == {
+        ("alice", rejected), ("alice", ids.make("movie", "tmdb", "201")),
+        ("bob", ids.make("movie", "tmdb", "202")),
+    }
+    # each profile fanned out only from its own seed, exactly once
+    recs = [u for u, _ in router.calls if u.endswith("/recommendations")]
+    assert recs.count(f"{TMDB}/movie/603/recommendations") == 1
+    assert recs.count(f"{TMDB}/movie/700/recommendations") == 1
+    assert stats["profiles"] == 2
+    assert stats["seeds"]["movie"] == 2
+    assert stats["skipped"] == 1  # bob's reject blocked 200 for bob alone
+    assert stats["new"] == {"tmdb_similar": 3}

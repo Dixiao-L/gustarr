@@ -240,6 +240,7 @@
   .dlg-head { display: flex; align-items: center; gap: 8px; padding: 14px 16px 10px; }
   .dlg-head h2 { margin: 0 auto 0 0; font-size: 15px; font-weight: 650; letter-spacing: -.01em; }
   .dlg-head .iconbtn { height: 30px; }
+  .dlg-sub { margin: -8px 16px 10px; font-size: 12px; color: var(--muted); }
   .setting {
     display: flex; flex-direction: column; gap: 6px;
     padding: 12px 16px; border-top: 1px solid var(--line);
@@ -358,6 +359,9 @@
       <path d="M12 3v2M12 19v2M21 12h-2M5 12H3"/>
       <path d="M18.4 5.6l-1.5 1.5M7.1 16.9l-1.5 1.5M18.4 18.4l-1.5-1.5M7.1 7.1L5.6 5.6"/>
     </symbol>
+    <symbol id="i-user" viewBox="0 0 24 24">
+      <circle cx="12" cy="8.5" r="3.25"/><path d="M5.5 19.5a6.5 6.5 0 0 1 13 0"/>
+    </symbol>
   </defs>
 </svg>
 
@@ -403,6 +407,7 @@
     <button id="settings-close" class="iconbtn" type="button" aria-label="Close settings">
       <svg class="icon" aria-hidden="true"><use href="#i-x"/></svg></button>
   </div>
+  <p class="dlg-sub">Operator-level — global, shared by every profile</p>
   <div id="settings-body"></div>
 </dialog>
 
@@ -411,6 +416,13 @@
   'use strict';
 
   const TMDB = 'https://image.tmdb.org/t/p/w342';
+  // Forward-auth deployments pick the profile from a proxy header on every
+  // request; ?profile= is the header-less fallback (bookmarkable per person)
+  // and must survive into each API call the page makes.
+  const PROFILE = new URLSearchParams(location.search).get('profile');
+  const api = path => PROFILE
+    ? path + (path.includes('?') ? '&' : '?') + 'profile=' + encodeURIComponent(PROFILE)
+    : path;
   // Client-side twin of the server's /api/recs?domain=music alias: the page
   // fetches every domain in one status=all request and tabs filter locally,
   // so the Music tab's artist+album+track span lives in this set.
@@ -435,7 +447,8 @@
     { key: 'exploration_frac', label: 'Exploration Fraction', type: 'range',
       hint: 'Share of each run reserved for outside-your-bubble picks' },
   ];
-  const state = { rows: [], stats: null, tab: 'all', loaded: false, settings: null };
+  const state = { rows: [], stats: null, tab: 'all', loaded: false, settings: null,
+                  profile: null };
   const $ = id => document.getElementById(id);
 
   const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g,
@@ -496,8 +509,13 @@
     const approvedWeek = acted.filter(r =>
       (r.status === 'approved' || r.status === 'added') &&
       r.acted_at && Date.parse(r.acted_at) >= weekAgo).length;
-    const parts = [chip('clock', 'Open queue', open.length),
-                   chip('check', 'Approved this week', approvedWeek)];
+    const parts = [];
+    // Quiet profile chip: only interesting when the instance actually
+    // serves more than one person.
+    if (state.profile && (state.profile.profiles || []).length > 1)
+      parts.push(chip('user', 'Profile', state.profile.name));
+    parts.push(chip('clock', 'Open queue', open.length),
+               chip('check', 'Approved this week', approvedWeek));
     const div = state.stats && state.stats.diversity;
     if (div && typeof div.genre_entropy_recs === 'number')
       parts.push(chip('chart', 'Genre entropy', div.genre_entropy_recs.toFixed(2)));
@@ -632,7 +650,7 @@
     if (local !== null) { box.innerHTML = head + local; return; }
     box.innerHTML = head + '<p class="whytext">Loading…</p>';
     const out = box.querySelector('.whytext');
-    try { out.textContent = (await getJSON(`/api/recs/${r.id}/why`)).text; }
+    try { out.textContent = (await getJSON(api(`/api/recs/${r.id}/why`))).text; }
     catch (e) { out.textContent = 'Could not load explanation: ' + (e.message || e); }
   }
 
@@ -779,7 +797,7 @@
   async function act(el, r, action) {
     el.classList.add('busy');
     try {
-      const resp = await fetch(`/api/recs/${r.id}/${action}`, { method: 'POST' });
+      const resp = await fetch(api(`/api/recs/${r.id}/${action}`), { method: 'POST' });
       if (!resp.ok) throw new Error(await errDetail(resp));
       r.status = ACT[action].status;
       r.acted_at = new Date().toISOString().slice(0, 19) + 'Z';
@@ -795,7 +813,7 @@
   async function forgive(el, r) {
     el.classList.add('busy');
     try {
-      const resp = await fetch(`/api/recs/${r.id}/forgive`, { method: 'POST' });
+      const resp = await fetch(api(`/api/recs/${r.id}/forgive`), { method: 'POST' });
       if (!resp.ok) throw new Error(await errDetail(resp));
       r.status = 'expired';
       r.acted_at = new Date().toISOString().slice(0, 19) + 'Z';
@@ -1021,13 +1039,15 @@
     $('banner').hidden = true;
     showSkeletons();
     try {
-      const [rows, stats, runtime] = await Promise.all([
-        getJSON('/api/recs?status=all'),
-        getJSON('/api/stats').catch(() => null), // chips are decorative
+      const [rows, stats, runtime, profile] = await Promise.all([
+        getJSON(api('/api/recs?status=all')),
+        getJSON(api('/api/stats')).catch(() => null), // chips are decorative
         getJSON('/api/settings').catch(() => null), // paused banner is best-effort
+        getJSON(api('/api/profile')).catch(() => null), // profile chip likewise
       ]);
       state.rows = rows;
       state.stats = stats;
+      state.profile = profile;
       if (runtime) state.settings = runtime;
       state.loaded = true;
       updateCounts();

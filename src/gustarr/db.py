@@ -28,14 +28,16 @@ CREATE TABLE IF NOT EXISTS items (
 );
 CREATE INDEX IF NOT EXISTS idx_items_domain ON items(domain);
 
--- Every taste signal, append-only. weight is the label contribution
--- (see signals.py); one row per (ts,item,kind,source,dedup) so re-syncs
--- are idempotent. dedup disambiguates genuinely distinct same-second
--- events (e.g. two tracks by one artist scrobbled in the same second
--- both mirror to the artist item) — collectors pass a stable
--- discriminator like the originating track id.
+-- Every taste signal, append-only, owned by a profile. weight is the
+-- label contribution (see signals.py); one row per
+-- (profile,ts,item,kind,source,dedup) so re-syncs are idempotent.
+-- dedup disambiguates genuinely distinct same-second events (e.g. two
+-- tracks by one artist scrobbled in the same second both mirror to the
+-- artist item) — collectors pass a stable discriminator like the
+-- originating track id.
 CREATE TABLE IF NOT EXISTS events (
   id      INTEGER PRIMARY KEY,
+  profile TEXT NOT NULL DEFAULT 'default',
   ts      TEXT NOT NULL,                 -- ISO8601 UTC
   item_id TEXT NOT NULL REFERENCES items(id),
   kind    TEXT NOT NULL,                 -- play|complete|scrobble|loved|favorite|library_add|approve|reject|abandon
@@ -43,9 +45,9 @@ CREATE TABLE IF NOT EXISTS events (
   source  TEXT NOT NULL,                 -- jellyfin|lastfm|listenbrainz|arr|user
   dedup   TEXT NOT NULL DEFAULT '',
   meta    TEXT NOT NULL DEFAULT '{}',
-  UNIQUE(ts, item_id, kind, source, dedup)
+  UNIQUE(profile, ts, item_id, kind, source, dedup)
 );
-CREATE INDEX IF NOT EXISTS idx_events_item ON events(item_id);
+CREATE INDEX IF NOT EXISTS idx_events_item ON events(profile, item_id);
 
 -- Fallback → canonical id mappings recorded by merge_item, so a
 -- collector re-minting a name-keyed id after enrich merged it away
@@ -70,6 +72,7 @@ CREATE TABLE IF NOT EXISTS library (
 -- (item,source) is the identity so one item found by several sources
 -- keeps all its provenance.
 CREATE TABLE IF NOT EXISTS candidates (
+  profile        TEXT NOT NULL DEFAULT 'default',
   item_id        TEXT NOT NULL REFERENCES items(id),
   source         TEXT NOT NULL,          -- tmdb_similar|tmdb_discover|lastfm_similar|listenbrainz_cf|...
   seed_item_id   TEXT,                   -- which liked item produced this (for "why")
@@ -77,11 +80,12 @@ CREATE TABLE IF NOT EXISTS candidates (
   first_seen     TEXT NOT NULL,
   last_seen      TEXT NOT NULL,
   meta           TEXT NOT NULL DEFAULT '{}',
-  PRIMARY KEY (item_id, source)
+  PRIMARY KEY (profile, item_id, source)
 );
 
 CREATE TABLE IF NOT EXISTS recommendations (
   id       INTEGER PRIMARY KEY,
+  profile  TEXT NOT NULL DEFAULT 'default',
   run_id   TEXT NOT NULL,
   ts       TEXT NOT NULL,
   domain   TEXT NOT NULL,
@@ -89,13 +93,13 @@ CREATE TABLE IF NOT EXISTS recommendations (
   score    REAL NOT NULL,
   why      TEXT NOT NULL DEFAULT '{}',   -- json: {"neighbors":[...],"sources":[...],"exploration":bool}
   status   TEXT NOT NULL DEFAULT 'proposed',
-           -- proposed → approved|rejected (user) → added|failed (apply)
+           -- proposed → approved|rejected|snoozed (user) → added|failed (apply)
            -- proposed → auto_added (music auto mode) | expired (TTL)
   acted_at TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_recs_status ON recommendations(status);
+CREATE INDEX IF NOT EXISTS idx_recs_status ON recommendations(profile, status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_recs_open_item
-  ON recommendations(item_id) WHERE status IN ('proposed', 'approved');
+  ON recommendations(profile, item_id) WHERE status IN ('proposed', 'approved');
 
 CREATE TABLE IF NOT EXISTS embeddings (
   item_id    TEXT NOT NULL,
@@ -118,14 +122,71 @@ def now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+SCHEMA_VERSION = "2"
+
+# state keys that belong to a profile (cursors, taste models); everything
+# else in state — settings, arr inventory, API caches — is operator/global.
+_PROFILE_STATE_PREFIXES = ("model:", "centroid:", "lastfm:", "jellyfin:")
+
+
 def connect(db_path: str | Path) -> sqlite3.Connection:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    _migrate(conn)
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
+    conn.execute(
+        "INSERT INTO state (key, value) VALUES ('schema_version', ?)"
+        " ON CONFLICT(key) DO UPDATE SET value=excluded.value", (SCHEMA_VERSION,))
+    conn.commit()
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """v1 → v2: profile columns on events/candidates/recommendations, with
+    existing rows assigned to the 'default' profile, plus per-profile
+    namespacing of cursor/model state keys. UNIQUE constraints changed, so
+    the tables are rebuilt (SQLite can't alter constraints in place)."""
+    tables = {r["name"] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    if "events" not in tables:
+        return  # fresh database: SCHEMA creates v2 directly
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(events)")}
+    if "profile" in cols:
+        return
+    conn.execute("PRAGMA foreign_keys=OFF")
+    with conn:  # one transaction: a crash mid-migration leaves v1 intact
+        conn.execute("ALTER TABLE events RENAME TO events_v1")
+        conn.execute("ALTER TABLE candidates RENAME TO candidates_v1")
+        conn.execute("ALTER TABLE recommendations RENAME TO recommendations_v1")
+        conn.execute("DROP INDEX IF EXISTS idx_events_item")
+        conn.execute("DROP INDEX IF EXISTS idx_recs_status")
+        conn.execute("DROP INDEX IF EXISTS idx_recs_open_item")
+        conn.executescript(SCHEMA)
+        conn.execute(
+            "INSERT INTO events (id, profile, ts, item_id, kind, weight, source, dedup, meta)"
+            " SELECT id, 'default', ts, item_id, kind, weight, source, dedup, meta"
+            " FROM events_v1")
+        conn.execute(
+            "INSERT INTO candidates (profile, item_id, source, seed_item_id, external_score,"
+            "                        first_seen, last_seen, meta)"
+            " SELECT 'default', item_id, source, seed_item_id, external_score,"
+            "        first_seen, last_seen, meta FROM candidates_v1")
+        conn.execute(
+            "INSERT INTO recommendations (id, profile, run_id, ts, domain, item_id, score,"
+            "                             why, status, acted_at)"
+            " SELECT id, 'default', run_id, ts, domain, item_id, score, why, status, acted_at"
+            " FROM recommendations_v1")
+        conn.execute("DROP TABLE events_v1")
+        conn.execute("DROP TABLE candidates_v1")
+        conn.execute("DROP TABLE recommendations_v1")
+        for prefix in _PROFILE_STATE_PREFIXES:
+            conn.execute(
+                "UPDATE OR REPLACE state SET key = 'p:default:' || key"
+                " WHERE key LIKE ? AND key NOT LIKE 'p:%'", (prefix + "%",))
+    conn.execute("PRAGMA foreign_keys=ON")
 
 
 # ── items ────────────────────────────────────────────────────────────
@@ -228,12 +289,13 @@ def add_event(
     source: str,
     meta: dict[str, Any] | None = None,
     dedup: str = "",
+    profile: str = "default",
 ) -> bool:
     """Returns False when the event already existed (idempotent re-sync)."""
     cur = conn.execute(
-        "INSERT OR IGNORE INTO events (ts, item_id, kind, weight, source, dedup, meta)"
-        " VALUES (?,?,?,?,?,?,?)",
-        (ts, canonical_id(conn, item_id), kind, weight, source, dedup,
+        "INSERT OR IGNORE INTO events (profile, ts, item_id, kind, weight, source, dedup, meta)"
+        " VALUES (?,?,?,?,?,?,?,?)",
+        (profile, ts, canonical_id(conn, item_id), kind, weight, source, dedup,
          json.dumps(meta or {})),
     )
     return cur.rowcount > 0
@@ -253,6 +315,21 @@ def set_state(conn: sqlite3.Connection, key: str, value: str) -> None:
         " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         (key, value),
     )
+
+
+# Profile-scoped state (sync cursors, taste models): one flat namespace
+# per profile so two profiles' Last.fm cursors or centroids never collide.
+def pkey(profile: str, key: str) -> str:
+    return f"p:{profile}:{key}"
+
+
+def pget_state(conn: sqlite3.Connection, profile: str, key: str,
+               default: str | None = None) -> str | None:
+    return get_state(conn, pkey(profile, key), default)
+
+
+def pset_state(conn: sqlite3.Connection, profile: str, key: str, value: str) -> None:
+    set_state(conn, pkey(profile, key), value)
 
 
 # ── embeddings ───────────────────────────────────────────────────────

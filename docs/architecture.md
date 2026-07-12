@@ -1,10 +1,12 @@
 # Architecture
 
-gustarr follows one rule: **atomic commands, one shared SQLite store, no
+Gustarr follows one rule: **atomic commands, one shared SQLite store, no
 daemons except the optional web UI.** Every stage does one thing and
 communicates with the others only through the store. Composition is
 `gustarr run nightly|weekly` — or your own cron/systemd timers calling the
-atomic commands directly.
+atomic commands directly (the web process can optionally host a minimal
+in-container scheduler for exactly that composition; see
+[deployment](deployment.md)).
 
 ```
   signals in                     the store (SQLite)                  actions out
@@ -79,14 +81,22 @@ One SQLite database, WAL mode, created on first connect (`db.py`):
 
 | table | role |
 |---|---|
-| `items` | canonical catalogue: `id`, `domain`, `title`, `year`, `ids` (JSON id map), `meta` (genres, overview, trailer, …), `enriched_at` |
-| `events` | append-only taste signals: `ts`, `item_id`, `kind`, `weight`, `source`, `dedup`, `meta`; unique on `(ts, item_id, kind, source, dedup)` so re-syncs are idempotent |
-| `item_aliases` | fallback → canonical id redirects recorded by merges |
-| `library` | what the *arrs already manage — never recommended |
-| `candidates` | the pool rank scores; PK `(item_id, source)` so one item found by several sources keeps all its provenance, with `seed_item_id` for "why" |
-| `recommendations` | the queue: `run_id`, `score`, `why` JSON, `status`, `acted_at` |
-| `embeddings` | fp16 vectors, PK `(item_id, model)` — swapping `embed_model` re-embeds cleanly |
-| `state` | key-value: sync cursors, trained model blobs, runtime setting overrides (`setting:*`) |
+| `items` | canonical catalogue: `id`, `domain`, `title`, `year`, `ids` (JSON id map), `meta` (genres, overview, trailer, …), `enriched_at` — global |
+| `events` | append-only taste signals owned by a profile: `profile`, `ts`, `item_id`, `kind`, `weight`, `source`, `dedup`, `meta`; unique on `(profile, ts, item_id, kind, source, dedup)` so re-syncs are idempotent |
+| `item_aliases` | fallback → canonical id redirects recorded by merges — global |
+| `library` | what the *arrs already manage — never recommended; global |
+| `candidates` | the pool rank scores; PK `(profile, item_id, source)` so one item found by several sources keeps all its provenance per profile, with `seed_item_id` for "why" |
+| `recommendations` | the per-profile queue: `profile`, `run_id`, `score`, `why` JSON, `status`, `acted_at` |
+| `embeddings` | fp16 vectors, PK `(item_id, model)` — swapping `embed_model` re-embeds cleanly; global |
+| `state` | key-value: per-profile sync cursors and trained models (`p:<profile>:*`), global runtime setting overrides (`setting:*`) and *arr inventory |
+
+**Profile ownership in one line**: taste (events, candidates,
+recommendations, cursors, models) is per-profile; the world (items,
+metadata, embeddings, *arr library state) and the auto-add budgets are
+global — one disk, one Lidarr, however many tastes. Library adds and
+*arr-deletion rejects are attributed to *every* configured profile at a
+modest weight: the household owns the library, so nobody's model gets to
+claim sole credit for it.
 
 Recommendation status flow:
 
@@ -163,8 +173,8 @@ the [README](../README.md#signals--weights)). Aggregation per item:
 
 ## Echo-chamber design
 
-A single-user recommender trained on its own output converges on a bubble
-unless that's engineered against. The guards, end to end:
+A personal recommender trained on its own output converges on a bubble
+unless that's engineered against. The guards, per profile, end to end:
 
 - **Serendipity candidates** (`candidates.py`): TMDb discover over the user's
   *under*-represented genres (rarest first, deterministic) and least-visited

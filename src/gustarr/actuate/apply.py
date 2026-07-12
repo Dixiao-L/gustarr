@@ -63,8 +63,10 @@ def _record_add(conn: sqlite3.Connection, row: sqlite3.Row, ts: str) -> None:
     else:
         # audit trail only: 'auto_add' is not in signals.WEIGHTS, so
         # gustarr's own adds never feed back into training as praise.
+        # Attributed to the rec's own profile: budgets are shared, but
+        # the record of whose queue an add came from must not be.
         db.add_event(conn, ts, row["item_id"], "auto_add", 0.0, "gustarr",
-                     {"rec_id": row["id"]})
+                     {"rec_id": row["id"]}, profile=row["profile"])
         _mark(conn, row["id"], "auto_added", ts)
     conn.commit()
 
@@ -125,6 +127,8 @@ def _apply_music_domain(
     # semantics, same error split — only the domain, the weekly budget
     # and the LidarrClient method differ.
     stats[added_key] = 0
+    # The acted count deliberately ignores profile: one disk, one Lidarr,
+    # so alice's auto-adds spend bob's remaining weekly allowance too.
     acted = conn.execute(
         "SELECT COUNT(*) FROM recommendations WHERE domain=?"
         " AND status IN ('auto_added','added') AND acted_at>=?",
@@ -133,11 +137,13 @@ def _apply_music_domain(
     stats[budget_key] = budget
     # Approved rows are actuated in every mode (an explicit approve is
     # consent) and don't consume the weekly budget; proposed rows are
-    # auto-picked only in auto mode, inside the budget.
+    # auto-picked only in auto mode, inside the budget. Every profile's
+    # queue competes in one score-ordered pass — the budget is household
+    # property, not a per-person allowance.
     auto = settings.get(conn, cfg, "music_mode") == "auto"
     rows = conn.execute(
-        "SELECT r.id, r.item_id, r.status, r.why, i.title, i.ids FROM recommendations r"
-        " JOIN items i ON i.id = r.item_id"
+        "SELECT r.id, r.item_id, r.profile, r.status, r.why, i.title, i.ids"
+        " FROM recommendations r JOIN items i ON i.id = r.item_id"
         " WHERE r.domain=? AND r.status IN ('approved','proposed')"
         " ORDER BY r.status='approved' DESC, r.score DESC", (domain,)).fetchall()
     picks: list[tuple[sqlite3.Row, str]] = []
@@ -189,8 +195,11 @@ def _apply_video(
 ) -> None:
     stats["video_added"] = 0
     stats["video_failed"] = 0
+    # No profile filter: an approve is consent whoever gave it, and auto
+    # mode's per-run cap bounds writes to the shared arrs, so the top
+    # proposals of every profile compete for it on score.
     sql = (
-        "SELECT r.id, r.item_id, r.domain, r.status, r.why, i.title, i.ids"
+        "SELECT r.id, r.item_id, r.profile, r.domain, r.status, r.why, i.title, i.ids"
         " FROM recommendations r JOIN items i ON i.id = r.item_id"
         " WHERE r.status=? AND r.domain IN ('movie','series') ORDER BY r.score DESC")
     rows = conn.execute(sql, ("approved",)).fetchall()
@@ -250,18 +259,22 @@ def _apply_video(
 def _expire_overflow(
     conn: sqlite3.Connection, cfg: Config, ts: str, dry_run: bool, stats: dict[str, Any]
 ) -> None:
-    pending = conn.execute(
-        "SELECT COUNT(*) FROM recommendations WHERE status='proposed'"
-        " AND domain IN ('movie','series')").fetchone()[0]
-    surplus = max(0, pending - settings.get(conn, cfg, "video_queue_max_pending"))
-    if dry_run:
-        stats["would_expire_overflow"] = surplus
-        return
-    stats["overflow_expired"] = 0
-    if surplus == 0:
-        return
-    stats["overflow_expired"] = conn.execute(
-        "UPDATE recommendations SET status='expired', acted_at=? WHERE id IN ("
-        " SELECT id FROM recommendations WHERE status='proposed'"
-        " AND domain IN ('movie','series') ORDER BY score ASC, id ASC LIMIT ?)",
-        (ts, surplus)).rowcount
+    # The pending cap bounds each profile's own approval queue (rank
+    # fills per profile up to it), so the trim is per profile too — a
+    # global trim would let one profile's backlog expire another's picks.
+    cap = settings.get(conn, cfg, "video_queue_max_pending")
+    expired = 0
+    for profile in cfg.profiles:
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM recommendations WHERE profile=? AND status='proposed'"
+            " AND domain IN ('movie','series')", (profile,)).fetchone()[0]
+        surplus = max(0, pending - cap)
+        if dry_run or surplus == 0:
+            expired += surplus
+            continue
+        expired += conn.execute(
+            "UPDATE recommendations SET status='expired', acted_at=? WHERE id IN ("
+            " SELECT id FROM recommendations WHERE profile=? AND status='proposed'"
+            " AND domain IN ('movie','series') ORDER BY score ASC, id ASC LIMIT ?)",
+            (ts, profile, surplus)).rowcount
+    stats["would_expire_overflow" if dry_run else "overflow_expired"] = expired

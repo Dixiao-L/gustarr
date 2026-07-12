@@ -25,14 +25,17 @@ def list_recs(
     conn: sqlite3.Connection,
     domain: str | None = None,
     status: str = "proposed",
+    profile: str = "default",
 ) -> list[dict[str, Any]]:
     sql = (
-        "SELECT r.id, r.ts, r.domain, r.item_id, r.score, r.why, r.status, r.acted_at,"
-        " i.title, i.year, i.ids, i.meta"
+        "SELECT r.id, r.profile, r.ts, r.domain, r.item_id, r.score, r.why, r.status,"
+        " r.acted_at, i.title, i.year, i.ids, i.meta"
         " FROM recommendations r JOIN items i ON i.id = r.item_id"
     )
-    where: list[str] = []
-    params: list[Any] = []
+    # Always one profile's queue: 'default' keeps single-user setups (and
+    # callers written before profiles existed) seeing everything they did.
+    where: list[str] = ["r.profile = ?"]
+    params: list[Any] = [profile]
     if status != "all":
         where.append("r.status = ?")
         params.append(status)
@@ -43,8 +46,7 @@ def list_recs(
     elif domain:
         where.append("r.domain = ?")
         params.append(domain)
-    if where:
-        sql += " WHERE " + " AND ".join(where)
+    sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY r.score DESC, r.id"
 
     rows: list[dict[str, Any]] = []
@@ -53,6 +55,7 @@ def list_recs(
         overview = meta.get("overview")
         rows.append({
             "id": r["id"],
+            "profile": r["profile"],
             "domain": r["domain"],
             "item_id": r["item_id"],
             "title": r["title"],
@@ -77,13 +80,17 @@ def list_recs(
     return rows
 
 
-def set_status(conn: sqlite3.Connection, rec_id: int, status: str) -> dict[str, int]:
+def set_status(
+    conn: sqlite3.Connection, rec_id: int, status: str, profile: str | None = None,
+) -> dict[str, int]:
     if status not in ("approved", "rejected", "snoozed"):
         raise ValueError(f"only approved/rejected/snoozed can be set here, not {status!r}")
     row = conn.execute(
-        "SELECT item_id, status, why FROM recommendations WHERE id=?", (rec_id,)).fetchone()
+        "SELECT item_id, profile, status, why FROM recommendations WHERE id=?",
+        (rec_id,)).fetchone()
     if row is None:
         raise ValueError(f"no recommendation #{rec_id}")
+    _check_profile(row, rec_id, profile)
     if row["status"] in TERMINAL_STATUSES:
         raise ValueError(f"recommendation #{rec_id} is already {row['status']}; too late")
     if row["status"] == status:
@@ -109,18 +116,34 @@ def set_status(conn: sqlite3.Connection, rec_id: int, status: str) -> dict[str, 
         # Approvals stay full weight — a hit is a hit however it was found.
         weight *= 0.3
         meta["exploration"] = True
-    added = db.add_event(conn, ts, row["item_id"], kind, weight, "user", meta=meta)
+    # The verdict trains the rec owner's model, so the event carries the
+    # rec's own profile — never the caller-supplied guard value.
+    added = db.add_event(conn, ts, row["item_id"], kind, weight, "user", meta=meta,
+                         profile=row["profile"])
     return {"updated": 1, "events": int(added)}
 
 
-def forgive(conn: sqlite3.Connection, rec_id: int) -> dict[str, int]:
+def _check_profile(row: sqlite3.Row, rec_id: int, profile: str | None) -> None:
+    """A rec id already implies its profile, so profile here is a guard,
+    not a lookup key: None (the default) trusts the id, anything else
+    must match — catches a --profile flag pointed at someone else's rec."""
+    if profile is not None and row["profile"] != profile:
+        raise ValueError(
+            f"recommendation #{rec_id} belongs to profile {row['profile']!r}, not {profile!r}")
+
+
+def forgive(
+    conn: sqlite3.Connection, rec_id: int, profile: str | None = None,
+) -> dict[str, int]:
     """Undo a reject: delete that rec's reject event(s) so training stops
     penalising the item, and flip the rec to 'expired' so rank may
     propose it again. Only this rec's events go — a reject of the same
     item via another recommendation is a separate verdict and stays."""
-    row = conn.execute("SELECT status FROM recommendations WHERE id=?", (rec_id,)).fetchone()
+    row = conn.execute(
+        "SELECT status, profile FROM recommendations WHERE id=?", (rec_id,)).fetchone()
     if row is None:
         raise ValueError(f"no recommendation #{rec_id}")
+    _check_profile(row, rec_id, profile)
     if row["status"] != "rejected":
         raise ValueError(f"recommendation #{rec_id} is {row['status']}; only rejected"
                          " recs can be forgiven")
@@ -172,15 +195,16 @@ def _neighbour_line(conn: sqlite3.Connection, nb: Any) -> str:
     return f"because you liked {title} (sim {_fmt_sim(sim)})"
 
 
-def explain(conn: sqlite3.Connection, rec_id: int) -> str:
+def explain(conn: sqlite3.Connection, rec_id: int, profile: str | None = None) -> str:
     row = conn.execute(
-        "SELECT r.id, r.domain, r.item_id, r.score, r.why, r.status,"
+        "SELECT r.id, r.profile, r.domain, r.item_id, r.score, r.why, r.status,"
         " i.title, i.year, i.meta"
         " FROM recommendations r JOIN items i ON i.id = r.item_id WHERE r.id=?",
         (rec_id,),
     ).fetchone()
     if row is None:
         raise ValueError(f"no recommendation #{rec_id}")
+    _check_profile(row, rec_id, profile)
 
     why = json.loads(row["why"] or "{}")
     meta = json.loads(row["meta"])
@@ -223,16 +247,17 @@ def _genre_entropy(metas: Iterable[str]) -> float:
     return round(-sum(n / total * math.log2(n / total) for n in counts.values()), 3)
 
 
-def _diversity(conn: sqlite3.Connection) -> dict[str, Any]:
-    """Is the queue actually wider than the library it feeds on?"""
+def _diversity(conn: sqlite3.Connection, profile: str) -> dict[str, Any]:
+    """Is this profile's queue actually wider than the (shared) library
+    it feeds on? Recs are per person; the library baseline is global."""
     recent = conn.execute(
         "SELECT r.why, i.meta FROM recommendations r JOIN items i ON i.id = r.item_id"
-        " ORDER BY r.id DESC LIMIT 100").fetchall()
+        " WHERE r.profile=? ORDER BY r.id DESC LIMIT 100", (profile,)).fetchall()
     n_explore = sum(1 for r in recent if json.loads(r["why"] or "{}").get("exploration"))
     acted = positive = 0
     for r in conn.execute(
-            "SELECT status, why FROM recommendations"
-            " WHERE status IN ('approved','rejected','added','auto_added')"):
+            "SELECT status, why FROM recommendations WHERE profile=?"
+            " AND status IN ('approved','rejected','added','auto_added')", (profile,)):
         if json.loads(r["why"] or "{}").get("exploration"):
             acted += 1
             # 'added' implies a prior approve; 'auto_added' skipped the user,
@@ -247,7 +272,10 @@ def _diversity(conn: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
-def store_stats(conn: sqlite3.Connection) -> dict[str, Any]:
+def store_stats(conn: sqlite3.Connection, profile: str = "default") -> dict[str, Any]:
+    # Table totals stay global (one store, one disk); anything that is a
+    # judgement about a person — rec counts, model freshness, sync
+    # cursors, diversity — is reported for the requested profile.
     tables = {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in _TABLES}
     events_by_kind = {
         r[0]: r[1]
@@ -256,25 +284,31 @@ def store_stats(conn: sqlite3.Connection) -> dict[str, Any]:
     recs_by_status = {
         r[0]: r[1]
         for r in conn.execute(
-            "SELECT status, COUNT(*) FROM recommendations GROUP BY status ORDER BY status")
+            "SELECT status, COUNT(*) FROM recommendations WHERE profile=?"
+            " GROUP BY status ORDER BY status", (profile,))
     }
 
     sync: dict[str, Any] = {}
+    uts = db.pget_state(conn, profile, "lastfm:last_uts")
+    if uts is not None:
+        sync["lastfm:last_uts"] = uts
     for r in conn.execute(
-            "SELECT key, value FROM state"
-            " WHERE key = 'lastfm:last_uts' OR key LIKE 'arr:known:%' ORDER BY key"):
-        # arr cursors are big id maps — presence is the interesting bit.
-        sync[r["key"]] = r["value"] if r["key"] == "lastfm:last_uts" else True
+            "SELECT key FROM state WHERE key LIKE 'arr:known:%' ORDER BY key"):
+        # arr cursors are global (one arr inventory) and big id maps —
+        # presence is the interesting bit.
+        sync[r["key"]] = True
 
     models: dict[str, Any] = {}
-    for r in conn.execute("SELECT key, value FROM state WHERE key LIKE 'model:%' ORDER BY key"):
+    prefix = db.pkey(profile, "model:")
+    for r in conn.execute("SELECT key, value FROM state WHERE key LIKE ? ORDER BY key",
+                          (prefix + "%",)):
         try:
             val: Any = json.loads(r["value"])
         except ValueError:
             val = r["value"]
         if isinstance(val, dict):
             val = val.get("trained_at", val)
-        models[r["key"].removeprefix("model:")] = val
+        models[r["key"].removeprefix(prefix)] = val
 
     interesting = "SELECT item_id FROM events UNION SELECT item_id FROM candidates"
     needed = conn.execute(f"SELECT COUNT(*) FROM ({interesting})").fetchone()[0]
@@ -283,6 +317,7 @@ def store_stats(conn: sqlite3.Connection) -> dict[str, Any]:
         " WHERE item_id IN (SELECT item_id FROM embeddings)").fetchone()[0]
 
     return {
+        "profile": profile,
         "tables": tables,
         "events_by_kind": events_by_kind,
         "recs_by_status": recs_by_status,
@@ -291,5 +326,5 @@ def store_stats(conn: sqlite3.Connection) -> dict[str, Any]:
         "settings_overridden": conn.execute(
             "SELECT COUNT(*) FROM state WHERE key LIKE 'setting:%'").fetchone()[0],
         "embedding_coverage": {"needed": needed, "embedded": embedded},
-        "diversity": _diversity(conn),
+        "diversity": _diversity(conn, profile),
     }

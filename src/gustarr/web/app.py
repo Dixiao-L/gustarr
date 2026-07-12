@@ -1,11 +1,19 @@
 """Approval web UI: a thin FastAPI shell around queue.py.
 
-No auth by design: gustarr is single-user and binds 127.0.0.1 by default
-(``[web] bind``, see cli.py); any wider exposure happens intranet-only
-behind Traefik, which owns TLS and access control. A Host/Origin guard
-still runs on every request (see ``guard`` below) because a localhost
-bind alone does not stop the user's own browser: extra hostnames (e.g.
-the Traefik one) go in ``[web] allowed_hosts``.
+No auth by design: Gustarr binds 127.0.0.1 by default (``[web] bind``,
+see cli.py); any wider exposure happens intranet-only behind Traefik,
+which owns TLS and access control. A Host/Origin guard still runs on
+every request (see ``guard`` below) because a localhost bind alone does
+not stop the user's own browser: extra hostnames (e.g. the Traefik one)
+go in ``[web] allowed_hosts``.
+
+Multi-user households resolve a *profile* per request instead of adding
+auth here: a forward-auth proxy (Authelia) stamps the identity header
+named by ``[web] profile_header`` (default ``Remote-User``), with
+``?profile=`` as the header-less fallback. The header is trusted as-is,
+so a multi-profile instance must only be reachable through the proxy
+that sets it. Runtime settings stay operator-global — one store, one
+budget, every profile.
 """
 
 from __future__ import annotations
@@ -18,7 +26,7 @@ from urllib.parse import urlsplit
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from .. import db, queue, settings
+from .. import db, queue, scheduler, settings
 from ..config import Config
 
 _INDEX = Path(__file__).parent / "static" / "index.html"
@@ -43,8 +51,29 @@ def _allowed_hosts(cfg: Config) -> set[str]:
 
 
 def create_app(cfg: Config) -> FastAPI:
-    app = FastAPI(title="gustarr", docs_url=None, redoc_url=None)
+    app = FastAPI(title="Gustarr", docs_url=None, redoc_url=None)
     allowed = _allowed_hosts(cfg)
+    # Container deployments schedule the nightly pipeline from inside the
+    # web process ([scheduler] nightly); start() is a no-op when unset.
+    scheduler.start(cfg)
+    profiles = list(cfg.profiles) or ["default"]
+    profile_header = cfg.web.get("profile_header", "Remote-User")
+
+    def get_profile(request: Request) -> str:
+        # Resolution order: forward-auth header (Authelia sets it), explicit
+        # query param, then the sole configured profile. An explicit name
+        # must match the config — a typo'd or unmapped user seeing the
+        # 'default' queue would silently cross-pollinate taste models.
+        for name in (request.headers.get(profile_header),
+                     request.query_params.get("profile")):
+            if name:
+                if name not in profiles:
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"unknown profile {name!r}"
+                               f" (configured: {', '.join(profiles)})")
+                return name
+        return profiles[0] if len(profiles) == 1 else "default"
 
     @app.middleware("http")
     async def guard(
@@ -79,15 +108,22 @@ def create_app(cfg: Config) -> FastAPI:
         conn.commit()
         return {"id": rec_id, "status": status, **stats}
 
+    @app.get("/api/profile")
+    def api_profile(profile: str = Depends(get_profile)) -> dict[str, Any]:
+        # Feeds the header chip: which queue this request sees, and whether
+        # showing that is even interesting (>1 configured profile).
+        return {"name": profile, "profiles": profiles}
+
     @app.get("/api/recs")
     def api_recs(
         status: str = "proposed",
         domain: str | None = None,
+        profile: str = Depends(get_profile),
         conn: sqlite3.Connection = Depends(get_conn),
     ) -> list[dict[str, Any]]:
         # domain='music' expands to artist+album inside list_recs, so the
         # web UI and the CLI share one alias implementation.
-        return queue.list_recs(conn, domain=domain or None, status=status)
+        return queue.list_recs(conn, domain=domain or None, status=status, profile=profile)
 
     @app.post("/api/recs/{rec_id}/approve")
     def api_approve(rec_id: int, conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
@@ -118,8 +154,13 @@ def create_app(cfg: Config) -> FastAPI:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/api/stats")
-    def api_stats(conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
-        return queue.store_stats(conn)
+    def api_stats(
+        profile: str = Depends(get_profile),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict[str, Any]:
+        # Cursors, models and the diversity block are per-profile now;
+        # table counts and budgets in the payload stay store-global.
+        return queue.store_stats(conn, profile=profile)
 
     @app.get("/api/settings")
     def api_settings(conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:

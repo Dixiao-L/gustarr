@@ -22,10 +22,13 @@ from gustarr.ml import train as train_mod
 DIM = 8
 
 
-def make_cfg(tmp_path, **model_kw):
+def make_cfg(tmp_path, profiles=None, **model_kw):
+    # no profiles section → config synthesizes the single 'default' profile
     raw = {"core": {"data_dir": str(tmp_path)}}
     if model_kw:
         raw["model"] = model_kw
+    if profiles:
+        raw["profiles"] = {name: {} for name in profiles}
     return C._build(raw)
 
 
@@ -45,13 +48,14 @@ def put_vec(conn, item_id, vec, model):
     db.put_embedding(conn, item_id, model, v16.tobytes(), len(v16))
 
 
-def add_candidate(conn, item_id, source="tmdb_similar", seed=None, ext=None):
+def add_candidate(conn, item_id, source="tmdb_similar", seed=None, ext=None,
+                  profile="default"):
     ts = db.now()
     conn.execute(
         "INSERT OR REPLACE INTO candidates"
-        " (item_id, source, seed_item_id, external_score, first_seen, last_seen)"
-        " VALUES (?,?,?,?,?,?)",
-        (item_id, source, seed, ext, ts, ts))
+        " (profile, item_id, source, seed_item_id, external_score, first_seen, last_seen)"
+        " VALUES (?,?,?,?,?,?,?)",
+        (profile, item_id, source, seed, ext, ts, ts))
 
 
 def b64(vec):
@@ -184,9 +188,9 @@ def test_train_head_separates_and_persists(tmp_path):
         add_candidate(conn, iid)
 
     stats = train_mod.run(conn, cfg)
-    assert stats["movie"] == {"pos": 10, "neg": 3, "weak": 20, "head": 1}
+    assert stats["default"]["movie"] == {"pos": 10, "neg": 3, "weak": 20, "head": 1}
 
-    head = json.loads(db.get_state(conn, "model:movie"))
+    head = json.loads(db.pget_state(conn, "default", "model:movie"))
     w = np.frombuffer(base64.b64decode(head["w"]), dtype=np.float32)
     assert w.shape == (DIM,)
     assert head["dim"] == DIM
@@ -200,7 +204,7 @@ def test_train_head_separates_and_persists(tmp_path):
     assert s(axis(0)) > s(-axis(0)) + 0.2  # separates the taste axis
     assert s(axis(0)) > s(axis(1))
 
-    cent = json.loads(db.get_state(conn, "centroid:movie"))
+    cent = json.loads(db.pget_state(conn, "default", "centroid:movie"))
     pos_c = np.frombuffer(base64.b64decode(cent["pos"]), dtype=np.float32)
     assert float(unit(pos_c) @ axis(0)) > 0.9
     neg_c = np.frombuffer(base64.b64decode(cent["neg"]), dtype=np.float32)
@@ -209,7 +213,9 @@ def test_train_head_separates_and_persists(tmp_path):
     assert all(len(e) == 2 for e in cent["exemplars"])
     labels = [e[1] for e in cent["exemplars"]]
     assert labels == sorted(labels, reverse=True)
-    assert db.get_state(conn, "model:artist") is None
+    assert db.pget_state(conn, "default", "model:artist") is None
+    # nothing may leak into the old un-namespaced key
+    assert db.get_state(conn, "model:movie") is None
 
 
 def test_train_few_positives_centroid_only(tmp_path):
@@ -224,11 +230,42 @@ def test_train_few_positives_centroid_only(tmp_path):
         db.add_event(conn, ts, iid, "library_add", 0.6, "arr")
 
     stats = train_mod.run(conn, cfg)
-    assert stats["series"] == {"pos": 3, "neg": 0, "weak": 0, "head": 0}
-    assert db.get_state(conn, "model:series") is None
-    cent = json.loads(db.get_state(conn, "centroid:series"))
+    assert stats["default"]["series"] == {"pos": 3, "neg": 0, "weak": 0, "head": 0}
+    assert db.pget_state(conn, "default", "model:series") is None
+    cent = json.loads(db.pget_state(conn, "default", "centroid:series"))
     assert cent["neg"] is None
     assert len(cent["exemplars"]) == 3
+
+
+def test_train_two_profiles_independent_centroids(tmp_path):
+    """Shared items/embeddings, personal labels: each profile's centroid
+    must be built from its own events only."""
+    conn = db.connect(tmp_path / "t.db")
+    cfg = make_cfg(tmp_path, profiles=["alice", "bob"])
+    model = cfg.model.embed_model
+    ts = db.now()
+    for profile, ax in (("alice", 0), ("bob", 1)):
+        for i in range(3):
+            iid = f"movie:tmdb:{profile}{i}"
+            db.upsert_item(conn, iid, "movie", title=f"{profile}-{i}")
+            put_vec(conn, iid, unit(axis(ax) + 0.05 * axis(i + 2)), model)
+            db.add_event(conn, ts, iid, "loved", 1.0, "jellyfin", profile=profile)
+
+    stats = train_mod.run(conn, cfg)
+
+    assert stats["alice"]["movie"]["pos"] == 3
+    assert stats["bob"]["movie"]["pos"] == 3
+    alice = json.loads(db.pget_state(conn, "alice", "centroid:movie"))
+    bob = json.loads(db.pget_state(conn, "bob", "centroid:movie"))
+    a_pos = np.frombuffer(base64.b64decode(alice["pos"]), dtype=np.float32)
+    b_pos = np.frombuffer(base64.b64decode(bob["pos"]), dtype=np.float32)
+    assert float(unit(a_pos) @ axis(0)) > 0.9  # alice's taste axis, untainted by bob's
+    assert float(unit(b_pos) @ axis(1)) > 0.9
+    # exemplars are the training evidence — one profile's must never
+    # surface in the other's "because you liked ..." explanations
+    assert {e[0] for e in alice["exemplars"]} == {f"movie:tmdb:alice{i}" for i in range(3)}
+    assert {e[0] for e in bob["exemplars"]} == {f"movie:tmdb:bob{i}" for i in range(3)}
+    assert db.get_state(conn, "centroid:movie") is None  # no global leftovers
 
 
 # ── rank ─────────────────────────────────────────────────────────────
@@ -280,7 +317,7 @@ def test_rank_end_to_end(tmp_path):
         "INSERT INTO recommendations (run_id, ts, domain, item_id, score, status)"
         " VALUES ('old2', ?, 'movie', 'movie:tmdb:stale', 0.5, 'proposed')", (old_ts,))
 
-    db.set_state(conn, "model:movie", json.dumps({
+    db.pset_state(conn, "default", "model:movie", json.dumps({
         "w": b64(4.0 * e[0]), "b": -1.0, "dim": DIM, "embed_model": model,
         "trained_at": db.now(), "n_pos": 10, "n_neg": 3, "n_weak": 20}))
     exemplars = []
@@ -290,7 +327,7 @@ def test_rank_end_to_end(tmp_path):
         db.upsert_item(conn, iid, "movie", title=f"Liked {i}")
         put_vec(conn, iid, v, model)
         exemplars.append([iid, round(1.0 - 0.1 * i, 2)])
-    db.set_state(conn, "centroid:movie", json.dumps({
+    db.pset_state(conn, "default", "centroid:movie", json.dumps({
         "pos": b64(e[0]), "neg": None, "dim": DIM, "embed_model": model,
         "exemplars": exemplars}))
 
@@ -360,10 +397,10 @@ def test_rank_serendipity_wins_exploration_slots(tmp_path):
         put_vec(conn, iid, v, model)
         source = "serendipity_tmdb" if name in ("sr", "sj") else "tmdb_similar"
         add_candidate(conn, iid, source=source)
-    db.set_state(conn, "model:movie", json.dumps({
+    db.pset_state(conn, "default", "model:movie", json.dumps({
         "w": b64(4.0 * axis(0)), "b": -1.0, "dim": DIM, "embed_model": model,
         "trained_at": db.now(), "n_pos": 10, "n_neg": 3, "n_weak": 20}))
-    db.set_state(conn, "centroid:movie", json.dumps({
+    db.pset_state(conn, "default", "centroid:movie", json.dumps({
         "pos": b64(axis(0)), "neg": None, "dim": DIM, "embed_model": model,
         "exemplars": []}))
 
@@ -409,10 +446,10 @@ def test_rank_exploration_novelty_gate_excludes_near_core(tmp_path):
         db.upsert_item(conn, iid, "movie", title=name.upper())
         put_vec(conn, iid, v, model)
         add_candidate(conn, iid)
-    db.set_state(conn, "model:movie", json.dumps({
+    db.pset_state(conn, "default", "model:movie", json.dumps({
         "w": b64(4.0 * axis(1)), "b": -1.0, "dim": DIM, "embed_model": model,
         "trained_at": db.now(), "n_pos": 10, "n_neg": 3, "n_weak": 20}))
-    db.set_state(conn, "centroid:movie", json.dumps({
+    db.pset_state(conn, "default", "centroid:movie", json.dumps({
         "pos": b64(axis(0)), "neg": None, "dim": DIM, "embed_model": model,
         "exemplars": []}))
 
@@ -444,10 +481,10 @@ def test_rank_exploration_fallback_without_serendipity(tmp_path):
         db.upsert_item(conn, iid, "movie", title=name.upper())
         put_vec(conn, iid, v, model)
         add_candidate(conn, iid)
-    db.set_state(conn, "model:movie", json.dumps({
+    db.pset_state(conn, "default", "model:movie", json.dumps({
         "w": b64(4.0 * axis(1)), "b": -1.0, "dim": DIM, "embed_model": model,
         "trained_at": db.now(), "n_pos": 10, "n_neg": 3, "n_weak": 20}))
-    db.set_state(conn, "centroid:movie", json.dumps({
+    db.pset_state(conn, "default", "centroid:movie", json.dumps({
         "pos": b64(axis(0)), "neg": None, "dim": DIM, "embed_model": model,
         "exemplars": []}))
 
@@ -479,7 +516,7 @@ def test_rank_album_domain_slots_and_video_cap_exemption(tmp_path):
         put_vec(conn, iid, unit(axis(0) + 0.3 * rng.normal(size=DIM)), model)
         add_candidate(conn, iid, source="lastfm_top_albums", seed="artist:mbid:seed-a",
                       ext=1.0 - 0.05 * i)
-    db.set_state(conn, "centroid:album", json.dumps({
+    db.pset_state(conn, "default", "centroid:album", json.dumps({
         "pos": b64(axis(0)), "neg": None, "dim": DIM, "embed_model": model,
         "exemplars": []}))
     # movies in the same run: the video cap of 1 must bite them, not albums
@@ -488,7 +525,7 @@ def test_rank_album_domain_slots_and_video_cap_exemption(tmp_path):
         db.upsert_item(conn, iid, "movie", title=f"M{i}")
         put_vec(conn, iid, axis(i + 1), model)
         add_candidate(conn, iid)
-    db.set_state(conn, "centroid:movie", json.dumps({
+    db.pset_state(conn, "default", "centroid:movie", json.dumps({
         "pos": b64(axis(1)), "neg": None, "dim": DIM, "embed_model": model,
         "exemplars": []}))
 
@@ -516,7 +553,7 @@ def test_rank_centroid_fallback_artist(tmp_path):
         db.upsert_item(conn, iid, "artist", title=name)
         put_vec(conn, iid, v, model)
         add_candidate(conn, iid, source="lastfm_similar")
-    db.set_state(conn, "centroid:artist", json.dumps({
+    db.pset_state(conn, "default", "centroid:artist", json.dumps({
         "pos": b64(axis(0)), "neg": None, "dim": DIM, "embed_model": model,
         "exemplars": []}))
 
@@ -563,7 +600,7 @@ def test_rank_rescores_open_proposals_with_current_scorer(tmp_path):
     db.upsert_item(conn, "movie:tmdb:new", "movie", title="New")
     put_vec(conn, "movie:tmdb:new", axis(0), model)
     add_candidate(conn, "movie:tmdb:new")
-    db.set_state(conn, "model:movie", json.dumps({
+    db.pset_state(conn, "default", "model:movie", json.dumps({
         "w": b64(4.0 * axis(0)), "b": -1.0, "dim": DIM, "embed_model": model,
         "trained_at": ts, "n_pos": 10, "n_neg": 3, "n_weak": 20}))
 
@@ -596,10 +633,10 @@ def test_rank_ignores_head_from_other_embed_model(tmp_path):
         put_vec(conn, iid, v, model)
         add_candidate(conn, iid, source="lastfm_similar")
     # Stale head points at axis(1): if it were used, a2 would win big.
-    db.set_state(conn, "model:artist", json.dumps({
+    db.pset_state(conn, "default", "model:artist", json.dumps({
         "w": b64(4.0 * axis(1)), "b": -1.0, "dim": DIM, "embed_model": "other/embedder",
         "trained_at": db.now(), "n_pos": 8, "n_neg": 0, "n_weak": 16}))
-    db.set_state(conn, "centroid:artist", json.dumps({
+    db.pset_state(conn, "default", "centroid:artist", json.dumps({
         "pos": b64(axis(0)), "neg": None, "dim": DIM, "embed_model": model,
         "exemplars": []}))
 
@@ -619,7 +656,7 @@ def test_rank_skips_domain_when_all_state_is_stale(tmp_path):
     db.upsert_item(conn, "artist:mbid:a1", "artist", title="a1")
     put_vec(conn, "artist:mbid:a1", axis(0), cfg.model.embed_model)
     add_candidate(conn, "artist:mbid:a1", source="lastfm_similar")
-    db.set_state(conn, "centroid:artist", json.dumps({
+    db.pset_state(conn, "default", "centroid:artist", json.dumps({
         "pos": b64(axis(0)), "neg": None, "dim": DIM, "embed_model": "other/embedder",
         "exemplars": []}))
 
@@ -639,7 +676,7 @@ def _artist_centroid_store(tmp_path, names):
         db.upsert_item(conn, iid, "artist", title=name)
         put_vec(conn, iid, v, model)
         add_candidate(conn, iid, source="lastfm_similar")
-    db.set_state(conn, "centroid:artist", json.dumps({
+    db.pset_state(conn, "default", "centroid:artist", json.dumps({
         "pos": b64(axis(0)), "neg": None, "dim": DIM, "embed_model": model,
         "exemplars": []}))
     return conn, cfg
@@ -707,7 +744,7 @@ def test_rank_exploration_frac_override_changes_slot_split(tmp_path):
         db.upsert_item(conn, iid, "movie", title=name.upper())
         put_vec(conn, iid, v, model)
         add_candidate(conn, iid)
-    db.set_state(conn, "model:movie", json.dumps({
+    db.pset_state(conn, "default", "model:movie", json.dumps({
         "w": b64(4.0 * axis(0)), "b": -1.0, "dim": DIM, "embed_model": model,
         "trained_at": db.now(), "n_pos": 10, "n_neg": 3, "n_weak": 20}))
     settings.set(conn, "exploration_frac", 0.4)
@@ -756,7 +793,7 @@ def test_rank_video_cap_override_widens_budget(tmp_path):
         db.upsert_item(conn, iid, "movie", title=f"C{i}")
         put_vec(conn, iid, axis(i), model)
         add_candidate(conn, iid)
-    db.set_state(conn, "centroid:movie", json.dumps({
+    db.pset_state(conn, "default", "centroid:movie", json.dumps({
         "pos": b64(axis(0)), "neg": None, "dim": DIM, "embed_model": model,
         "exemplars": []}))
     settings.set(conn, "video_queue_max_pending", 3)
@@ -771,7 +808,7 @@ def test_album_domain_falls_back_to_artist_model(tmp_path):
     cfg = make_cfg(tmp_path)
     model = cfg.model.embed_model
     pos = axis(0)
-    db.set_state(conn, "centroid:artist", json.dumps({
+    db.pset_state(conn, "default", "centroid:artist", json.dumps({
         "dim": DIM, "embed_model": model, "pos": b64(pos), "neg": None,
         "exemplars": []}))
     for i in range(3):
@@ -781,3 +818,51 @@ def test_album_domain_falls_back_to_artist_model(tmp_path):
         add_candidate(conn, iid, source="lastfm_top_albums")
     stats = rank_mod.run(conn, cfg, top=5)
     assert stats.get("album", 0) == 3
+
+
+# ── rank: profiles ───────────────────────────────────────────────────
+
+
+def _two_profile_artist_store(tmp_path):
+    """One shared candidate item, per-profile pool rows + centroids."""
+    conn = db.connect(tmp_path / "t.db")
+    cfg = make_cfg(tmp_path, profiles=["alice", "bob"])
+    model = cfg.model.embed_model
+    db.upsert_item(conn, "artist:mbid:x", "artist", title="Shared Pick")
+    put_vec(conn, "artist:mbid:x", axis(0), model)
+    for profile in ("alice", "bob"):
+        add_candidate(conn, "artist:mbid:x", source="lastfm_similar", profile=profile)
+        db.pset_state(conn, profile, "centroid:artist", json.dumps({
+            "pos": b64(axis(0)), "neg": None, "dim": DIM, "embed_model": model,
+            "exemplars": []}))
+    return conn, cfg
+
+
+def test_rank_proposes_same_item_to_both_profiles(tmp_path):
+    """The open-rec unique index is (profile, item_id): one household,
+    two queues, so both profiles may hold their own rec for one item."""
+    conn, cfg = _two_profile_artist_store(tmp_path)
+
+    stats = rank_mod.run(conn, cfg)
+
+    assert stats["proposed"] == 2
+    rows = conn.execute(
+        "SELECT profile FROM recommendations WHERE item_id='artist:mbid:x'"
+        " AND status='proposed'").fetchall()
+    assert sorted(r["profile"] for r in rows) == ["alice", "bob"]
+    # idempotence across runs: the per-profile index blocks re-queueing
+    assert rank_mod.run(conn, cfg)["proposed"] == 0
+
+
+def test_rank_one_profiles_reject_does_not_block_the_other(tmp_path):
+    conn, cfg = _two_profile_artist_store(tmp_path)
+    db.add_event(conn, db.now(), "artist:mbid:x", "reject", -1.0, "user", profile="alice")
+
+    stats = rank_mod.run(conn, cfg)
+
+    assert stats["proposed"] == 1
+    rows = conn.execute(
+        "SELECT profile FROM recommendations WHERE item_id='artist:mbid:x'"
+        " AND status='proposed'").fetchall()
+    # alice said no — that verdict is hers alone, bob still gets the pick
+    assert [r["profile"] for r in rows] == ["bob"]

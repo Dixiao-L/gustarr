@@ -1,5 +1,7 @@
 """Candidate pool refresh: fan out from liked items to unseen neighbours.
 
+The whole pass runs once per configured profile: seeds, exclusions and
+caps are that profile's own, and candidate rows carry the profile.
 Seeds are the top positively-labelled items per domain (same label
 policy as training — signals.aggregate_label). Movies/series fan out
 through TMDb recommendations/similar plus a genre-keyed discover pass
@@ -85,31 +87,38 @@ def run(conn: sqlite3.Connection, cfg: Config, domain: str | None = None) -> dic
     domains = [domain] if domain else ["movie", "series", "artist", "album"]
     stats: dict[str, Any] = {
         "seeds": {}, "new": {}, "updated": {}, "skipped": 0, "capped": [], "errors": 0,
-        "serendipity": 0,
+        "serendipity": 0, "profiles": 0,
     }
-    pool = _Pool(conn, stats)
     tmdb_key = cfg.tmdb.get("api_key")
     lastfm_key = cfg.lastfm.get("api_key")
-    for dom in domains:
-        if dom in ("movie", "series") and tmdb_key:
-            positives = _positive_items(conn, dom)
-            seeds = [(iid, tid) for iid, tid in
-                     ((iid, _tmdb_id(conn, iid)) for iid, _ in positives[:SEED_LIMIT]) if tid]
-            stats["seeds"][dom] = len(seeds)
-            _tmdb_similar(tmdb_key, dom, seeds, pool, stats)
-            _tmdb_discover(conn, tmdb_key, dom, positives, pool, stats)
-            _tmdb_serendipity(conn, tmdb_key, dom, positives, pool, stats)
-        elif dom == "artist" and lastfm_key:
-            positives = _positive_items(conn, "artist")
-            _lastfm_similar(conn, lastfm_key, [iid for iid, _ in positives[:SEED_LIMIT]],
-                            pool, stats)
-            _lastfm_serendipity(conn, lastfm_key, positives, pool, stats)
-        elif dom == "album" and lastfm_key:
-            # Album taste rides on artist taste: reuse the artist seed list
-            # rather than inventing a separate album label policy.
-            positives = _positive_items(conn, "artist")
-            _lastfm_top_albums(conn, lastfm_key, [iid for iid, _ in positives[:SEED_LIMIT]],
-                               pool, stats)
+    # One full pass per profile: seeds come from that profile's own labels,
+    # exclusions from its own recs/rejects (library stays global), and the
+    # per-source new-row caps reset with each pool. Stats stay flat totals
+    # across profiles — the per-profile split isn't actionable in a log line.
+    for profile in cfg.profiles or {"default": None}:
+        stats["profiles"] += 1
+        pool = _Pool(conn, profile, stats)
+        for dom in domains:
+            if dom in ("movie", "series") and tmdb_key:
+                positives = _positive_items(conn, profile, dom)
+                seeds = [(iid, tid) for iid, tid in
+                         ((iid, _tmdb_id(conn, iid)) for iid, _ in positives[:SEED_LIMIT])
+                         if tid]
+                stats["seeds"][dom] = stats["seeds"].get(dom, 0) + len(seeds)
+                _tmdb_similar(tmdb_key, dom, seeds, pool, stats)
+                _tmdb_discover(conn, tmdb_key, dom, positives, pool, stats)
+                _tmdb_serendipity(conn, tmdb_key, dom, positives, pool, stats)
+            elif dom == "artist" and lastfm_key:
+                positives = _positive_items(conn, profile, "artist")
+                _lastfm_similar(conn, lastfm_key, [iid for iid, _ in positives[:SEED_LIMIT]],
+                                pool, stats)
+                _lastfm_serendipity(conn, lastfm_key, positives, pool, stats)
+            elif dom == "album" and lastfm_key:
+                # Album taste rides on artist taste: reuse the artist seed list
+                # rather than inventing a separate album label policy.
+                positives = _positive_items(conn, profile, "artist")
+                _lastfm_top_albums(conn, lastfm_key,
+                                   [iid for iid, _ in positives[:SEED_LIMIT]], pool, stats)
     stats["serendipity"] = sum(
         n for src, n in stats["new"].items() if src.startswith("serendipity_"))
     return stats
@@ -119,12 +128,14 @@ def run(conn: sqlite3.Connection, cfg: Config, domain: str | None = None) -> dic
 
 
 class _Pool:
-    """Insert-time gate: exclusion sets, per-source new-row cap, upsert."""
+    """Insert-time gate for one profile: exclusion sets, per-source
+    new-row cap, upsert onto the (profile, item, source) key."""
 
-    def __init__(self, conn: sqlite3.Connection, stats: dict[str, Any]):
+    def __init__(self, conn: sqlite3.Connection, profile: str, stats: dict[str, Any]):
         self.conn = conn
+        self.profile = profile
         self.stats = stats
-        self.excluded = _excluded_ids(conn)
+        self.excluded = _excluded_ids(conn, profile)
         self.new_rows: Counter[str] = Counter()
 
     def add(self, item_id: str, domain: str, title: str | None, year: int | None,
@@ -138,7 +149,8 @@ class _Pool:
             self.stats["skipped"] += 1
             return
         exists = self.conn.execute(
-            "SELECT 1 FROM candidates WHERE item_id=? AND source=?", (item_id, source)
+            "SELECT 1 FROM candidates WHERE profile=? AND item_id=? AND source=?",
+            (self.profile, item_id, source)
         ).fetchone() is not None
         if not exists and self.new_rows[source] >= SOURCE_CAPS.get(source, MAX_NEW_PER_SOURCE):
             if source not in self.stats["capped"]:
@@ -147,14 +159,15 @@ class _Pool:
         db.upsert_item(self.conn, item_id, domain, title=title, year=year, ids=ids_d, meta=meta)
         ts = db.now()
         self.conn.execute(
-            "INSERT INTO candidates (item_id, source, seed_item_id, external_score,"
-            " first_seen, last_seen) VALUES (?,?,?,?,?,?)"
-            " ON CONFLICT(item_id, source) DO UPDATE SET last_seen=excluded.last_seen,"
+            "INSERT INTO candidates (profile, item_id, source, seed_item_id, external_score,"
+            " first_seen, last_seen) VALUES (?,?,?,?,?,?,?)"
+            " ON CONFLICT(profile, item_id, source) DO UPDATE SET"
+            " last_seen=excluded.last_seen,"
             " external_score=CASE"
             "   WHEN candidates.external_score IS NULL THEN excluded.external_score"
             "   WHEN excluded.external_score IS NULL THEN candidates.external_score"
             "   ELSE max(candidates.external_score, excluded.external_score) END",
-            (item_id, source, seed_id, score, ts, ts),
+            (self.profile, item_id, source, seed_id, score, ts, ts),
         )
         bucket = "updated" if exists else "new"
         self.stats[bucket][source] = self.stats[bucket].get(source, 0) + 1
@@ -162,18 +175,20 @@ class _Pool:
             self.new_rows[source] += 1
 
 
-def _excluded_ids(conn: sqlite3.Connection) -> set[str]:
+def _excluded_ids(conn: sqlite3.Connection, profile: str) -> set[str]:
     marks = ",".join("?" * len(BLOCKED_REC_STATUSES))
+    # library is the household's one disk — global; recommendation verdicts
+    # and rejects are one person's taste — scoped to the profile.
     q = (
         "SELECT x.item_id, i.domain, i.ids FROM ("
         "SELECT item_id FROM library"
-        f" UNION SELECT item_id FROM recommendations WHERE status IN ({marks})"
-        "   OR (status='snoozed' AND acted_at >= ?)"
-        " UNION SELECT item_id FROM events WHERE kind='reject') x"
+        f" UNION SELECT item_id FROM recommendations WHERE profile=? AND (status IN ({marks})"
+        "   OR (status='snoozed' AND acted_at >= ?))"
+        " UNION SELECT item_id FROM events WHERE profile=? AND kind='reject') x"
         " LEFT JOIN items i ON i.id = x.item_id"
     )
     excluded: set[str] = set()
-    for r in conn.execute(q, (*BLOCKED_REC_STATUSES, snooze_cutoff())):
+    for r in conn.execute(q, (profile, *BLOCKED_REC_STATUSES, snooze_cutoff(), profile)):
         excluded.add(r["item_id"])
         if r["domain"] is None:
             continue
@@ -189,13 +204,14 @@ def _excluded_ids(conn: sqlite3.Connection) -> set[str]:
 # ── seed selection ───────────────────────────────────────────────────
 
 
-def _positive_items(conn: sqlite3.Connection, domain: str) -> list[tuple[str, float]]:
-    """Items with aggregate label >= SEED_LABEL_MIN, best first
-    (ties broken by most recent event)."""
+def _positive_items(conn: sqlite3.Connection, profile: str,
+                    domain: str) -> list[tuple[str, float]]:
+    """One profile's items with aggregate label >= SEED_LABEL_MIN, best
+    first (ties broken by most recent event)."""
     rows = conn.execute(
         "SELECT e.item_id, e.ts, e.kind, e.weight FROM events e"
-        " JOIN items i ON i.id = e.item_id WHERE i.domain=?",
-        (domain,),
+        " JOIN items i ON i.id = e.item_id WHERE e.profile=? AND i.domain=?",
+        (profile, domain),
     ).fetchall()
     events: dict[str, list[tuple[str, str, float]]] = {}
     latest: dict[str, str] = {}
@@ -464,7 +480,8 @@ def _lastfm_similar(conn: sqlite3.Connection, api_key: str, seed_ids: list[str],
             item_id, name, mb, score = resolved
             pool.add(item_id, "artist", name, None, {"mbid": mb} if mb else {}, {},
                      "lastfm_similar", seed_id, score)
-    stats["seeds"]["artist"] = used
+    # accumulate: run() calls this once per profile
+    stats["seeds"]["artist"] = stats["seeds"].get("artist", 0) + used
 
 
 # ── Last.fm: top albums ──────────────────────────────────────────────
@@ -529,7 +546,8 @@ def _lastfm_top_albums(conn: sqlite3.Connection, api_key: str, seed_ids: list[st
             pool.add(ids.make("album", "mbid", album_mbid), "album", title, None,
                      {"mbid": album_mbid, "artist_mbid": artist_mbid}, meta,
                      "lastfm_top_albums", seed_id, score)
-    stats["seeds"]["album"] = used
+    # accumulate: run() calls this once per profile
+    stats["seeds"]["album"] = stats["seeds"].get("album", 0) + used
 
 
 # ── serendipity: Last.fm ─────────────────────────────────────────────
@@ -541,10 +559,12 @@ def _lastfm_serendipity(conn: sqlite3.Connection, api_key: str,
     """2-hop neighbourhood: getSimilar on the strongest hop-1 candidates
     (never library rows or seeds), scores damped for the extra hop."""
     seeds = {iid for iid, _ in positives}
+    # hop-1 pool and the bubble check below are this profile's own view:
+    # another profile's reachability says nothing about ours
     hops = [r["item_id"] for r in conn.execute(
-        "SELECT item_id FROM candidates WHERE source='lastfm_similar'"
+        "SELECT item_id FROM candidates WHERE profile=? AND source='lastfm_similar'"
         " AND item_id NOT IN (SELECT item_id FROM library)"
-        " ORDER BY external_score DESC, item_id")
+        " ORDER BY external_score DESC, item_id", (pool.profile,))
         if r["item_id"] not in seeds][:SERENDIPITY_HOP_SEEDS]
     for hop_id in hops:
         params = _artist_query_params(conn, hop_id, api_key, limit=SERENDIPITY_HOP_LIMIT)
@@ -564,8 +584,9 @@ def _lastfm_serendipity(conn: sqlite3.Connection, api_key: str,
             # anything already reachable at hop 1 (or via another source)
             # is bubble-adjacent, not serendipity — leave it be
             known = conn.execute(
-                "SELECT 1 FROM candidates WHERE item_id=? AND source!='serendipity_lastfm'",
-                (item_id,)).fetchone()
+                "SELECT 1 FROM candidates WHERE profile=? AND item_id=?"
+                " AND source!='serendipity_lastfm'",
+                (pool.profile, item_id)).fetchone()
             if known is not None:
                 continue
             pool.add(item_id, "artist", name, None, {"mbid": mb} if mb else {}, {},

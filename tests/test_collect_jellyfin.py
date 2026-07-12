@@ -94,18 +94,25 @@ def make_transport(state):
             rows = [r for r in state["pbr_rows"] if r[0] > cur]
             cols = ["rowid", "DateCreated", "UserId", "ItemId", "ItemType", "PlayDuration"]
             return httpx.Response(200, json={"colums": cols, "results": rows})
-        if path == "/Users/u1/Items":
+        m = re.fullmatch(r"/Users/([^/]+)/Items", path)
+        if m:
             if "Ids" in q:
                 found = [state["by_id"][i] for i in q["Ids"].split(",") if i in state["by_id"]]
                 return httpx.Response(200, json={"Items": found,
                                                  "TotalRecordCount": len(found)})
+            # legacy single-user state keeps u1's view at the top level;
+            # multi-profile tests park per-uid views under 'per_user'
+            view = state.get("per_user", {}).get(
+                m.group(1), state if m.group(1) == "u1" else None)
+            if view is None:
+                return httpx.Response(404)
             inc = q.get("IncludeItemTypes", "")
             if "Episode" in inc:
-                data = state["episodes"]
+                data = view["episodes"]
             elif "Audio" in inc:
-                data = state["audio"]
+                data = view["audio"]
             else:
-                data = state["library"]
+                data = view["library"]
             start = int(q.get("StartIndex", 0))
             page = data[start:start + 2]  # tiny pages force the pagination loop
             return httpx.Response(200, json={"Items": page, "TotalRecordCount": len(data)})
@@ -143,7 +150,10 @@ def test_sync_maps_canonical_ids_and_events(tmp_path):
     assert stats["series_plays"] == 1 and stats["series_completes"] == 0
     assert stats["scrobbles"] == 2
     assert stats["playback_reporting"] == 2
-    assert db.get_state(conn, "jellyfin:pbr_rowid") == "2"
+    assert stats["profiles"] == 1 and stats["profiles_skipped"] == 0
+    # legacy single-user config: everything lands on the synthesized default
+    assert {r["profile"] for r in conn.execute("SELECT profile FROM events")} == {"default"}
+    assert db.pget_state(conn, "default", "jellyfin:pbr_rowid") == "2"
 
 
 def test_second_sync_is_a_noop(tmp_path):
@@ -235,7 +245,7 @@ def test_cursor_holds_when_duplicate_key_blocks_scrobble(tmp_path):
     state["audio"][0]["UserData"]["PlayCount"] = 9
     stats = jellyfin.sync(conn, cfg, transport=make_transport(state))
     assert stats["scrobbles"] == 0
-    assert db.get_state(conn, "jellyfin:track_plays:t1") == "7"
+    assert db.pget_state(conn, "default", "jellyfin:track_plays:t1") == "7"
     # once the ts finally moves, the pending delta lands intact
     state["audio"][0]["UserData"]["LastPlayedDate"] = "2024-06-20T10:00:00.0000000Z"
     stats = jellyfin.sync(conn, cfg, transport=make_transport(state))
@@ -244,7 +254,7 @@ def test_cursor_holds_when_duplicate_key_blocks_scrobble(tmp_path):
         "SELECT weight, meta FROM events WHERE ts='2024-06-20T10:00:00Z'").fetchone()
     assert row["weight"] == pytest.approx(2 * WEIGHTS["scrobble"])
     assert json.loads(row["meta"])["delta"] == 2
-    assert db.get_state(conn, "jellyfin:track_plays:t1") == "9"
+    assert db.pget_state(conn, "default", "jellyfin:track_plays:t1") == "9"
 
 
 def test_merged_fallback_artist_is_not_resurrected(tmp_path, monkeypatch):
@@ -303,7 +313,7 @@ def test_series_cursors_follow_merged_id(tmp_path, monkeypatch):
     kinds = sorted(r["kind"] for r in conn.execute(
         "SELECT kind FROM events WHERE item_id='series:tmdb:999' AND ts LIKE '2099-01-02%'"))
     assert kinds == ["complete", "play"]
-    assert db.get_state(conn, "jellyfin:series_played:series:tmdb:999") == "5"
+    assert db.pget_state(conn, "default", "jellyfin:series_played:series:tmdb:999") == "5"
 
 
 def test_missing_user_errors_clearly(tmp_path):
@@ -363,4 +373,105 @@ def test_pbr_rows_become_precise_events(tmp_path):
     state["audio"][0]["UserData"]["LastPlayedDate"] = "2024-06-20T10:00:00.0000000Z"
     stats2 = jellyfin.sync(conn, cfg, transport=make_transport(state))
     assert stats2["pbr_scrobbles"] == stats2["scrobbles"] == 0
-    assert db.get_state(conn, "jellyfin:track_plays:t1") == "9"
+    assert db.pget_state(conn, "default", "jellyfin:track_plays:t1") == "9"
+
+
+# ── multi-profile ────────────────────────────────────────────────────
+
+
+def two_profile_cfg(tmp_path):
+    return C._build({
+        "core": {"data_dir": str(tmp_path)},
+        "jellyfin": {"url": BASE, "api_key": "sekrit"},
+        "profiles": {"tab": {"jellyfin_user": "tab"},
+                     "guest": {"jellyfin_user": "guest"}},
+    })
+
+
+def test_two_profiles_plays_land_in_own_profiles(tmp_path):
+    conn = db.connect(tmp_path / "t.db")
+    cfg = two_profile_cfg(tmp_path)
+    state = server_state()
+    state["pbr_available"] = False  # count-delta path: per-user UserData drives events
+    matrix = {"Id": "m1", "Type": "Movie", "Name": "The Matrix", "ProductionYear": 1999,
+              "ProviderIds": {"Tmdb": "603"}}
+    state["per_user"] = {
+        "u1": {
+            "library": [{**matrix, "UserData": {
+                "Played": True, "IsFavorite": True,
+                "LastPlayedDate": "2024-05-01T20:00:00.0000000Z"}}],
+            "episodes": [],
+            "audio": [{"Id": "t1", "Type": "Audio", "Name": "Paranoid Android",
+                       "Album": "OK Computer",
+                       "ArtistItems": [{"Id": "a1", "Name": "Radiohead"}],
+                       "UserData": {"PlayCount": 2,
+                                    "LastPlayedDate": "2024-06-01T10:00:00.0000000Z"}}],
+        },
+        "u2": {
+            "library": [{**matrix, "UserData": {
+                "Played": True, "IsFavorite": False,
+                "LastPlayedDate": "2024-05-02T20:00:00.0000000Z"}}],
+            "episodes": [],
+            "audio": [{"Id": "t2", "Type": "Audio", "Name": "Roygbiv", "Album": "MHTRTC",
+                       "ArtistItems": [{"Id": "a2", "Name": "Boards of Canada"}],
+                       "UserData": {"PlayCount": 3,
+                                    "LastPlayedDate": "2024-06-02T10:00:00.0000000Z"}}],
+        },
+    }
+    stats = jellyfin.sync(conn, cfg, transport=make_transport(state))
+
+    assert stats["profiles"] == 2 and stats["profiles_skipped"] == 0
+    assert stats["favorites"] == 1 and stats["completes"] == 2
+    assert stats["scrobbles"] == 2
+
+    ev = {(r["profile"], r["item_id"], r["kind"]): r
+          for r in conn.execute("SELECT * FROM events")}
+    # the shared movie: both watched it, only tab favorited it
+    assert ("tab", "movie:tmdb:603", "complete") in ev
+    assert ("guest", "movie:tmdb:603", "complete") in ev
+    assert ("tab", "movie:tmdb:603", "favorite") in ev
+    assert ("guest", "movie:tmdb:603", "favorite") not in ev
+    # each profile's listens stay its own
+    assert ev[("tab", ARTIST_MBID, "scrobble")]["weight"] \
+        == pytest.approx(2 * WEIGHTS["scrobble"])
+    assert ev[("guest", ARTIST_LASTFM, "scrobble")]["weight"] \
+        == pytest.approx(3 * WEIGHTS["scrobble"])
+    assert ("guest", ARTIST_MBID, "scrobble") not in ev
+    assert ("tab", ARTIST_LASTFM, "scrobble") not in ev
+
+    # cursors are per profile, never shared
+    assert db.pget_state(conn, "tab", "jellyfin:track_plays:t1") == "2"
+    assert db.pget_state(conn, "guest", "jellyfin:track_plays:t2") == "3"
+    assert db.pget_state(conn, "guest", "jellyfin:track_plays:t1") is None
+
+    # re-sync stays a noop for both profiles
+    stats2 = jellyfin.sync(conn, cfg, transport=make_transport(state))
+    assert stats2["favorites"] == stats2["completes"] == stats2["scrobbles"] == 0
+
+
+def test_pbr_rows_map_to_owning_profile(tmp_path):
+    conn = db.connect(tmp_path / "t.db")
+    cfg = two_profile_cfg(tmp_path)
+    state = server_state()
+    empty = {"library": [], "episodes": [], "audio": []}
+    state["per_user"] = {"u1": dict(empty), "u2": dict(empty)}
+    state["by_id"]["t1"] = server_state()["audio"][0]
+    state["by_id"]["t2"] = server_state()["audio"][1]
+    state["pbr_rows"] = [
+        [1, "2024-06-01 10:00:00", "u1", "t1", "Audio", 240],
+        [2, "2024-06-02 20:00:00", "u2", "t2", "Audio", 200],
+        [3, "2024-06-03 21:00:00", "u9", "t1", "Audio", 99],  # nobody's user: dropped
+    ]
+    stats = jellyfin.sync(conn, cfg, transport=make_transport(state))
+
+    assert stats["pbr_scrobbles"] == 2
+    assert stats["playback_reporting"] == 6  # each profile walks all 3 rows
+    scrobbles = {(r["profile"], r["item_id"], r["dedup"]) for r in conn.execute(
+        "SELECT profile, item_id, dedup FROM events WHERE kind='scrobble'")}
+    assert scrobbles == {("tab", ARTIST_MBID, "pbr1"), ("guest", ARTIST_LASTFM, "pbr2")}
+    # each profile's walk cursor covers the whole table independently
+    assert db.pget_state(conn, "tab", "jellyfin:pbr_rowid") == "3"
+    assert db.pget_state(conn, "guest", "jellyfin:pbr_rowid") == "3"
+
+    stats2 = jellyfin.sync(conn, cfg, transport=make_transport(state))
+    assert stats2["pbr_scrobbles"] == 0 and stats2["playback_reporting"] == 0

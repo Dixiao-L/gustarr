@@ -34,15 +34,15 @@ def cfg(tmp_path):
 
 
 def add_rec(conn, item_id, domain="movie", title=None, year=None, score=0.5,
-            why=None, status="proposed", genres=None, meta=None):
+            why=None, status="proposed", genres=None, meta=None, profile="default"):
     item_meta = dict(meta or {})
     if genres:
         item_meta["genres"] = genres
     db.upsert_item(conn, item_id, domain, title, year, meta=item_meta or None)
     cur = conn.execute(
-        "INSERT INTO recommendations (run_id, ts, domain, item_id, score, why, status)"
-        " VALUES ('r1', ?, ?, ?, ?, ?, ?)",
-        (db.now(), domain, item_id, score, json.dumps(why or {}), status))
+        "INSERT INTO recommendations (profile, run_id, ts, domain, item_id, score, why, status)"
+        " VALUES (?, 'r1', ?, ?, ?, ?, ?, ?)",
+        (profile, db.now(), domain, item_id, score, json.dumps(why or {}), status))
     return cur.lastrowid
 
 
@@ -125,6 +125,19 @@ def test_list_recs_music_domain_alias(conn):
     assert [r["id"] for r in queue.list_recs(conn, domain="artist")] == [artist]
 
 
+def test_list_recs_scoped_to_profile(conn):
+    alice = add_rec(conn, "movie:tmdb:1", title="Hers", score=0.9, profile="alice")
+    add_rec(conn, "movie:tmdb:2", title="His", score=0.8, profile="bob")
+    default = add_rec(conn, "movie:tmdb:3", title="Legacy", score=0.7)
+
+    # no profile argument = the synthesized single-user profile, so
+    # pre-profile callers (web, scripts) keep seeing exactly their queue
+    assert [r["id"] for r in queue.list_recs(conn)] == [default]
+    rows = queue.list_recs(conn, profile="alice")
+    assert [r["id"] for r in rows] == [alice]
+    assert rows[0]["profile"] == "alice"
+
+
 # ── queue: approve / reject ──────────────────────────────────────────
 
 
@@ -186,6 +199,31 @@ def test_exploration_approve_keeps_full_weight(conn):
     ev = conn.execute("SELECT * FROM events WHERE kind='approve'").fetchone()
     assert ev["weight"] == WEIGHTS["approve"] == 1.0
     assert json.loads(ev["meta"]) == {"rec_id": rid}
+
+
+def test_set_status_profile_guard_and_event_attribution(conn):
+    rid = add_rec(conn, "movie:tmdb:40", title="Hers", profile="alice")
+    # the guard only bites when a profile is supplied and wrong
+    with pytest.raises(ValueError, match="belongs to profile 'alice'"):
+        queue.set_status(conn, rid, "approved", profile="bob")
+    assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+
+    # no profile given: the rec id is trusted — and the taste event must
+    # land on the rec owner's profile so it trains *her* model
+    queue.set_status(conn, rid, "approved")
+    ev = conn.execute("SELECT profile, kind FROM events").fetchone()
+    assert (ev["profile"], ev["kind"]) == ("alice", "approve")
+
+
+def test_forgive_and_explain_profile_guard(conn):
+    rid = add_rec(conn, "movie:tmdb:41", title="Hers", profile="alice")
+    with pytest.raises(ValueError, match="belongs to profile 'alice'"):
+        queue.explain(conn, rid, profile="bob")
+    assert "Hers" in queue.explain(conn, rid, profile="alice")
+    queue.set_status(conn, rid, "rejected", profile="alice")
+    with pytest.raises(ValueError, match="belongs to profile 'alice'"):
+        queue.forgive(conn, rid, profile="bob")
+    assert queue.forgive(conn, rid, profile="alice") == {"deleted_events": 1}
 
 
 def test_double_approve_raises(conn):
@@ -378,11 +416,15 @@ def test_store_stats(conn):
         "INSERT INTO candidates (item_id, source, first_seen, last_seen)"
         " VALUES ('movie:tmdb:2', 'tmdb_similar', ?, ?)", (db.now(), db.now()))
     db.put_embedding(conn, "artist:mbid:aa", "m", b"\x00\x00", 1)
-    db.set_state(conn, "lastfm:last_uts", "1700000000")
+    # cursors and models live in the profile namespace now; arr inventory
+    # stays global
+    db.pset_state(conn, "default", "lastfm:last_uts", "1700000000")
     db.set_state(conn, "arr:known:radarr", json.dumps({"movie:tmdb:1": 11}))
-    db.set_state(conn, "model:movie", json.dumps({"trained_at": "2026-07-01T00:00:00Z"}))
+    db.pset_state(conn, "default", "model:movie",
+                  json.dumps({"trained_at": "2026-07-01T00:00:00Z"}))
 
     s = queue.store_stats(conn)
+    assert s["profile"] == "default"
     assert s["tables"]["items"] == 4
     assert s["tables"]["events"] == 3
     assert s["tables"]["recommendations"] == 3
@@ -397,6 +439,26 @@ def test_store_stats(conn):
     assert s["settings_overridden"] == 1  # only setting:% keys count
     # 3 items carry events/candidates; only the artist has a vector
     assert s["embedding_coverage"] == {"needed": 3, "embedded": 1}
+
+
+def test_store_stats_scoped_to_profile(conn):
+    add_rec(conn, "movie:tmdb:1", title="Hers", profile="alice")
+    add_rec(conn, "movie:tmdb:2", title="His", status="approved", profile="bob")
+    db.pset_state(conn, "alice", "model:movie",
+                  json.dumps({"trained_at": "2026-07-01T00:00:00Z"}))
+    db.pset_state(conn, "alice", "lastfm:last_uts", "1700000000")
+
+    s = queue.store_stats(conn, profile="alice")
+    assert s["profile"] == "alice"
+    assert s["recs_by_status"] == {"proposed": 1}  # bob's approval invisible
+    assert s["models"] == {"movie": "2026-07-01T00:00:00Z"}
+    assert s["sync"] == {"lastfm:last_uts": "1700000000"}
+    assert s["tables"]["recommendations"] == 2  # table totals stay global
+
+    s = queue.store_stats(conn, profile="bob")
+    assert s["recs_by_status"] == {"approved": 1}
+    assert s["models"] == {}  # bob hasn't trained yet — alice's model isn't his
+    assert s["sync"] == {}
 
 
 def test_store_stats_diversity_entropy_and_share(conn):

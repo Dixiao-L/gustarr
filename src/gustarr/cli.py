@@ -176,13 +176,14 @@ def apply(ctx: Ctx, dry_run: bool) -> None:
 @main.command()
 @click.option("--domain", default=None)
 @click.option("--status", default="proposed")
+@click.option("--profile", default="default", help="Whose queue to list.")
 @click.option("--json", "as_json", is_flag=True)
 @click.pass_obj
-def recs(ctx: Ctx, domain: str | None, status: str, as_json: bool) -> None:
+def recs(ctx: Ctx, domain: str | None, status: str, profile: str, as_json: bool) -> None:
     """List recommendations (default: the open approval queue)."""
     from .queue import list_recs
 
-    rows = list_recs(ctx.conn, domain=domain, status=status)
+    rows = list_recs(ctx.conn, domain=domain, status=status, profile=profile)
     if as_json:
         click.echo(json.dumps(rows, ensure_ascii=False, indent=2))
         return
@@ -191,49 +192,62 @@ def recs(ctx: Ctx, domain: str | None, status: str, as_json: bool) -> None:
                    f"{r['title']} ({r['year'] or '?'})  [{r['status']}]")
 
 
+# A rec id already implies its profile, so --profile on the id-taking
+# commands is a guard, not a selector: given, it must match the rec's
+# owner (catches acting on someone else's queue by mistyped id); omitted,
+# the id alone is trusted.
+_PROFILE_GUARD = click.option(
+    "--profile", default=None,
+    help="Fail unless the recommendation belongs to this profile.")
+
+
 @main.command()
 @click.argument("rec_ids", type=int, nargs=-1, required=True)
+@_PROFILE_GUARD
 @click.pass_obj
-def approve(ctx: Ctx, rec_ids: tuple[int, ...]) -> None:
+def approve(ctx: Ctx, rec_ids: tuple[int, ...], profile: str | None) -> None:
     """Approve queued recommendations (adds on next `apply`; feeds training)."""
     from .queue import set_status
 
     for rid in rec_ids:
-        set_status(ctx.conn, rid, "approved")
+        set_status(ctx.conn, rid, "approved", profile=profile)
     ctx.conn.commit()
     click.echo(f"approved: {', '.join(map(str, rec_ids))}")
 
 
 @main.command()
 @click.argument("rec_ids", type=int, nargs=-1, required=True)
+@_PROFILE_GUARD
 @click.pass_obj
-def reject(ctx: Ctx, rec_ids: tuple[int, ...]) -> None:
+def reject(ctx: Ctx, rec_ids: tuple[int, ...], profile: str | None) -> None:
     """Reject recommendations — the model learns from this immediately."""
     from .queue import set_status
 
     for rid in rec_ids:
-        set_status(ctx.conn, rid, "rejected")
+        set_status(ctx.conn, rid, "rejected", profile=profile)
     ctx.conn.commit()
     click.echo(f"rejected: {', '.join(map(str, rec_ids))}")
 
 
 @main.command()
 @click.argument("rec_id", type=int)
+@_PROFILE_GUARD
 @click.pass_obj
-def why(ctx: Ctx, rec_id: int) -> None:
+def why(ctx: Ctx, rec_id: int, profile: str | None) -> None:
     """Explain a recommendation: nearest liked neighbours + sources."""
     from .queue import explain
 
-    click.echo(explain(ctx.conn, rec_id))
+    click.echo(explain(ctx.conn, rec_id, profile=profile))
 
 
 @main.command()
+@click.option("--profile", default="default", help="Profile for the per-person numbers.")
 @click.pass_obj
-def stats(ctx: Ctx) -> None:
+def stats(ctx: Ctx, profile: str) -> None:
     """Store overview: events, items, candidates, queue, model freshness."""
     from .queue import store_stats
 
-    click.echo(json.dumps(store_stats(ctx.conn), indent=2))
+    click.echo(json.dumps(store_stats(ctx.conn, profile=profile), indent=2))
 
 
 # ── composition + web ────────────────────────────────────────────────

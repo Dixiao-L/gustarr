@@ -40,11 +40,14 @@ _SPECS: dict[str, dict[str, Any]] = {
 
 def sync(conn: sqlite3.Connection, cfg: Config) -> dict[str, int]:
     stats = {"items": 0, "library": 0, "events": 0, "rejects": 0, "removed": 0, "skipped": 0}
+    # library/items stay global (one disk, one *arr); only the taste events
+    # below are per-profile. Guard for hand-built Configs without profiles.
+    profiles = list(cfg.profiles) or ["default"]
     for name, spec in _SPECS.items():
         arr_cfg: ArrConfig | None = getattr(cfg, name)
         if arr_cfg is None:
             continue
-        _sync_one(conn, name, spec, arr_cfg, stats)
+        _sync_one(conn, name, spec, arr_cfg, profiles, stats)
     return stats
 
 
@@ -62,6 +65,7 @@ def _sync_one(
     name: str,
     spec: dict[str, Any],
     arr_cfg: ArrConfig,
+    profiles: list[str],
     stats: dict[str, int],
 ) -> None:
     base = arr_cfg.url.rstrip("/")
@@ -98,10 +102,14 @@ def _sync_one(
 
         # gustarr's own adds are not taste signal — that would be feedback
         # leakage; its feedback loop is watch events + explicit approve/reject.
+        # The *arr can't say WHO added it, so the event fans out to every
+        # configured profile: the household owns the library, and the modest
+        # library_add weight keeps the shared attribution harmless.
         if not is_gustarr and added:
-            if db.add_event(conn, added, item_id, "library_add", WEIGHTS["library_add"],
-                            "arr", {"arr": name}):
-                stats["events"] += 1
+            for profile in profiles:
+                if db.add_event(conn, added, item_id, "library_add", WEIGHTS["library_add"],
+                                "arr", {"arr": name}, profile=profile):
+                    stats["events"] += 1
         current[item_id] = entry.get("id")
 
     state_key = f"arr:known:{name}"
@@ -110,10 +118,13 @@ def _sync_one(
         row = conn.execute(
             "SELECT meta FROM library WHERE item_id=? AND arr=?", (item_id, name)).fetchone()
         if row and json.loads(row["meta"]).get("gustarr"):
-            # user deleted a gustarr add: the strongest negative we ever see
-            if db.add_event(conn, db.now(), item_id, "reject", WEIGHTS["reject"], "arr",
-                            {"deleted": True}):
-                stats["rejects"] += 1
+            # user deleted a gustarr add: the strongest negative we ever see.
+            # Deletion is as anonymous as adding — fan out to every profile
+            # (see the library_add comment above).
+            for profile in profiles:
+                if db.add_event(conn, db.now(), item_id, "reject", WEIGHTS["reject"], "arr",
+                                {"deleted": True}, profile=profile):
+                    stats["rejects"] += 1
         conn.execute("DELETE FROM library WHERE item_id=? AND arr=?", (item_id, name))
         stats["removed"] += 1
     db.set_state(conn, state_key, json.dumps(current))

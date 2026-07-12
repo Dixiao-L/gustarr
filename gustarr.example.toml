@@ -1,4 +1,4 @@
-# gustarr configuration — full key reference in docs/configuration.md.
+# Gustarr configuration — full key reference in docs/configuration.md.
 # Secrets use env:VAR — resolved from the process environment (systemd
 # EnvironmentFile=, agenix, docker env_file, direnv...), so this file is
 # safe to commit. Every section is optional — configure only the services
@@ -25,16 +25,29 @@ user = "your-lastfm-username"
 # Exploration playlist feed the music candidate pool.
 [listenbrainz]
 user = "your-listenbrainz-username"
-# token only needed if you want gustarr to submit anything; reads are public
+# token only needed if you want Gustarr to submit anything; reads are public
 # (a token merely lifts rate limits)
 # token = "env:LISTENBRAINZ_TOKEN"
+
+# Multi-user households: one taste model / queue / cursor set per profile,
+# over the shared library and shared weekly budgets. The web UI resolves the
+# profile per request (auth-proxy header, ?profile=, or the sole profile).
+# Omit entirely for single-user — the top-level user keys above become the
+# implicit "default" profile.
+# [profiles.alice]
+# jellyfin_user = "alice"
+# lastfm_user = "alice-fm"
+# listenbrainz_user = "alice-lb"
+#
+# [profiles.bob]
+# jellyfin_user = "bob"
 
 # Movie/series metadata and candidates. Free key: themoviedb.org/settings/api
 # (No TVDB key needed anywhere — series ids resolve through TMDb/Sonarr.)
 [tmdb]
 api_key = "env:TMDB_API_KEY"
 
-# Each *arr is optional. Items gustarr adds are tagged "gustarr" (override
+# Each *arr is optional. Items Gustarr adds are tagged "gustarr" (override
 # with `tag = "..."`); it never removes or modifies anything without that tag.
 [sonarr]
 url = "http://127.0.0.1:8989"
@@ -54,7 +67,7 @@ api_key = "env:LIDARR_API_KEY"
 quality_profile = "Standard"
 root_folder = "/media/data/music"
 
-# Autonomy: how much gustarr may do without you. Several of these can be
+# Autonomy: how much Gustarr may do without you. Several of these can be
 # overridden at runtime from the web UI (overrides win until cleared).
 [autonomy]
 music_mode = "auto"    # auto-add music within the caps below ("queue" = ask first)
@@ -76,3 +89,12 @@ bind = "127.0.0.1:8790"
 # Extra hostnames past the Host/Origin guard — needed when serving via a
 # reverse proxy or a non-localhost bind (otherwise browsers get 403).
 # allowed_hosts = ["nas.lan"]
+# Forward-auth header mapped to a profile name (what Authelia sets); only
+# meaningful with [profiles.*] configured, and only safe behind the proxy.
+# profile_header = "Remote-User"
+
+# Built-in scheduler for containers: when set, `gustarr web` runs the
+# nightly pipeline itself at this local time (set TZ in the container!).
+# Leave unset under systemd/cron timers — they are the better boundary.
+# [scheduler]
+# nightly = "04:30"

@@ -1,10 +1,13 @@
-# gustarr compose example. Copy to docker-compose.yml and adjust.
+# Gustarr compose example. Copy to docker-compose.yml and adjust.
 #
 # Config: copy gustarr.example.toml to ./gustarr.toml. For containers set
-#   [core]  data_dir = "/var/lib/gustarr"
-#   [model] device   = "cpu"                # image ships CPU-only torch
-#   [web]   bind     = "0.0.0.0:8790"       # reachable through the port map
-#   [web]   allowed_hosts = ["nas.lan"]     # hostname you browse to (Host guard)
+#   [core]      data_dir = "/var/lib/gustarr"
+#   [model]     device   = "cpu"              # image ships CPU-only torch
+#   [web]       bind     = "0.0.0.0:8790"     # reachable through the port map
+#   [web]       allowed_hosts = ["nas.lan"]   # hostname you browse to (Host guard)
+#   [scheduler] nightly  = "04:30"            # built-in scheduler: the web
+#                                             # container runs the pipeline
+#                                             # itself — no host cron needed
 # Secrets stay out of the TOML via env:VAR — put the actual values in
 # ./gustarr.env (chmod 600, gitignored):
 #   TMDB_API_KEY=...
@@ -12,7 +15,9 @@
 #   SONARR_API_KEY=...
 
 services:
-  # long-running approval web UI — the only daemon
+  # long-running approval web UI — with [scheduler] set, also the nightly
+  # pipeline's launcher (it runs as a subprocess; start/exit land in the
+  # container logs)
   gustarr:
     image: ghcr.io/dixiao-l/gustarr:latest
     # build: .                              # or build locally
@@ -21,6 +26,8 @@ services:
       - "8790:8790"
     env_file:
       - gustarr.env
+    # environment:
+    #   TZ: Europe/Berlin                   # [scheduler] fires in container-local time
     volumes:
       - ./gustarr.toml:/etc/gustarr/gustarr.toml:ro
       - gustarr-state:/var/lib/gustarr     # SQLite store + model cache: back this up
@@ -32,8 +39,8 @@ services:
       retries: 3
       start_period: 15s
 
-  # There is deliberately no scheduler in the container. Run pipelines as
-  # one-shots from host cron / a host systemd timer:
+  # Prefer pipelines outside the web container (separate logs/limits)?
+  # Leave [scheduler] unset and run one-shots from host cron instead:
   #
   #   30 4 * * *  cd /opt/gustarr && docker compose run --rm gustarr run nightly
   #   0  9 * * 6  cd /opt/gustarr && docker compose run --rm gustarr run weekly
