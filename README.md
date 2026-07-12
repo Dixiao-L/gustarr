@@ -111,8 +111,9 @@ EOF
 $ docker compose up -d gustarr             # web UI on :8790 — that's it
 ```
 
-With `[scheduler] nightly = "HH:MM"` set, the web container runs the pipeline
-itself every night — no host cron, no extra services. Kick a run manually with
+With `[scheduler] nightly = "HH:MM"` set, the scheduler service (a dedicated
+`gustarr schedule` process from the same image — the web UI never runs the
+pipeline) fires it every night; no host cron needed. Kick a run manually with
 the UI's **Run Now**, or `docker compose run --rm gustarr run nightly`. The
 image ships CPU-only torch (works everywhere, ~2 GB); GPU embedding is what
 the NixOS module is for. See [docs/deployment.md](docs/deployment.md).
@@ -233,7 +234,7 @@ resolved from the environment at load time, so the file is safe to commit.
 | `[web]` | `bind` | `"127.0.0.1:8790"` | web UI bind address |
 | `[web]` | `allowed_hosts` | `[]` | extra hostnames past the Host/Origin guard |
 | `[web]` | `profile_header` | `"Remote-User"` | forward-auth header mapped to a profile name |
-| `[scheduler]` | `nightly` | unset | `"HH:MM"` local time — `gustarr web` runs the nightly pipeline itself (for containers) |
+| `[scheduler]` | `nightly` | unset | `"HH:MM"` local time — when the dedicated `gustarr schedule` process fires the pipeline |
 
 A handful of knobs (`paused`, `music_mode`, `music_max_artists_per_week`,
 `video_queue_max_pending`, `exploration_frac`) can also be flipped at runtime
@@ -312,7 +313,7 @@ maintainers drop PNGs there — the directory ships empty in source checkouts.)*
 
 - [docs/architecture.md](docs/architecture.md) — pipeline stages, store schema, id namespaces, echo-chamber design
 - [docs/configuration.md](docs/configuration.md) — every TOML key, profiles, `env:` secrets, runtime-settings precedence
-- [docs/deployment.md](docs/deployment.md) — Docker compose + built-in scheduler, NixOS module reference, Authelia profile mapping, secrets guidance
+- [docs/deployment.md](docs/deployment.md) — Docker compose + scheduler service, NixOS module reference, Authelia profile mapping, secrets guidance
 - [docs/development.md](docs/development.md) — dev setup, test conventions, how the suite is organized
 
 ## License

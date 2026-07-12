@@ -1,5 +1,5 @@
 """Web approval UI: FastAPI layer over a fabricated store — plus the
-built-in scheduler that `gustarr web` optionally hosts."""
+standalone `gustarr schedule` process."""
 
 from __future__ import annotations
 
@@ -513,22 +513,17 @@ def test_scheduler_prime_spends_todays_past_slot():
     assert sched.tick(datetime(2026, 7, 13, 4, 30)) is True
 
 
-def test_scheduler_off_by_default_and_validates(tmp_path):
+def test_schedule_command_requires_config(tmp_path):
     cfg = C._build({"core": {"data_dir": str(tmp_path)}})
-    assert scheduler.start(cfg) is None
-    for bad in ("4pm", "25:00", "04:60", "0430"):
-        with pytest.raises(C.ConfigError):
-            scheduler.Scheduler(bad)
+    with pytest.raises(SystemExit):
+        scheduler.main(cfg)
 
 
-def test_create_app_wires_scheduler(tmp_path, monkeypatch):
-    started = []
-    monkeypatch.setattr("gustarr.web.app.scheduler.start",
-                        lambda cfg: started.append(cfg))
-    cfg = C._build({"core": {"data_dir": str(tmp_path)},
-                    "web": {"allowed_hosts": ["testserver"]}})
-    create_app(cfg)
-    assert started == [cfg]
+def test_web_process_has_no_scheduler(tmp_path):
+    # one process, one job: the web app must never own scheduling
+    import gustarr.web.app as app_mod
+    assert not hasattr(app_mod, "scheduler")
+
 
 
 def test_configured_allowed_hosts_honored(tmp_path):

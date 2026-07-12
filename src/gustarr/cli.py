@@ -275,6 +275,18 @@ def run(ctx: Ctx, recipe: str, dry_run: bool) -> None:
 
 @main.command()
 @click.pass_obj
+def schedule(ctx: Ctx) -> None:
+    """Run the nightly pipeline on a clock ([scheduler] nightly = "HH:MM").
+
+    A dedicated foreground process — container users run it as a second
+    service from the same image; systemd/cron users don't need it."""
+    from .scheduler import main as schedule_main
+
+    schedule_main(ctx.cfg)
+
+
+@main.command()
+@click.pass_obj
 def web(ctx: Ctx) -> None:
     """Serve the approval UI (bind address from [web] config)."""
     import uvicorn
