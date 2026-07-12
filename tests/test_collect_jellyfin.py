@@ -488,6 +488,36 @@ def test_stale_artist_credit_chases_merged_survivor(tmp_path):
     assert stats2["scrobbles"] == 0
 
 
+def test_junk_identity_rows_skip_without_failing_stage(tmp_path):
+    """Rows the server hands back with unusable identity keys — a Movie
+    whose Jellyfin Id is whitespace-only, a MusicArtist named only an
+    ideographic space — must never crash the pass: the row resolves or is
+    skipped, and every well-formed row around them still lands."""
+    conn = db.connect(tmp_path / "t.db")
+    state = server_state()
+    state["pbr_available"] = False
+    state["library"] += [
+        {"Id": "   ", "Type": "Movie", "Name": "Junk Id Movie", "ProductionYear": 2001,
+         "ProviderIds": {"Tmdb": "6100"}, "UserData": {"Played": True}},
+        {"Id": "a9", "Type": "MusicArtist", "Name": "　", "ProviderIds": {},
+         "UserData": {}},
+    ]
+    stats = jellyfin.sync(conn, make_cfg(tmp_path), transport=make_transport(state))
+
+    # both junk rows skipped alongside the provider-tagless x1
+    assert stats["skipped"] == 3
+    # every well-formed row still processed, all its signals intact
+    assert stats["items"] == 5
+    assert stats["favorites"] == 1 and stats["completes"] == 1
+    assert stats["series_plays"] == 1 and stats["scrobbles"] == 2
+    # the ideographic-space artist minted nothing: radiohead + boc only
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM items WHERE domain='artist'").fetchone()["c"] == 2
+    # no identity ever landed on an empty key (a shared '' would fuse items)
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM identities WHERE key=''").fetchone()["c"] == 0
+
+
 # ── multi-profile ────────────────────────────────────────────────────
 
 

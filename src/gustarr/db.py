@@ -172,23 +172,32 @@ def _exec_schema(conn: sqlite3.Connection) -> None:
             buf = ""
 
 
-def _atomic_migration(conn: sqlite3.Connection, work) -> None:
+def _atomic_migration(conn: sqlite3.Connection, needed, work) -> None:
     """Run a migration as ONE transaction, DDL included. Python's sqlite3
     legacy transaction control autocommits DDL (ALTER/CREATE/DROP run
     outside the implicit transaction), so `with conn:` alone leaves a
     crashed migration half-committed — renamed tables, missing data, and
     a store the version detection then misreads as healthy. Explicit
     BEGIN IMMEDIATE under isolation_level=None makes SQLite's
-    transactional DDL actually transactional, takes the write lock up
-    front (a concurrent connect blocks, then sees the finished version),
-    and a crash at any point rolls back to the pre-migration store."""
+    transactional DDL actually transactional and a crash at any point
+    rolls back to the pre-migration store.
+
+    ``needed`` re-runs the version detection INSIDE the transaction: in
+    WAL mode a second process's pre-transaction detection reads the old
+    snapshot, so it queues on BEGIN IMMEDIATE convinced it must migrate —
+    re-checking on the fresh post-lock snapshot turns that into a no-op
+    instead of a re-migration of the finished store. The busy timeout is
+    raised for the wait: big stores migrate longer than the default 30s,
+    and a concurrent command should wait, not die 'database is locked'."""
     prev = conn.isolation_level
     conn.isolation_level = None
     try:
         conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("PRAGMA busy_timeout=600000")
         conn.execute("BEGIN IMMEDIATE")
         try:
-            work()
+            if needed():
+                work()
             conn.execute("COMMIT")
         except BaseException:
             try:
@@ -197,18 +206,34 @@ def _atomic_migration(conn: sqlite3.Connection, work) -> None:
                 pass  # the journal rolls back on next open
             raise
     finally:
+        conn.execute("PRAGMA busy_timeout=30000")
         conn.isolation_level = prev
+
+
+def _needs_v2(conn: sqlite3.Connection) -> bool:
+    tables = {r["name"] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    if "events" not in tables:
+        return False
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(events)")}
+    if "profile" not in cols:
+        return True
+    # events carries the column but a sibling doesn't: a pre-hardening
+    # gustarr crashed between the autocommitted ALTERs. Undetectable as
+    # either version — refuse loudly rather than fail cryptically later.
+    for t in ("candidates", "recommendations"):
+        if t in tables and "profile" not in {
+                r["name"] for r in conn.execute(f"PRAGMA table_info({t})")}:
+            raise RuntimeError(
+                f"half-migrated v1→v2 store ({t} lacks the profile column);"
+                " restore the store from a backup before upgrading")
+    return False
 
 
 def _migrate_v2(conn: sqlite3.Connection) -> None:
     """v1 → v2 (profile columns); see git history for the v1 shape. Kept so
     a pre-profile store still upgrades along the full chain."""
-    tables = {r["name"] for r in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table'")}
-    if "events" not in tables:
-        return
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(events)")}
-    if "profile" in cols:
+    if not _needs_v2(conn):
         return
 
     def work() -> None:
@@ -225,7 +250,20 @@ def _migrate_v2(conn: sqlite3.Connection) -> None:
                 "UPDATE OR REPLACE state SET key = 'p:default:' || key"
                 " WHERE key LIKE ? AND key NOT LIKE 'p:%'", (prefix + "%",))
 
-    _atomic_migration(conn, work)
+    _atomic_migration(conn, lambda: _needs_v2(conn), work)
+
+
+def _needs_v3(conn: sqlite3.Connection) -> bool:
+    tables = {r["name"] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    if "items_v2" in tables:
+        raise RuntimeError(
+            "interrupted v2→v3 migration detected (items_v2 tables present);"
+            " restore the store from a backup before upgrading")
+    if "items" not in tables:
+        return False  # fresh database: SCHEMA creates v3 directly
+    items_cols = {r["name"] for r in conn.execute("PRAGMA table_info(items)")}
+    return "ids" in items_cols  # ids column == v2 shape
 
 
 def _migrate_v3(conn: sqlite3.Connection) -> None:
@@ -241,19 +279,12 @@ def _migrate_v3(conn: sqlite3.Connection) -> None:
     key). Everything, DDL included, runs in one genuine transaction
     (_atomic_migration): a crash at any point leaves v2 intact.
     """
-    tables = {r["name"] for r in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table'")}
-    if "items_v2" in tables:
-        raise RuntimeError(
-            "interrupted v2→v3 migration detected (items_v2 tables present);"
-            " restore the store from a backup before upgrading")
-    if "items" not in tables:
-        return  # fresh database: SCHEMA creates v3 directly
-    items_cols = {r["name"] for r in conn.execute("PRAGMA table_info(items)")}
-    if "ids" not in items_cols:
-        return  # already v3
+    if not _needs_v3(conn):
+        return
 
     def work() -> None:
+        tables = {r["name"] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
         for t in ("items", "events", "candidates", "recommendations",
                   "library", "embeddings"):
             conn.execute(f"ALTER TABLE {t} RENAME TO {t}_v2")
@@ -312,8 +343,14 @@ def _migrate_v3(conn: sqlite3.Connection) -> None:
                 if a == b:
                     continue
                 # a shared name/jellyfin key between two authoritative
-                # items proves difference: the first writer keeps the key
+                # items proves difference: no merge. The name stays with
+                # the first writer; the jellyfin pointer follows the
+                # LATEST claimant — a v2 retag left meta.jellyfin_id on
+                # both identifications, and the newer one is what the
+                # entry resolves to now (the runtime reassign rule).
                 if ns in ("name", "jellyfin") and strong[a] and strong[b]:
+                    if ns == "jellyfin":
+                        owner[(domain, ns, key)] = old
                     continue
                 root, gone = (a, b) if strong[a] or not strong[b] else (b, a)
                 parent[gone] = root
@@ -336,10 +373,16 @@ def _migrate_v3(conn: sqlite3.Connection) -> None:
                 for k, v in json.loads(rowmap[m]["meta"] or "{}").items():
                     meta.setdefault(k, v)
             r = rowmap[rep]
+            # rep's fields win, but a gap fills from any member — the
+            # same fill-only rule merge_items applies at runtime
+            ordered = [rep] + [m for m in members if m != rep]
+            title = next((rowmap[m]["title"] for m in ordered if rowmap[m]["title"]), None)
+            year = next((rowmap[m]["year"] for m in ordered
+                         if rowmap[m]["year"] is not None), None)
             cur = conn.execute(
                 "INSERT INTO items (domain, title, year, meta, enriched_at,"
                 " created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
-                (r["domain"], r["title"], r["year"], json.dumps(meta),
+                (r["domain"], title, year, json.dumps(meta),
                  r["enriched_at"], rowmap[members[0]]["created_at"], r["updated_at"]))
             for m in members:
                 id_map[m] = cur.lastrowid
@@ -427,7 +470,7 @@ def _migrate_v3(conn: sqlite3.Connection) -> None:
                 "SELECT key, value FROM state"
                 " WHERE key LIKE 'p:%:jellyfin:series_played:%'").fetchall():
             prefix, _, old_tail = row["key"].partition(":jellyfin:series_played:")
-            new_item = id_map.get(old_tail)
+            new_item = id_map.get(old_tail) or alias_map.get(old_tail)
             jf = None
             if new_item is not None:
                 r = conn.execute(
@@ -436,9 +479,21 @@ def _migrate_v3(conn: sqlite3.Connection) -> None:
                 jf = r["key"] if r else None
             conn.execute("DELETE FROM state WHERE key=?", (row["key"],))
             if jf:
+                # two old cursors can land on one jf key (merged items,
+                # retag pairs): keep the max — an over-count only quiets
+                # the next sync, an under-count re-emits watched history
+                newkey = f"{prefix}:jellyfin:series_played:{jf}"
+                prev = conn.execute(
+                    "SELECT value FROM state WHERE key=?", (newkey,)).fetchone()
+                val = row["value"]
+                if prev is not None:
+                    try:
+                        val = str(max(int(prev["value"]), int(val)))
+                    except (TypeError, ValueError):
+                        pass  # non-numeric cursor: last writer stands
                 conn.execute(
                     "INSERT OR REPLACE INTO state (key, value) VALUES (?,?)",
-                    (f"{prefix}:jellyfin:series_played:{jf}", row["value"]))
+                    (newkey, val))
         # v3 derives series completeness from event existence, not state
         conn.execute("DELETE FROM state WHERE key LIKE 'p:%:jellyfin:series_complete:%'")
 
@@ -446,7 +501,7 @@ def _migrate_v3(conn: sqlite3.Connection) -> None:
                   "library_v2", "embeddings_v2", "items_v2"):
             conn.execute(f"DROP TABLE {t}")
 
-    _atomic_migration(conn, work)
+    _atomic_migration(conn, lambda: _needs_v3(conn), work)
 
 
 # ── identity resolution: THE write path ─────────────────────────────

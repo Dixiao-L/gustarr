@@ -490,6 +490,152 @@ def test_reopening_a_migrated_store_changes_nothing(db_path):
     conn.close()
 
 
+def test_stale_needs_v3_detection_noops_inside_the_transaction(db_path, monkeypatch):
+    """The two-process WAL race in miniature: a second process's
+    pre-transaction detection reads the old snapshot and queues on BEGIN
+    IMMEDIATE convinced it must migrate; the re-check inside the
+    transaction sees the finished store and must no-op, never re-migrate."""
+    conn = db.connect(db_path)
+    item = db.resolve_item(conn, "artist", "mbid", MBID, title="Yorushika")
+    db.add_event(conn, T0, item, "scrobble", 1.0, "lastfm")
+    db.set_state(conn, "p:default:lastfm:cursor", "1700000000")
+    conn.commit()
+    before = _dump(conn)
+    conn.close()
+
+    real = db._needs_v3
+    calls: list[bool] = []
+
+    def stale_snapshot(conn):
+        calls.append(True)
+        if len(calls) == 1:
+            return True  # the detection that ran before the lock was held
+        return real(conn)
+
+    monkeypatch.setattr(db, "_needs_v3", stale_snapshot)
+    conn = db.connect(db_path)
+    assert len(calls) >= 2  # the in-transaction re-check actually ran
+    assert not any(t.endswith("_v2") for t in _tables(conn))
+    assert _dump(conn) == before
+    conn.close()
+
+
+def test_half_migrated_v1_store_refuses_with_backup_hint(db_path):
+    """events carrying the profile column while candidates lacks it means a
+    pre-hardening gustarr crashed between the autocommitted v1→v2 ALTERs —
+    undetectable as either version, so connect must refuse loudly."""
+    raw = _open_raw(db_path, V1_SCHEMA)
+    raw.execute("ALTER TABLE events ADD COLUMN dedup TEXT NOT NULL DEFAULT ''")
+    raw.execute("ALTER TABLE events ADD COLUMN profile TEXT NOT NULL DEFAULT 'default'")
+    v2_item(raw, f"artist:mbid:{MBID}", "artist", ids={"mbid": MBID})
+    raw.commit()
+    raw.close()
+
+    with pytest.raises(RuntimeError, match="backup"):
+        db.connect(db_path)
+
+
+def test_retag_pair_jellyfin_pointer_and_cursor_follow_the_later_item(db_path):
+    """A v2 retag left meta.jellyfin_id on both identifications of one
+    Jellyfin entry: the two items stay apart (both authoritative), the
+    jellyfin pointer follows the LATER identification — what the entry
+    resolves to now — and only its cursor survives; carrying the stale
+    item's lower count would re-open a duplicate-play window."""
+    s1, s2 = "series:tvdb:100", "series:tvdb:200"
+    raw = v2_store(db_path)
+    v2_item(raw, s1, "series", title="Wrong Show", ids={"tvdb": "100"},
+            meta={"jellyfin_id": "J"}, created=T0)
+    v2_item(raw, s2, "series", title="Right Show", ids={"tvdb": "200"},
+            meta={"jellyfin_id": "J"}, created=T1)
+    raw.execute("INSERT INTO state VALUES (?, '5')",
+                (f"p:default:jellyfin:series_played:{s1}",))
+    raw.execute("INSERT INTO state VALUES (?, '8')",
+                (f"p:default:jellyfin:series_played:{s2}",))
+    raw.commit()
+    raw.close()
+
+    conn = db.connect(db_path)
+    assert conn.execute("SELECT COUNT(*) FROM items").fetchone()[0] == 2  # no merge
+    stale = db.lookup_item(conn, "series", "tvdb", "100")
+    current = db.lookup_item(conn, "series", "tvdb", "200")
+    assert stale is not None and current is not None and stale != current
+    assert db.lookup_item(conn, "series", "jellyfin", "J") == current
+    played = [(r["key"], r["value"]) for r in conn.execute(
+        "SELECT key, value FROM state WHERE key LIKE '%series_played%'")]
+    assert played == [("p:default:jellyfin:series_played:j", "8")]
+    conn.close()
+
+
+def test_merged_items_cursors_collapse_to_the_max(db_path):
+    """Two v2 items proven one entity by a shared mbid each carried a
+    series_played cursor for the same Jellyfin entry: they land on one jf
+    key holding the max — an over-count only quiets the next sync, an
+    under-count re-emits watched history."""
+    a, b = f"series:mbid:{MBID}", "series:name:frieren"
+    raw = v2_store(db_path)
+    v2_item(raw, a, "series", title="Frieren", ids={"mbid": MBID},
+            meta={"jellyfin_id": "J"}, created=T0)
+    v2_item(raw, b, "series", title="葬送のフリーレン", ids={"mbid": MBID},
+            meta={"jellyfin_id": "J"}, created=T1)
+    raw.execute("INSERT INTO state VALUES (?, '3')",
+                (f"p:default:jellyfin:series_played:{a}",))
+    raw.execute("INSERT INTO state VALUES (?, '7')",
+                (f"p:default:jellyfin:series_played:{b}",))
+    raw.commit()
+    raw.close()
+
+    conn = db.connect(db_path)
+    assert conn.execute("SELECT COUNT(*) FROM items").fetchone()[0] == 1
+    item = db.lookup_item(conn, "series", "mbid", MBID)
+    assert db.lookup_item(conn, "series", "jellyfin", "J") == item
+    played = [(r["key"], r["value"]) for r in conn.execute(
+        "SELECT key, value FROM state WHERE key LIKE '%series_played%'")]
+    assert played == [("p:default:jellyfin:series_played:j", "7")]
+    conn.close()
+
+
+def test_union_fills_null_rep_fields_from_weak_member(db_path):
+    """The authoritative rep's fields win, but a NULL fills from any member
+    — a name-only twin that knew the title and year must not lose them."""
+    a, b = f"album:mbid:{MBID}", "album:lastfm:aria"
+    raw = v2_store(db_path)
+    v2_item(raw, a, "album", ids={"mbid": MBID, "lastfm": "Aria"}, created=T0)
+    v2_item(raw, b, "album", title="Aria", year=2001, ids={"lastfm": "Aria"}, created=T1)
+    raw.commit()
+    raw.close()
+
+    conn = db.connect(db_path)
+    assert conn.execute("SELECT COUNT(*) FROM items").fetchone()[0] == 1
+    item = db.lookup_item(conn, "album", "mbid", MBID)
+    row = conn.execute("SELECT title, year FROM items WHERE id=?", (item,)).fetchone()
+    assert row["title"] == "Aria"
+    assert row["year"] == 2001
+    conn.close()
+
+
+def test_cursor_reachable_only_through_alias_carries_onto_jf_key(db_path):
+    """A cursor keyed by an item merged away in v2 — its id survives only as
+    an item_aliases redirect — still lands on the live item's Jellyfin key
+    instead of being dropped."""
+    live, gone = "series:tvdb:42", "series:tvdb:555"
+    raw = v2_store(db_path)
+    v2_item(raw, live, "series", title="Frieren", ids={"tvdb": "42"},
+            meta={"jellyfin_id": "JF42"}, created=T0)
+    raw.execute("INSERT INTO item_aliases VALUES (?,?)", (gone, live))
+    raw.execute("INSERT INTO state VALUES (?, '11')",
+                (f"p:default:jellyfin:series_played:{gone}",))
+    raw.commit()
+    raw.close()
+
+    conn = db.connect(db_path)
+    item = db.lookup_item(conn, "series", "tvdb", "42")
+    assert db.lookup_item(conn, "series", "tvdb", "555") == item  # the alias identity
+    played = [(r["key"], r["value"]) for r in conn.execute(
+        "SELECT key, value FROM state WHERE key LIKE '%series_played%'")]
+    assert played == [("p:default:jellyfin:series_played:jf42", "11")]
+    conn.close()
+
+
 def test_v1_store_migrates_along_the_full_chain(db_path):
     """A pre-profile store (no profile columns, no events.dedup, unprefixed
     state keys) upgrades v1→v2→v3 in one connect(): events gain

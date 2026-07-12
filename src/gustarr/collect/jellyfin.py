@@ -118,6 +118,15 @@ def _resolve(conn: sqlite3.Connection, raw: dict[str, Any]) -> int | None:
     provider ids and the Jellyfin id itself — the next pass lands here
     even if provider tags vanish. attach_identity may reveal two items
     were one; every step continues with the returned winner."""
+    try:
+        return _resolve_inner(conn, raw)
+    except ValueError:
+        # a key that folds to nothing (whitespace-only id/name): this row
+        # is unidentifiable, which is exactly what None means
+        return None
+
+
+def _resolve_inner(conn: sqlite3.Connection, raw: dict[str, Any]) -> int | None:
     pids = {k.lower(): str(v).strip() for k, v in (raw.get("ProviderIds") or {}).items()
             if v and str(v).strip()}
     name = (raw.get("Name") or "").strip()
@@ -277,9 +286,13 @@ def _sync_audio(conn: sqlite3.Connection, profile: str, base: str, uid: str,
                 continue
             # credit not in the artist library: resolve by spelling, still
             # teach the jf id so a later library pass lands on this item
-            art_id = db.resolve_item(conn, "artist", "name", name, title=name)
-            if a0.get("Id"):
-                art_id = db.attach_identity(conn, art_id, "jellyfin", str(a0["Id"]))
+            try:
+                art_id = db.resolve_item(conn, "artist", "name", name, title=name)
+                if a0.get("Id"):
+                    art_id = db.attach_identity(conn, art_id, "jellyfin", str(a0["Id"]))
+            except ValueError:
+                stats["skipped"] += 1
+                continue
         ud = t.get("UserData") or {}
         # IsPlayed-filtered rows can still carry PlayCount 0 on some servers
         plays = max(int(ud.get("PlayCount") or 0), 1)

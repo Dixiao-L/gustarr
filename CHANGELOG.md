@@ -53,6 +53,24 @@ All notable changes to Gustarr are documented here. The format follows
   deletes a cached artist id made the Jellyfin and ListenBrainz stages
   crash with foreign-key errors; a name-collision refusal in the
   candidate pool no longer inherits the *other* artist's rejection.
+- Two commands racing through the same upgrade can't hurt each other:
+  version detection re-runs inside the migration's write transaction, so
+  the process that loses the race no-ops instead of re-migrating the
+  finished store, and the lock wait tolerates long migrations instead of
+  dying "database is locked" after 30 seconds. A store half-migrated by
+  a pre-hardening crash is refused with an actionable message in the
+  v1→v2 shape too, not just v2→v3.
+- One junk row from an external API (a name or id that normalizes to
+  nothing) skips that row instead of failing the whole collector stage,
+  in every collector and the candidate pool.
+- Migration edge cases found by adversarial verification: a Jellyfin
+  retag recorded in a v2 store hands the entry's pointer (and its series
+  cursor) to the *newer* identification, matching the runtime rule; two
+  cursors landing on one key keep the higher count; a merged item's
+  missing year/title fill from any member; cursors keyed by
+  alias-redirected ids carry over instead of being dropped; one artist
+  reached by both a name credit and an mbid credit gets its best CF
+  score once instead of a last-writer overwrite.
 
 ## [0.2.2] - 2026-07-12
 

@@ -82,14 +82,18 @@ def _sync_one(
         if not key:
             stats["skipped"] += 1
             continue
-        item = db.resolve_item(conn, spec["domain"], spec["ns"], str(key),
-                               title=entry.get(spec["title"]), year=entry.get("year"),
-                               meta={"genres": entry.get("genres", [])})
-        for field, ns in spec["id_fields"].items():
-            # a secondary id can reveal a twin another source minted first;
-            # attach_identity merges them and hands back the survivor
-            if ns != spec["ns"] and entry.get(field):
-                item = db.attach_identity(conn, item, ns, str(entry[field]))
+        try:
+            item = db.resolve_item(conn, spec["domain"], spec["ns"], str(key),
+                                   title=entry.get(spec["title"]), year=entry.get("year"),
+                                   meta={"genres": entry.get("genres", [])})
+            for field, ns in spec["id_fields"].items():
+                # a secondary id can reveal a twin another source minted
+                # first; attach_identity merges and returns the survivor
+                if ns != spec["ns"] and entry.get(field):
+                    item = db.attach_identity(conn, item, ns, str(entry[field]))
+        except ValueError:
+            stats["skipped"] += 1  # an id folding to nothing: skip the row
+            continue
         stats["items"] += 1
 
         is_gustarr = gustarr_tag is not None and gustarr_tag in (entry.get("tags") or [])

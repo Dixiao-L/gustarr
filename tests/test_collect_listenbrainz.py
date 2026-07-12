@@ -333,3 +333,99 @@ def test_cf_artist_flush_survives_mid_loop_merge(conn, cfg, monkeypatch):
     assert len(rows) == 1
     assert rows[0]["item_id"] == survivor
     assert rows[0]["external_score"] == pytest.approx(0.9)
+
+
+def test_cf_artist_flush_max_is_order_independent(conn, cfg, monkeypatch):
+    """Mirror of the mid-loop-merge test with the scores swapped: the
+    name-only credit carries the MAX (0.9) and arrives BEFORE the mbid
+    credit (0.4) that merges its item away. The flush must still write
+    exactly one listenbrainz_cf_artist row at 0.9 — the max regardless of
+    which external ref reached the survivor first — counted once."""
+    rec_1 = "78787878-7878-4787-8787-787878787878"
+    rec_2 = "9a9a9a9a-9a9a-4a9a-8a9a-9a9a9a9a9a9a"
+    artist_mb = "bcbcbcbc-bcbc-4cbc-8cbc-bcbcbcbcbcbc"
+    cf = {"payload": {"mbids": [
+        {"recording_mbid": rec_1, "score": 0.9},
+        {"recording_mbid": rec_2, "score": 0.4},
+    ]}}
+    metadata = {
+        rec_1: {"recording": {"name": "Song 1"},
+                "artist": {"name": "Twinly", "artists": []}},
+        rec_2: {"recording": {"name": "Song 2"},
+                "artist": {"name": "Twinly",
+                           "artists": [{"artist_mbid": artist_mb, "name": "Twinly"}]}},
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/1/cf/recommendation/user/alice/recording":
+            return httpx.Response(200, json=cf)
+        if path == "/1/metadata/recording/":
+            return httpx.Response(200, json=metadata)
+        if path == "/1/user/alice/playlists/createdfor":
+            return httpx.Response(200, json={"playlists": []})
+        return httpx.Response(404)
+
+    install(monkeypatch, handler)
+    stats = listenbrainz.sync(conn, cfg)
+
+    assert stats["cf_tracks"] == 2
+    survivor = db.lookup_item(conn, "artist", "mbid", artist_mb)
+    assert survivor is not None
+    assert db.lookup_item(conn, "artist", "name", "Twinly") == survivor
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM items WHERE domain='artist'").fetchone()["c"] == 1
+    rows = conn.execute(
+        "SELECT * FROM candidates WHERE source='listenbrainz_cf_artist'").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["item_id"] == survivor
+    assert rows[0]["external_score"] == pytest.approx(0.9)
+    assert stats["cf_artists"] == 1
+
+
+def test_cf_junk_artist_credit_skips_credit_not_stage(conn, cfg, monkeypatch):
+    """A CF recording whose artist credit folds to nothing (whitespace-only
+    name, no mbid) keeps its TRACK candidate and simply grows no artist
+    candidate; the rows around it are untouched."""
+    rec_junk = "abababab-abab-4bab-8bab-abababababab"
+    rec_ok = "cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd"
+    cf = {"payload": {"mbids": [
+        {"recording_mbid": rec_junk, "score": 0.8},
+        {"recording_mbid": rec_ok, "score": 0.6},
+    ]}}
+    metadata = {
+        rec_junk: {"recording": {"name": "Junk Credit Song"},
+                   "artist": {"name": "  ", "artists": []}},
+        rec_ok: {"recording": {"name": "Fine Song"},
+                 "artist": {"name": "Keeper", "artists": []}},
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/1/cf/recommendation/user/alice/recording":
+            return httpx.Response(200, json=cf)
+        if path == "/1/metadata/recording/":
+            return httpx.Response(200, json=metadata)
+        if path == "/1/user/alice/playlists/createdfor":
+            return httpx.Response(200, json={"playlists": []})
+        return httpx.Response(404)
+
+    install(monkeypatch, handler)
+    stats = listenbrainz.sync(conn, cfg)
+
+    assert stats["cf_tracks"] == 2
+    assert stats["cf_artists"] == 1
+    # the junk-credited TRACK still landed, just without an artist in meta
+    track = db.lookup_item(conn, "track", "mbid", rec_junk)
+    row = candidate(conn, track, "listenbrainz_cf")
+    assert row["external_score"] == pytest.approx(0.8)
+    item = conn.execute("SELECT * FROM items WHERE id=?", (track,)).fetchone()
+    assert item["title"] == "Junk Credit Song"
+    assert "artist" not in json.loads(item["meta"])
+    # only the well-credited artist became a candidate; the whitespace
+    # credit minted no artist item at all
+    keeper = db.lookup_item(conn, "artist", "name", "Keeper")
+    krow = candidate(conn, keeper, "listenbrainz_cf_artist")
+    assert krow["external_score"] == pytest.approx(0.6)
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM items WHERE domain='artist'").fetchone()["c"] == 1

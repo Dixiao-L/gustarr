@@ -566,6 +566,57 @@ def test_refused_name_attach_does_not_inherit_rejection(conn, cfg, router):
     assert stats["skipped"] == 1
 
 
+def test_lastfm_entry_whose_name_folds_to_nothing_is_ignored(conn, cfg, router):
+    # an ideographic-space name with no mbid folds to an empty key: the
+    # entry is dropped before minting anything, and its neighbours land
+    mb = "5b11f4ce-a62d-471e-81fc-a69a8278c7da"
+    seed = db.resolve_item(conn, "artist", "mbid", mb, title="Nirvana")
+    db.add_event(conn, iso(1), seed, "loved", 1.0, "lastfm")
+
+    def similar(params):
+        if params["limit"] == 20:  # hop-2 serendipity fan-out, covered elsewhere
+            return {"similarartists": {"artist": []}}
+        return {"similarartists": {"artist": [
+            {"name": "　", "mbid": "", "match": "0.9"},
+            {"name": "Hole", "mbid": "h-1", "match": "0.8"},
+        ]}}
+
+    router.route("lastfm:artist.getsimilar", similar)
+    stats = run(conn, cfg, domain="artist")
+
+    rows = candidate_rows(conn)
+    assert (item(conn, "artist", "mbid", "h-1"), "lastfm_similar") in rows
+    assert stats["new"] == {"lastfm_similar": 1}
+    assert stats["skipped"] == 0  # ignored, not an exclusion
+    # the junk entry minted no item and no empty identity key
+    assert conn.execute(
+        "SELECT count(*) c FROM items WHERE domain='artist'").fetchone()["c"] == 2
+    assert conn.execute("SELECT count(*) c FROM identities WHERE key=''").fetchone()["c"] == 0
+
+
+def test_pool_add_skips_key_folding_to_nothing(conn, cfg, router):
+    # a whitespace-only tmdb key can't be an item: pool.add counts the
+    # skip and mints no item row for it
+    seed_movie(conn, 603, "The Matrix")
+    router.route("/movie/603/recommendations", {"results": [
+        {"id": "  ", "title": "Phantom", "release_date": "2020-01-01", "vote_average": 7.0},
+        movie_result(200),
+    ]})
+    router.route("/movie/603/similar", {"results": []})
+    router.route("/genre/movie/list", {"genres": []})
+    router.route("/discover/movie", {"results": []})  # serendipity decade probe
+
+    stats = run(conn, cfg, domain="movie")
+
+    rows = candidate_rows(conn)
+    assert (item(conn, "movie", "tmdb", "200"), "tmdb_similar") in rows
+    assert len(rows) == 1
+    assert stats["skipped"] == 1
+    assert stats["new"] == {"tmdb_similar": 1}
+    # seed + M200 only: the junk key never became an item
+    assert conn.execute("SELECT count(*) c FROM items").fetchone()["c"] == 2
+
+
 # ── top albums ───────────────────────────────────────────────────────
 
 
