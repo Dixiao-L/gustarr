@@ -51,8 +51,10 @@ WORKDIR /var/lib/gustarr
 EXPOSE 8790
 
 ENTRYPOINT ["gustarr"]
-# default: serve the approval UI. With [scheduler] nightly = "HH:MM" in the
-# TOML, this same process also launches the nightly pipeline — no host cron.
+# default: serve the approval UI — this process never runs the pipeline.
+# Scheduling is a dedicated `gustarr schedule` process: run a second
+# container from this same image with command "schedule" and
+# [scheduler] nightly = "HH:MM" in the TOML (see the compose example).
 # One-shots still work for manual runs or cron-style scheduling, e.g.
 #   docker compose run --rm gustarr run nightly
 CMD ["web"]

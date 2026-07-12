@@ -42,7 +42,7 @@ Two properties of the mapping worth knowing:
   advisory at startup in this shape. That may be perfectly fine for your
   living room; it is not access control, and Gustarr won't pretend otherwise.
 
-## Authorization, honestly
+## Authorization
 
 - Approve/reject/snooze/forgive act on **the resolved profile's** queue and
   taste model only.

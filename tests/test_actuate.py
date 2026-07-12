@@ -782,6 +782,51 @@ def test_approved_video_survives_connect_error(conn, tmp_path, net):
     assert rec_row(conn, rid)["status"] == "added"
 
 
+@pytest.mark.parametrize("status", [401, 403])
+def test_approved_video_survives_credential_failure(conn, tmp_path, net, status):
+    # credentials are service-level, not a verdict on the item: an
+    # api-key rotation window must not burn approvals (enrich's taxonomy)
+    cfg = make_cfg(tmp_path)
+    net.radarr.fail_add = (status, "invalid api key")
+    rid = add_rec(conn, "movie:tmdb:603", "movie", "The Matrix", {"tmdb": 603},
+                  status="approved")
+    stats = apply_mod.run(conn, cfg)
+    assert stats["video_added"] == 0
+    assert stats["video_failed"] == 0
+    row = rec_row(conn, rid)
+    assert row["status"] == "approved"  # retryable, not terminally failed
+    assert json.loads(row["why"])["attempts"] == 1
+    # key fixed: the same approval lands on the next apply
+    net.radarr.fail_add = None
+    stats = apply_mod.run(conn, cfg)
+    assert stats["video_added"] == 1
+    assert rec_row(conn, rid)["status"] == "added"
+
+
+def test_quality_profile_typo_leaves_approved(conn, tmp_path, net):
+    # a typo'd quality_profile is operator config, not a verdict on the
+    # item: failing the rec terminally would be unforgivable — it must
+    # survive until the config is fixed
+    cfg = C._build({
+        "core": {"data_dir": str(tmp_path)},
+        "radarr": {"url": "http://radarr.test", "api_key": "rk",
+                   "quality_profile": "Ultra-4K", "root_folder": "/movies"},
+    })
+    rid = add_rec(conn, "movie:tmdb:603", "movie", "The Matrix", {"tmdb": 603},
+                  status="approved")
+    stats = apply_mod.run(conn, cfg)
+    assert stats["video_added"] == 0
+    assert stats["video_failed"] == 0
+    assert any("config" in e and "Ultra-4K" in e for e in stats["errors"])
+    row = rec_row(conn, rid)
+    assert row["status"] == "approved"  # retryable, not terminally failed
+    assert json.loads(row["why"])["attempts"] == 1
+    # operator fixes the config: the same approval lands on the next run
+    stats = apply_mod.run(conn, make_cfg(tmp_path))
+    assert stats["video_added"] == 1
+    assert rec_row(conn, rid)["status"] == "added"
+
+
 def test_approved_video_4xx_marked_failed(conn, tmp_path, net):
     cfg = make_cfg(tmp_path)
     net.radarr.fail_add = (400, '[{"errorMessage": "TMDb id required"}]')
@@ -956,7 +1001,8 @@ def test_tag_ensured_once_across_adds(conn, tmp_path, net):
 def test_quality_profile_error_lists_available_names(net):
     client = arr_client.RadarrClient(
         ArrConfig(url="http://radarr.test", api_key="rk", quality_profile="Ultra-4K"))
-    with pytest.raises(arr_client.ArrError) as exc:
+    # ArrConfigError, not plain ArrError: apply keys retryability on it
+    with pytest.raises(arr_client.ArrConfigError) as exc:
         client.quality_profile_id()
     msg = str(exc.value)
     assert "Ultra-4K" in msg
@@ -980,7 +1026,7 @@ def test_root_folder_explicit_mismatch_raises(net):
     net.radarr.roots = [{"path": "/other"}]
     client = arr_client.RadarrClient(
         ArrConfig(url="http://radarr.test", api_key="rk", root_folder="/missing"))
-    with pytest.raises(arr_client.ArrError) as exc:
+    with pytest.raises(arr_client.ArrConfigError) as exc:
         client.root_folder_path()
     msg = str(exc.value)
     assert "/missing" in msg

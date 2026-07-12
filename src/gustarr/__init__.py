@@ -1,3 +1,3 @@
 """gustarr — learns one user's media taste and drives the Servarr stack."""
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"

@@ -19,7 +19,7 @@ from typing import Any, Callable
 from .. import db, http, settings
 from ..config import Config
 from . import jellyfin_collections
-from .arr_client import ArrError, LidarrClient, RadarrClient, SonarrClient
+from .arr_client import ArrConfigError, ArrError, LidarrClient, RadarrClient, SonarrClient
 from .jellyfin_collections import external_id
 
 
@@ -40,11 +40,16 @@ def _mark(conn: sqlite3.Connection, rec_id: int, status: str, ts: str) -> None:
 
 
 def _transient(exc: Exception) -> bool:
-    """Transport failures (status None) and 5xx/429 are outages of the
-    arr, not verdicts on the item — the rec keeps its status so the next
-    apply retries. ArrError and other 4xx are deterministic failures."""
+    """Transport failures (status None), 5xx/429 and 401/403 are outages
+    of the arr, not verdicts on the item — credentials are service-level
+    (enrich's taxonomy: an api-key rotation window must not burn
+    approvals). ArrConfigError is likewise operator-fixable config, so
+    the rec keeps its status and the next apply retries. Other 4xx and
+    the remaining ArrErrors are deterministic failures."""
+    if isinstance(exc, ArrConfigError):
+        return True
     return isinstance(exc, http.ApiError) and (
-        exc.status is None or exc.status == 429 or exc.status >= 500)
+        exc.status is None or exc.status in (401, 403, 429) or exc.status >= 500)
 
 
 def _bump_attempts(conn: sqlite3.Connection, row: sqlite3.Row) -> None:

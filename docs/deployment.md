@@ -2,11 +2,12 @@
 
 Three supported shapes:
 
-1. **Docker / compose** — CPU-only image, self-contained: the built-in
-   scheduler runs the nightly pipeline from inside the web container. The
-   easiest way to run Gustarr.
-2. **NixOS module** — hardened systemd timers, agenix-friendly secrets, GPU
-   support. What the author runs in production.
+1. **Docker / compose** — CPU-only image, self-contained: a dedicated
+   scheduler service (`gustarr schedule`, second container from the same
+   image) runs the nightly pipeline; the web container only serves the
+   approval UI. The easiest way to run Gustarr.
+2. **NixOS module** — systemd timers, `EnvironmentFile=` secrets (agenix
+   works well), GPU support.
 3. **Bare pip/uv + your own cron** — it's just a CLI; nothing stops you.
 
 In every shape the moving parts are the same: a *nightly* pipeline run, an
@@ -85,9 +86,15 @@ Start from [`docker-compose.example.yml`](../docker-compose.example.yml):
 $ cp docker-compose.example.yml docker-compose.yml
 $ cp gustarr.example.toml gustarr.toml
 $ $EDITOR gustarr.toml       # URLs, usernames; keep secrets as env:VAR
-$ $EDITOR gustarr.env        # TMDB_API_KEY=... etc. — chmod 600, gitignored
-$ docker compose up -d gustarr
+$ $EDITOR gustarr.env        # every env:VAR the TOML references — chmod 600, gitignored
+$ docker compose up -d       # starts both services: web UI + scheduler
 ```
+
+`gustarr.env` must set **all** the `env:VAR` names your TOML references
+(the example TOML uses `JELLYFIN_API_KEY`, `TMDB_API_KEY`, `LASTFM_API_KEY`,
+`SONARR_API_KEY`, `RADARR_API_KEY`, `LIDARR_API_KEY`) — or delete the
+sections for services you don't run; an unset `env:` reference is a hard
+config error on purpose.
 
 Container specifics:
 
@@ -118,21 +125,27 @@ process never runs the pipeline; one process, one job): set
 nightly = "04:30"          # local time — set TZ on the container
 ```
 
-and the web container runs `gustarr run nightly` itself, once a day. No host
-cron, no sidecar. Properties worth knowing:
+and the scheduler service fires `gustarr run nightly` once a day. No host
+cron needed — the compose example ships the scheduler as a second service
+(`command: ["schedule"]`) sharing the same config and state volume.
+Properties worth knowing:
 
-- The pipeline runs as a **subprocess** of the scheduler process — it never blocks
-  the UI, and a pipeline crash never takes the UI down. Start and exit code
-  are logged to the container's stdout (`docker compose logs gustarr`).
+- The pipeline runs as a **subprocess** of the scheduler process — a pipeline
+  crash never takes the scheduler down, and the web UI (a separate container)
+  is never involved at all. Start and exit code are logged to the scheduler's
+  stdout (`docker compose logs scheduler`).
 - One fire per day; if a slot comes up while the previous run is still
   alive, it is skipped, not queued.
 - "Local time" means the container's clock: set `TZ=Europe/Berlin` (or
   similar) in the compose `environment:`, or your 04:30 is 04:30 UTC.
-- Off by default — without a `[scheduler]` section, `gustarr web` schedules
-  nothing, so systemd/cron deployments are unaffected.
+- Off by default — `gustarr schedule` refuses to start without a
+  `[scheduler]` section, and `gustarr web` never schedules anything, so
+  systemd/cron deployments are unaffected (just don't run the scheduler
+  service).
 
-If you prefer the pipeline outside the web container (separate logs,
-resource limits, one-process-per-container purism), host cron still works:
+If you prefer host-controlled scheduling instead of the scheduler service
+(separate logs, resource limits, existing cron discipline), drop the
+scheduler service — host cron still works:
 
 ```cron
 # nightly at 04:30, weekly Saturday 09:00 (paths: wherever your compose file lives)
@@ -142,8 +155,6 @@ resource limits, one-process-per-container purism), host cron still works:
 
 Or a systemd timer on the host with
 `ExecStart=docker compose -f /opt/gustarr/docker-compose.yml run --rm gustarr run nightly`.
-The compose example also contains a commented one-shot `pipeline` service if
-you prefer `docker compose run pipeline`.
 
 SQLite is in WAL mode and the pipeline commits between stages, so a pipeline
 run and the web UI sharing the volume is the normal, supported arrangement —

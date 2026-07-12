@@ -404,7 +404,7 @@ def multi(tmp_path):
         " VALUES ('bob','r1',?,?,?,?,?)", (db.now(), "movie", BLADE, 0.8, "{}")).lastrowid
     conn.commit()
     conn.close()
-    return TestClient(create_app(cfg)), alice_rec, bob_rec
+    return TestClient(create_app(cfg)), cfg, alice_rec, bob_rec
 
 
 def test_profile_from_forward_auth_header(multi):
@@ -458,11 +458,64 @@ def test_profile_header_name_configurable(tmp_path):
 
 
 def test_recs_scoped_to_active_profile(multi):
-    client, alice_rec, bob_rec = multi
+    client, _, alice_rec, bob_rec = multi
     rows = client.get("/api/recs", headers={"Remote-User": "alice"}).json()
     assert [r["id"] for r in rows] == [alice_rec]
     rows = client.get("/api/recs", params={"profile": "bob"}).json()
     assert [r["id"] for r in rows] == [bob_rec]
+
+
+def test_cross_profile_act_denied_with_403(multi):
+    client, cfg, alice_rec, bob_rec = multi
+    # rec ids are guessable smallints, so acting on another profile's rec
+    # must be authorization (403), not a state answer (409) or a mutation
+    for action in ("approve", "reject", "snooze"):
+        resp = client.post(f"/api/recs/{alice_rec}/{action}", headers={"Remote-User": "bob"})
+        assert resp.status_code == 403
+        assert resp.json()["detail"] == "recommendation belongs to another profile"
+    # the header-less 'default' identity is a stranger to alice's rec too
+    assert client.post(f"/api/recs/{alice_rec}/approve").status_code == 403
+    (row,) = _fetch(cfg, "SELECT status FROM recommendations WHERE id=?", alice_rec)
+    assert row["status"] == "proposed"
+    assert _fetch(cfg, "SELECT 1 FROM events") == []
+    # the guard never locks anyone out of their own queue
+    assert client.post(f"/api/recs/{alice_rec}/approve",
+                       headers={"Remote-User": "alice"}).status_code == 200
+    assert client.post(f"/api/recs/{bob_rec}/reject",
+                       params={"profile": "bob"}).status_code == 200
+
+
+def test_cross_profile_forgive_denied_with_403(multi):
+    client, cfg, alice_rec, bob_rec = multi
+    assert client.post(f"/api/recs/{alice_rec}/reject",
+                       headers={"Remote-User": "alice"}).status_code == 200
+    resp = client.post(f"/api/recs/{alice_rec}/forgive", headers={"Remote-User": "bob"})
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "recommendation belongs to another profile"
+    # ownership outranks the state machine: a foreign *proposed* rec is
+    # still 403, never the state-leaking "only rejected recs" 409
+    assert client.post(f"/api/recs/{bob_rec}/forgive",
+                       headers={"Remote-User": "alice"}).status_code == 403
+    # the denied forgive left the reject verdict (and its event) intact
+    (row,) = _fetch(cfg, "SELECT status FROM recommendations WHERE id=?", alice_rec)
+    assert row["status"] == "rejected"
+    assert len(_fetch(cfg, "SELECT 1 FROM events WHERE kind='reject'")) == 1
+    assert client.post(f"/api/recs/{alice_rec}/forgive",
+                       headers={"Remote-User": "alice"}).status_code == 200
+
+
+def test_cross_profile_why_403(multi):
+    client, _, alice_rec, _ = multi
+    # explanations are taste data: reading across profiles is denied like
+    # acting is, and with the same non-leaking detail
+    resp = client.get(f"/api/recs/{alice_rec}/why", headers={"Remote-User": "bob"})
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "recommendation belongs to another profile"
+    ok = client.get(f"/api/recs/{alice_rec}/why", headers={"Remote-User": "alice"})
+    assert ok.status_code == 200
+    assert "The Matrix" in ok.json()["text"]
+    # a genuinely unknown id stays a plain 404 for everyone
+    assert client.get("/api/recs/99999/why", headers={"Remote-User": "bob"}).status_code == 404
 
 
 # ── built-in scheduler ───────────────────────────────────────────────
@@ -513,10 +566,80 @@ def test_scheduler_prime_spends_todays_past_slot():
     assert sched.tick(datetime(2026, 7, 13, 4, 30)) is True
 
 
+def test_scheduler_consumes_run_now_sentinel(tmp_path, capsys):
+    procs = []
+
+    def popen(cmd):
+        assert cmd[-2:] == ["run", "nightly"]
+        procs.append(FakeProc())
+        return procs[-1]
+
+    sentinel = tmp_path / "run-requested"
+    sched = scheduler.Scheduler("04:30", popen=popen, sentinel=sentinel)
+    # spend today's clock slot so only the sentinel can fire below
+    sched.prime(datetime(2026, 7, 12, 12, 0))
+    assert sched.tick(datetime(2026, 7, 12, 12, 1)) is False  # nothing requested
+    sentinel.touch()
+    assert sched.tick(datetime(2026, 7, 12, 12, 2)) is True
+    assert not sentinel.exists()
+    assert len(procs) == 1
+    # a second request while the run is alive: consumed, but skipped — a
+    # leftover file would otherwise re-fire every minute forever
+    sentinel.touch()
+    assert sched.tick(datetime(2026, 7, 12, 12, 3)) is False
+    assert not sentinel.exists()
+    assert len(procs) == 1
+    assert "still alive" in capsys.readouterr().out
+    # once the run finishes, RUN NOW fires again the same day
+    procs[0].returncode = 0
+    sentinel.touch()
+    assert sched.tick(datetime(2026, 7, 12, 12, 4)) is True
+    assert len(procs) == 2
+
+
+def test_scheduler_sentinel_run_makes_clock_slot_skip(tmp_path):
+    procs = []
+
+    def popen(cmd):
+        procs.append(FakeProc())
+        return procs[-1]
+
+    sentinel = tmp_path / "run-requested"
+    sched = scheduler.Scheduler("04:30", popen=popen, sentinel=sentinel)
+    sched.prime(datetime(2026, 7, 12, 3, 0))
+    sentinel.touch()
+    assert sched.tick(datetime(2026, 7, 12, 3, 1)) is True
+    # the nightly slot arrives while the manual run is alive: skip, not queue
+    assert sched.tick(datetime(2026, 7, 12, 4, 30)) is False
+    assert len(procs) == 1
+    # the skipped slot stays spent for the day; the next day fires normally
+    procs[0].returncode = 0
+    assert sched.tick(datetime(2026, 7, 12, 4, 31)) is False
+    assert sched.tick(datetime(2026, 7, 13, 4, 30)) is True
+    assert len(procs) == 2
+
+
 def test_schedule_command_requires_config(tmp_path):
     cfg = C._build({"core": {"data_dir": str(tmp_path)}})
     with pytest.raises(SystemExit):
         scheduler.main(cfg)
+
+
+def test_schedule_main_wires_sentinel(tmp_path, monkeypatch):
+    # `gustarr schedule` must watch the very file web's POST /api/run
+    # touches, or RUN NOW silently no-ops in Docker deployments
+    cfg = C._build({"core": {"data_dir": str(tmp_path)},
+                    "scheduler": {"nightly": "04:30"}})
+    seen = {}
+
+    def fake_run_forever(self, *args, **kwargs):
+        seen["sentinel"] = self.sentinel
+        seen["at"] = (self.hour, self.minute)
+
+    monkeypatch.setattr(scheduler.Scheduler, "run_forever", fake_run_forever)
+    scheduler.main(cfg)
+    assert seen["sentinel"] == tmp_path / "run-requested"
+    assert seen["at"] == (4, 30)
 
 
 def test_web_process_has_no_scheduler(tmp_path):

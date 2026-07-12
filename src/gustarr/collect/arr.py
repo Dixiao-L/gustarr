@@ -2,7 +2,9 @@
 
 What Sonarr/Radarr/Lidarr manage is both an exclusion list (never
 recommend what's owned) and taste: a manual add is a positive
-declaration, and deleting something gustarr added is a strong negative.
+declaration, and deleting something gustarr added is a strong negative
+for the profile whose recommendation landed it (household fan-out at
+reduced weight only when no owner is on record).
 Items carrying the gustarr tag get no library_add event — rewarding our
 own adds would feed the model its own output.
 """
@@ -118,12 +120,25 @@ def _sync_one(
         row = conn.execute(
             "SELECT meta FROM library WHERE item_id=? AND arr=?", (item_id, name)).fetchone()
         if row and json.loads(row["meta"]).get("gustarr"):
-            # user deleted a gustarr add: the strongest negative we ever see.
-            # Deletion is as anonymous as adding — fan out to every profile
-            # (see the library_add comment above).
-            for profile in profiles:
-                if db.add_event(conn, db.now(), item_id, "reject", WEIGHTS["reject"], "arr",
-                                {"deleted": True}, profile=profile):
+            # user deleted a gustarr add: the strongest negative we ever
+            # see. Unlike adds, this IS usually attributable — the
+            # recommendation row that landed the item names whose queue it
+            # came from, so the reject hits that profile alone at full
+            # weight instead of poisoning everyone's model. Only an
+            # ownerless add (pre-profile store, hand-applied tag) falls
+            # back to a household fan-out, damped to 0.3x: deleting a
+            # shared item is weak evidence about any individual's taste,
+            # and meta flags it as shared so training can tell.
+            owner = conn.execute(
+                "SELECT profile FROM recommendations WHERE item_id=?"
+                " AND status IN ('added','auto_added')"
+                " ORDER BY acted_at DESC, id DESC LIMIT 1", (item_id,)).fetchone()
+            targets = [owner["profile"]] if owner else profiles
+            weight = WEIGHTS["reject"] if owner else WEIGHTS["reject"] * 0.3
+            meta = {"deleted": True} if owner else {"deleted": True, "shared": True}
+            for profile in targets:
+                if db.add_event(conn, db.now(), item_id, "reject", weight, "arr",
+                                meta, profile=profile):
                     stats["rejects"] += 1
         conn.execute("DELETE FROM library WHERE item_id=? AND arr=?", (item_id, name))
         stats["removed"] += 1

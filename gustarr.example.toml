@@ -93,8 +93,10 @@ bind = "127.0.0.1:8790"
 # meaningful with [profiles.*] configured, and only safe behind the proxy.
 # profile_header = "Remote-User"
 
-# Built-in scheduler for containers: when set, `gustarr web` runs the
-# nightly pipeline itself at this local time (set TZ in the container!).
-# Leave unset under systemd/cron timers — they are the better boundary.
+# Scheduler for containers: when set, the dedicated `gustarr schedule`
+# process (the compose example runs it as a second service from the same
+# image) fires the nightly pipeline at this local time (set TZ in the
+# container!). The web process never runs the pipeline. Leave unset under
+# systemd/cron timers — they are the better boundary.
 # [scheduler]
 # nightly = "04:30"

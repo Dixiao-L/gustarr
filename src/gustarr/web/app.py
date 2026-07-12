@@ -50,6 +50,17 @@ def _allowed_hosts(cfg: Config) -> set[str]:
     return allowed
 
 
+def _queue_error(exc: ValueError, missing: int = 409) -> HTTPException:
+    # queue's per-rec calls raise bare ValueError for state-machine
+    # refusals and the ownership guard alike; only the guard is
+    # authorization, so it alone maps to 403 — with a fixed detail,
+    # because the owning profile's name is nobody else's business.
+    if "belongs to profile" in str(exc):
+        return HTTPException(status_code=403,
+                             detail="recommendation belongs to another profile")
+    return HTTPException(status_code=missing, detail=str(exc))
+
+
 def create_app(cfg: Config) -> FastAPI:
     app = FastAPI(title="Gustarr", docs_url=None, redoc_url=None)
     allowed = _allowed_hosts(cfg)
@@ -108,11 +119,14 @@ def create_app(cfg: Config) -> FastAPI:
         finally:
             conn.close()
 
-    def act(conn: sqlite3.Connection, rec_id: int, status: str) -> dict[str, Any]:
+    def act(conn: sqlite3.Connection, rec_id: int, status: str, profile: str) -> dict[str, Any]:
+        # The resolved profile rides along as queue's ownership guard: a
+        # rec id is guessable, so acting across profiles must be a 403,
+        # not a mutation.
         try:
-            stats = queue.set_status(conn, rec_id, status)
-        except ValueError as exc:  # unknown rec / already acted / terminal status
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            stats = queue.set_status(conn, rec_id, status, profile=profile)
+        except ValueError as exc:  # unknown rec / already acted / other profile's rec
+            raise _queue_error(exc) from exc
         conn.commit()
         return {"id": rec_id, "status": status, **stats}
 
@@ -134,32 +148,54 @@ def create_app(cfg: Config) -> FastAPI:
         return queue.list_recs(conn, domain=domain or None, status=status, profile=profile)
 
     @app.post("/api/recs/{rec_id}/approve")
-    def api_approve(rec_id: int, conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
-        return act(conn, rec_id, "approved")
+    def api_approve(
+        rec_id: int,
+        profile: str = Depends(get_profile),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict[str, Any]:
+        return act(conn, rec_id, "approved", profile)
 
     @app.post("/api/recs/{rec_id}/reject")
-    def api_reject(rec_id: int, conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
-        return act(conn, rec_id, "rejected")
+    def api_reject(
+        rec_id: int,
+        profile: str = Depends(get_profile),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict[str, Any]:
+        return act(conn, rec_id, "rejected", profile)
 
     @app.post("/api/recs/{rec_id}/snooze")
-    def api_snooze(rec_id: int, conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
-        return act(conn, rec_id, "snoozed")
+    def api_snooze(
+        rec_id: int,
+        profile: str = Depends(get_profile),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict[str, Any]:
+        return act(conn, rec_id, "snoozed", profile)
 
     @app.post("/api/recs/{rec_id}/forgive")
-    def api_forgive(rec_id: int, conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
+    def api_forgive(
+        rec_id: int,
+        profile: str = Depends(get_profile),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict[str, Any]:
         try:
-            stats = queue.forgive(conn, rec_id)
-        except ValueError as exc:  # unknown rec / not rejected
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            stats = queue.forgive(conn, rec_id, profile=profile)
+        except ValueError as exc:  # unknown rec / not rejected / other profile's rec
+            raise _queue_error(exc) from exc
         conn.commit()
         return {"id": rec_id, "status": "expired", **stats}
 
     @app.get("/api/recs/{rec_id}/why")
-    def api_why(rec_id: int, conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, str]:
+    def api_why(
+        rec_id: int,
+        profile: str = Depends(get_profile),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict[str, str]:
+        # Explanations name the neighbours that seeded a rec — taste data,
+        # so reading across profiles is a 403 exactly like acting is.
         try:
-            return {"text": queue.explain(conn, rec_id)}
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            return {"text": queue.explain(conn, rec_id, profile=profile)}
+        except ValueError as exc:  # unknown rec (404) / other profile's rec (403)
+            raise _queue_error(exc, missing=404) from exc
 
     @app.get("/api/stats")
     def api_stats(
@@ -200,9 +236,10 @@ def create_app(cfg: Config) -> FastAPI:
 
     @app.post("/api/run")
     def api_run() -> dict[str, bool]:
-        # The sentinel file is the whole IPC: a systemd path unit on the
-        # host watches data_dir and starts the pipeline when it appears,
-        # so the web process never runs the pipeline in-process.
+        # The sentinel file is the whole IPC: on NixOS a systemd path unit
+        # watches data_dir; in containers the `gustarr schedule` process
+        # consumes it on its next tick. Either way the web process never
+        # runs the pipeline in-process.
         sentinel = Path(cfg.data_dir) / "run-requested"
         sentinel.parent.mkdir(parents=True, exist_ok=True)
         sentinel.touch(mode=0o644)

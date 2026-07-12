@@ -791,12 +791,15 @@ def test_transient_failure_leaves_item_queued_for_retry(conn, tmp_path, monkeypa
     assert row["enriched_at"] is None
     assert "boom" in json.loads(row["meta"])["enrich_error"]
 
-    # service recovered: the same item is retried and enriched
+    # service recovered: the same item is retried and enriched, and the
+    # stale failure note goes with it (meta merges key-wise, so the
+    # success write alone would leave it behind)
     mock_api(monkeypatch, [("/movie/605", {**MOVIE_DETAIL, "id": 605, "title": "Flaky"})])
     stats = run(conn, cfg)
     assert stats["enriched"] == 1 and stats["errors"] == 0
-    row = conn.execute("SELECT enriched_at FROM items WHERE id=?", (iid,)).fetchone()
+    row = conn.execute("SELECT enriched_at, meta FROM items WHERE id=?", (iid,)).fetchone()
     assert row["enriched_at"] is not None
+    assert "enrich_error" not in json.loads(row["meta"])
 
 
 def test_unexpected_exception_is_transient(conn, tmp_path, monkeypatch):
