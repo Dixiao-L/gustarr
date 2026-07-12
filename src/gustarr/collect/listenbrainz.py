@@ -100,7 +100,12 @@ def _sync_cf(conn: sqlite3.Connection, profile: str, user: str, headers: dict[st
         recording = info.get("recording") or {}
         artist = info.get("artist") or {}
         release = info.get("release") or {}
-        artist_id, artist_name, artist_mbid = _artist_ref(conn, artist)
+        try:
+            artist_id, artist_name, artist_mbid = _artist_ref(conn, artist)
+        except ValueError:
+            # a name that folds to nothing (whitespace-only credit): one
+            # junk metadata row must not fail the whole stage
+            artist_id, artist_name, artist_mbid = None, None, None
         meta: dict[str, Any] = {}
         if artist_name:
             meta["artist"] = artist_name
@@ -108,8 +113,11 @@ def _sync_cf(conn: sqlite3.Connection, profile: str, user: str, headers: dict[st
             meta["album"] = release["name"]
         if release.get("mbid"):
             meta["release_mbid"] = release["mbid"]
-        track_id = db.resolve_item(conn, "track", "mbid", mbid,
-                                   title=recording.get("name"), meta=meta)
+        try:
+            track_id = db.resolve_item(conn, "track", "mbid", mbid,
+                                       title=recording.get("name"), meta=meta)
+        except ValueError:
+            continue  # junk recording mbid: skip the row, not the stage
         _upsert_candidate(conn, profile, track_id, "listenbrainz_cf", score, ts)
         stats["cf_tracks"] += 1
         numeric = float(score) if isinstance(score, (int, float)) else 0.0
@@ -126,9 +134,16 @@ def _sync_cf(conn: sqlite3.Connection, profile: str, user: str, headers: dict[st
                 album_best[release["mbid"]] = (release["name"], artist_name,
                                                artist_mbid, numeric)
 
+    # re-resolve at flush (the loop's merges may have repointed a ref) and
+    # dedupe by the resolved item: one artist reached via both a name
+    # credit and an mbid credit must get its max score once, not a
+    # last-writer-wins overwrite and a double-counted stat
+    flush_best: dict[int, float] = {}
     for (ns, key), (artist_name, best) in artist_best.items():
-        # re-resolve at flush: the loop's merges may have repointed the ref
         artist_id = db.resolve_item(conn, "artist", ns, key, title=artist_name)
+        if best > flush_best.get(artist_id, float("-inf")):
+            flush_best[artist_id] = best
+    for artist_id, best in flush_best.items():
         _upsert_candidate(conn, profile, artist_id, "listenbrainz_cf_artist", best, ts)
         stats["cf_artists"] += 1
 
@@ -138,8 +153,11 @@ def _sync_cf(conn: sqlite3.Connection, profile: str, user: str, headers: dict[st
             # the album→artist relation actuation/Lidarr needs: a pointer to
             # another item, never one of the album's own identities
             meta["artist_mbid"] = artist_mbid
-        album_id = db.resolve_item(conn, "album", "mbid", release_mbid,
-                                   title=title, meta=meta)
+        try:
+            album_id = db.resolve_item(conn, "album", "mbid", release_mbid,
+                                       title=title, meta=meta)
+        except ValueError:
+            continue
         _upsert_candidate(conn, profile, album_id, "listenbrainz_cf_album", best, ts)
         stats["cf_albums"] += 1
 
@@ -173,11 +191,14 @@ def _sync_weekly(conn: sqlite3.Connection, profile: str, user: str, headers: dic
         if not mbid:
             continue
         creator = track.get("creator")
-        track_id = db.resolve_item(conn, "track", "mbid", mbid, title=track.get("title"),
-                                   meta={"artist": creator} if creator else None)
-        if creator:
-            # JSPF carries no artist MBID; enrich upgrades this later.
-            db.resolve_item(conn, "artist", "name", creator, title=creator)
+        try:
+            track_id = db.resolve_item(conn, "track", "mbid", mbid, title=track.get("title"),
+                                       meta={"artist": creator} if creator else None)
+            if creator:
+                # JSPF carries no artist MBID; enrich upgrades this later.
+                db.resolve_item(conn, "artist", "name", creator, title=creator)
+        except ValueError:
+            continue  # a key folding to nothing: skip the row, not the stage
         _upsert_candidate(conn, profile, track_id, "listenbrainz_weekly", None, ts)
         stats["weekly_tracks"] += 1
 

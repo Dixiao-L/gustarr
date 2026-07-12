@@ -25,7 +25,7 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from . import db, http, signals
+from . import db, http, ids, signals
 from .config import Config
 
 TMDB = "https://api.themoviedb.org/3"
@@ -146,6 +146,9 @@ class _Pool:
         # Gate on the looked-up identity before minting: an excluded or
         # capped result must not create (or freshen) an item row, or the
         # enrich/embed backlog balloons with rows rank never sees.
+        if not ids.normalize_key(str(key)):
+            self.stats["skipped"] += 1  # a key folding to nothing can't be an item
+            return
         item_id = db.lookup_item(self.conn, domain, ns, key)
         if item_id is not None and item_id in self.excluded:
             self.stats["skipped"] += 1
@@ -429,7 +432,7 @@ def _resolve_artist(conn: sqlite3.Connection, pool: _Pool,
     two rows. A verdict on either half must survive the merge, so the
     winner inherits the pool exclusion."""
     name = a.get("name")
-    if not name:
+    if not name or not ids.normalize_key(str(name)):
         return None
     mb = a.get("mbid") or None
     if mb:

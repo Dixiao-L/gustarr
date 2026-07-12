@@ -187,6 +187,31 @@ def test_v2_known_state_migrates_on_read(conn, cfg, fake_http):
     assert json.loads(db.get_state(conn, "arr:known:lidarr")) == {MBID: 31}
 
 
+def test_lidarr_junk_foreign_id_skips_row_not_stage(conn, cfg, fake_http, responses):
+    """A lidarr entry whose foreignArtistId is whitespace-only folds to an
+    empty key: the row is counted skipped, the stage completes, and the
+    entries after it still land."""
+    responses[f"{LIDARR}/api/v1/artist"].insert(0, {
+        "id": 30, "artistName": "Ghost Entry", "foreignArtistId": "   ",
+        "genres": [], "monitored": True, "added": "2024-04-02T07:00:00Z", "tags": []})
+
+    stats = arr.sync(conn, cfg)
+
+    assert stats["skipped"] == 1
+    assert stats["items"] == 4 and stats["library"] == 4
+    assert stats["events"] == 3  # Heat is gustarr-tagged: no library_add
+    # the junk row minted nothing; Radiohead (listed after it) still landed
+    assert db.lookup_item(conn, "artist", "mbid", MBID) is not None
+    assert conn.execute(
+        "SELECT COUNT(*) FROM items WHERE domain='artist'").fetchone()[0] == 1
+    # the skipped row never entered the known state, so the next sync
+    # neither removes nor rejects anything on its account
+    assert json.loads(db.get_state(conn, "arr:known:lidarr")) == {MBID: 31}
+    stats2 = arr.sync(conn, cfg)
+    assert stats2["skipped"] == 1
+    assert stats2["removed"] == 0 and stats2["rejects"] == 0
+
+
 def test_unconfigured_arrs_skipped(conn, tmp_path, monkeypatch, responses):
     cfg = C._build({"core": {"data_dir": str(tmp_path)},
                     "radarr": {"url": RADARR, "api_key": "rk"}})

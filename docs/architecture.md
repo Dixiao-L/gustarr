@@ -155,6 +155,17 @@ refused (the spelling stays with its current owner; enrich and dedupe count
 it as `alias_conflicts`). Name merges therefore only absorb name-only
 twins — the CJK-healing case they exist for.
 
+A `jellyfin` key is a *pointer* to a library entry, not an immutable
+identity. When it collides between two items that both hold authoritative
+ids, the entry was re-identified in Jellyfin (a retag) and the pointer
+moves to the new identification; when either side lacks authoritative ids,
+the collision is metadata enrichment and the items merge, carrying watch
+history. Two edges are accepted rather than guessed at: a retag whose old
+binding was a name-only item merges (indistinguishable from enrichment),
+and an agent switch that replaces an entry's entire provider-id set forks
+history onto the new identification — the old item keeps what it earned,
+and `gustarr dedupe` can heal it later via aliases.
+
 Authority per domain, strongest first (`ids.NS_PRIORITY`): movie
 `tmdb, imdb`; series `tvdb, tmdb, imdb`; artist/album/track `mbid, name`.
 `series` actuates by TVDB id because Sonarr can only add by it; enrich
