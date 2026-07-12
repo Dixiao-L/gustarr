@@ -240,6 +240,17 @@ def run(conn: sqlite3.Connection, cfg: Config, top: int = 20) -> dict:
         if centroid is not None and centroid.get("embed_model") != model_name:
             centroid = None
             stats["stale_state"] += 1
+        if head is None and centroid is None and domain == "album":
+            # Nothing listens "to an album" in the event stream yet, so the
+            # album domain has no labels of its own — score against the
+            # artist taste model (same embedding space, same musical taste)
+            # until album-level feedback accumulates.
+            head = _state_json(conn, "model:artist")
+            centroid = _state_json(conn, "centroid:artist")
+            if head is not None and head.get("embed_model") != model_name:
+                head = None
+            if centroid is not None and centroid.get("embed_model") != model_name:
+                centroid = None
         if head is None and centroid is None:
             continue
         stats["rescored"] += _rescore_open(conn, domain, model_name, head, centroid)
