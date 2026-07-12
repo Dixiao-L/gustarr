@@ -113,6 +113,29 @@ def enrich(ctx: Ctx, domain: str | None, limit: int) -> None:
 
 
 @main.command()
+@click.option("--fetch", is_flag=True,
+              help="Also fetch MusicBrainz alias lists for played artists that lack them"
+                   " (~1 request/second; bridges kana/kanji vs romaji spellings).")
+@click.option("--limit", type=int, default=500,
+              help="Max MusicBrainz alias fetches per run (0 = no cap).")
+@click.pass_obj
+def dedupe(ctx: Ctx, fetch: bool, limit: int) -> None:
+    """Merge items that are the same thing under different spellings.
+
+    Run once after upgrading gustarr (id normalization got stricter) or
+    after importing history from a new source, so events split across
+    width/case/script variants of one name land on a single item. Every
+    pass is idempotent; --fetch adds MusicBrainz alias lookups so an
+    artist's romanized and native-script names merge too.
+    """
+    from .dedupe import run as dedupe_run
+
+    stats = dedupe_run(ctx.conn, ctx.cfg, fetch=fetch, limit=limit or None)
+    ctx.conn.commit()
+    click.echo(json.dumps(stats))
+
+
+@main.command()
 @click.option("--domain", default=None)
 @click.pass_obj
 def candidates(ctx: Ctx, domain: str | None) -> None:
