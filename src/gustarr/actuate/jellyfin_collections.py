@@ -4,11 +4,10 @@ new arrivals surface where the user actually browses.
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from typing import Any
 
-from .. import http, ids
+from .. import db, http
 from ..config import Config
 
 COLLECTIONS = {
@@ -19,22 +18,14 @@ COLLECTIONS = {
     "track": "Gustarr Discover: Music",
 }
 
-# Jellyfin AnyProviderIdEquals filter: our ids-json key → provider name.
+# Jellyfin AnyProviderIdEquals filter: our identity namespace → provider
+# name. Only used when the item carries no 'jellyfin' identity yet (the
+# collector hands us the Jellyfin item id directly for library items).
 PROVIDERS = {
     "movie": ("tmdb", "tmdb"),
     "series": ("tvdb", "tvdb"),
     "artist": ("mbid", "musicbrainzartist"),
 }
-
-
-def external_id(row: sqlite3.Row, ns_key: str) -> str | None:
-    """Provider id from items.ids json, falling back to the canonical id
-    key when the item is keyed by that same namespace."""
-    ext = json.loads(row["ids"]).get(ns_key)
-    if ext is not None:
-        return str(ext)
-    _, ns, key = ids.parse(row["item_id"])
-    return key if ns == ns_key else None
 
 
 def _find_item(base: str, headers: dict[str, str], provider_value: str) -> str | None:
@@ -71,7 +62,7 @@ def sync_collections(
     if not base or not token:
         return {"skipped": True}
     rows = conn.execute(
-        "SELECT DISTINCT r.domain, i.id AS item_id, i.ids, i.title FROM recommendations r"
+        "SELECT DISTINCT r.domain, i.id AS item_id FROM recommendations r"
         " JOIN items i ON i.id = r.item_id WHERE r.status IN ('auto_added','added')"
     ).fetchall()
     if dry_run:
@@ -81,18 +72,29 @@ def sync_collections(
     stats = {"checked": 0, "matched": 0, "collections_created": 0, "collection_adds": 0}
     wanted: dict[str, list[str]] = {}
     for row in rows:
-        provider = PROVIDERS.get(row["domain"])
         name = COLLECTIONS.get(row["domain"])
-        if provider is None or name is None:
+        if name is None:
             continue
-        ext = external_id(row, provider[0])
-        if ext is None:
-            continue
-        stats["checked"] += 1
-        jf_id = _find_item(base, headers, f"{provider[1]}.{ext}")
-        if jf_id is None:
-            continue
-        stats["matched"] += 1
+        idents = db.identities_of(conn, row["item_id"])
+        # A 'jellyfin' identity IS the Jellyfin item id (stored lowercase,
+        # matching Jellyfin's own hex ids): use it directly and skip the
+        # provider-id search round-trip entirely.
+        jf_id = idents.get("jellyfin")
+        if jf_id is not None:
+            stats["checked"] += 1
+            stats["matched"] += 1
+        else:
+            provider = PROVIDERS.get(row["domain"])
+            if provider is None:
+                continue
+            ext = idents.get(provider[0])
+            if ext is None:
+                continue
+            stats["checked"] += 1
+            jf_id = _find_item(base, headers, f"{provider[1]}.{ext}")
+            if jf_id is None:
+                continue
+            stats["matched"] += 1
         bucket = wanted.setdefault(name, [])
         if jf_id not in bucket:
             bucket.append(jf_id)

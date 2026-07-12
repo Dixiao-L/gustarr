@@ -12,7 +12,9 @@ under-represented genres and least-visited decade (quality-floored),
 and a damped 2-hop Last.fm fan-out from the best hop-1 candidates.
 Exclusions (library, open/acted recommendations, actively snoozed or
 rejected items) are applied at insert time — nothing is deleted from
-the pool, excluded rows simply never enter.
+the pool, excluded rows simply never enter. New items mint through
+db.resolve_item, so a spelling or external id seen anywhere before
+lands on its existing row.
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from . import db, http, ids, signals
+from . import db, http, signals
 from .config import Config
 
 TMDB = "https://api.themoviedb.org/3"
@@ -138,17 +140,17 @@ class _Pool:
         self.excluded = _excluded_ids(conn, profile)
         self.new_rows: Counter[str] = Counter()
 
-    def add(self, item_id: str, domain: str, title: str | None, year: int | None,
-            ids_d: dict[str, Any], meta: dict[str, Any], source: str,
-            seed_id: str | None, score: float | None) -> None:
-        # A merged-away fallback id must land on its canonical row, or the
-        # candidates FK insert fails (upsert_item redirects the items write
-        # but this raw insert would still use the stale id).
-        item_id = db.canonical_id(self.conn, item_id)
-        if item_id in self.excluded:
+    def add(self, domain: str, ns: str, key: str, title: str | None, year: int | None,
+            meta: dict[str, Any], source: str, seed_id: int | None,
+            score: float | None) -> None:
+        # Gate on the looked-up identity before minting: an excluded or
+        # capped result must not create (or freshen) an item row, or the
+        # enrich/embed backlog balloons with rows rank never sees.
+        item_id = db.lookup_item(self.conn, domain, ns, key)
+        if item_id is not None and item_id in self.excluded:
             self.stats["skipped"] += 1
             return
-        exists = self.conn.execute(
+        exists = item_id is not None and self.conn.execute(
             "SELECT 1 FROM candidates WHERE profile=? AND item_id=? AND source=?",
             (self.profile, item_id, source)
         ).fetchone() is not None
@@ -156,7 +158,8 @@ class _Pool:
             if source not in self.stats["capped"]:
                 self.stats["capped"].append(source)
             return
-        db.upsert_item(self.conn, item_id, domain, title=title, year=year, ids=ids_d, meta=meta)
+        item_id = db.resolve_item(self.conn, domain, ns, key,
+                                  title=title, year=year, meta=meta)
         ts = db.now()
         self.conn.execute(
             "INSERT INTO candidates (profile, item_id, source, seed_item_id, external_score,"
@@ -175,37 +178,27 @@ class _Pool:
             self.new_rows[source] += 1
 
 
-def _excluded_ids(conn: sqlite3.Connection, profile: str) -> set[str]:
+def _excluded_ids(conn: sqlite3.Connection, profile: str) -> set[int]:
     marks = ",".join("?" * len(BLOCKED_REC_STATUSES))
     # library is the household's one disk — global; recommendation verdicts
-    # and rejects are one person's taste — scoped to the profile.
+    # and rejects are one person's taste — scoped to the profile. Identity
+    # resolution guarantees one item per entity, so a plain int set is the
+    # whole block list — no alternate-namespace synthesis needed.
     q = (
-        "SELECT x.item_id, i.domain, i.ids FROM ("
         "SELECT item_id FROM library"
         f" UNION SELECT item_id FROM recommendations WHERE profile=? AND (status IN ({marks})"
         "   OR (status='snoozed' AND acted_at >= ?))"
-        " UNION SELECT item_id FROM events WHERE profile=? AND kind='reject') x"
-        " LEFT JOIN items i ON i.id = x.item_id"
+        " UNION SELECT item_id FROM events WHERE profile=? AND kind='reject'"
     )
-    excluded: set[str] = set()
-    for r in conn.execute(q, (profile, *BLOCKED_REC_STATUSES, snooze_cutoff(), profile)):
-        excluded.add(r["item_id"])
-        if r["domain"] is None:
-            continue
-        # An excluded item is often known under several namespaces (a Sonarr
-        # library row is series:tvdb:<id> while TMDb mints series:tmdb:<id>),
-        # so block every alternate id derivable from its ids JSON as well.
-        for ns, key in json.loads(r["ids"]).items():
-            if key:
-                excluded.add(ids.make(r["domain"], ns, str(key)))
-    return excluded
+    return {r["item_id"] for r in conn.execute(
+        q, (profile, *BLOCKED_REC_STATUSES, snooze_cutoff(), profile))}
 
 
 # ── seed selection ───────────────────────────────────────────────────
 
 
 def _positive_items(conn: sqlite3.Connection, profile: str,
-                    domain: str) -> list[tuple[str, float]]:
+                    domain: str) -> list[tuple[int, float]]:
     """One profile's items with aggregate label >= SEED_LABEL_MIN, best
     first (ties broken by most recent event)."""
     rows = conn.execute(
@@ -213,8 +206,8 @@ def _positive_items(conn: sqlite3.Connection, profile: str,
         " JOIN items i ON i.id = e.item_id WHERE e.profile=? AND i.domain=?",
         (profile, domain),
     ).fetchall()
-    events: dict[str, list[tuple[str, str, float]]] = {}
-    latest: dict[str, str] = {}
+    events: dict[int, list[tuple[str, str, float]]] = {}
+    latest: dict[int, str] = {}
     for r in rows:
         events.setdefault(r["item_id"], []).append((r["ts"], r["kind"], r["weight"]))
         if r["ts"] > latest.get(r["item_id"], ""):
@@ -225,21 +218,15 @@ def _positive_items(conn: sqlite3.Connection, profile: str,
     return positives
 
 
-def _tmdb_id(conn: sqlite3.Connection, item_id: str) -> str | None:
-    _, ns, key = ids.parse(item_id)
-    if ns == "tmdb":
-        return key
-    row = conn.execute("SELECT ids FROM items WHERE id=?", (item_id,)).fetchone()
-    if row is None:
-        return None
-    tid = json.loads(row["ids"]).get("tmdb")
-    return str(tid) if tid else None
+def _tmdb_id(conn: sqlite3.Connection, item_id: int) -> str | None:
+    return db.identities_of(conn, item_id).get("tmdb")
 
 
 # ── TMDb ─────────────────────────────────────────────────────────────
 
 
 def _tmdb_result(domain: str, r: dict[str, Any]) -> tuple | None:
+    """(tmdb key, title, year, meta, external score) for one result row."""
     tid = r.get("id")
     if not tid:
         return None
@@ -253,11 +240,10 @@ def _tmdb_result(domain: str, r: dict[str, Any]) -> tuple | None:
         meta["overview"] = r["overview"][:300]
     if r.get("poster_path"):
         meta["poster_path"] = r["poster_path"]
-    item_id = ids.make(domain, "tmdb", str(tid))
-    return item_id, title, year, {"tmdb": tid}, meta, r.get("vote_average")
+    return str(tid), title, year, meta, r.get("vote_average")
 
 
-def _tmdb_similar(api_key: str, domain: str, seeds: list[tuple[str, str]],
+def _tmdb_similar(api_key: str, domain: str, seeds: list[tuple[int, str]],
                   pool: _Pool, stats: dict[str, Any]) -> None:
     media = "movie" if domain == "movie" else "tv"
     # TMDb has no /tv/{id}/similar worth using; recommendations covers it.
@@ -273,8 +259,8 @@ def _tmdb_similar(api_key: str, domain: str, seeds: list[tuple[str, str]],
             for r in (data or {}).get("results") or []:
                 parsed = _tmdb_result(domain, r)
                 if parsed:
-                    item_id, title, year, ids_d, meta, score = parsed
-                    pool.add(item_id, domain, title, year, ids_d, meta,
+                    key, title, year, meta, score = parsed
+                    pool.add(domain, "tmdb", key, title, year, meta,
                              "tmdb_similar", seed_id, score)
 
 
@@ -290,7 +276,7 @@ def _genre_map(conn: sqlite3.Connection, api_key: str, media: str) -> dict[str, 
     return mapping
 
 
-def _genre_counts(conn: sqlite3.Connection, positives: list[tuple[str, float]]) -> Counter[str]:
+def _genre_counts(conn: sqlite3.Connection, positives: list[tuple[int, float]]) -> Counter[str]:
     counts: Counter[str] = Counter()
     for iid, _ in positives:
         row = conn.execute("SELECT meta FROM items WHERE id=?", (iid,)).fetchone()
@@ -303,12 +289,12 @@ def _genre_counts(conn: sqlite3.Connection, positives: list[tuple[str, float]]) 
     return counts
 
 
-def _top_genres(conn: sqlite3.Connection, positives: list[tuple[str, float]]) -> list[str]:
+def _top_genres(conn: sqlite3.Connection, positives: list[tuple[int, float]]) -> list[str]:
     return [name for name, _ in _genre_counts(conn, positives).most_common(TOP_GENRES)]
 
 
 def _tmdb_discover(conn: sqlite3.Connection, api_key: str, domain: str,
-                   positives: list[tuple[str, float]], pool: _Pool,
+                   positives: list[tuple[int, float]], pool: _Pool,
                    stats: dict[str, Any]) -> None:
     genre_names = _top_genres(conn, positives)
     if not genre_names:
@@ -335,8 +321,8 @@ def _tmdb_discover(conn: sqlite3.Connection, api_key: str, domain: str,
     for r in (data or {}).get("results") or []:
         parsed = _tmdb_result(domain, r)
         if parsed:
-            item_id, title, year, ids_d, meta, score = parsed
-            pool.add(item_id, domain, title, year, ids_d, meta, "tmdb_discover", None, score)
+            key, title, year, meta, score = parsed
+            pool.add(domain, "tmdb", key, title, year, meta, "tmdb_discover", None, score)
 
 
 # ── serendipity: TMDb ────────────────────────────────────────────────
@@ -356,7 +342,7 @@ def _under_represented_genres(gmap: dict[str, int], counts: Counter[str]) -> lis
     return [name for _, name in under[:SERENDIPITY_GENRE_PROBES]]
 
 
-def _least_seen_decade(conn: sqlite3.Connection, positives: list[tuple[str, float]]) -> int:
+def _least_seen_decade(conn: sqlite3.Connection, positives: list[tuple[int, float]]) -> int:
     counts: Counter[int] = Counter()
     for iid, _ in positives:
         row = conn.execute("SELECT year FROM items WHERE id=?", (iid,)).fetchone()
@@ -368,7 +354,7 @@ def _least_seen_decade(conn: sqlite3.Connection, positives: list[tuple[str, floa
 
 
 def _tmdb_serendipity(conn: sqlite3.Connection, api_key: str, domain: str,
-                      positives: list[tuple[str, float]], pool: _Pool,
+                      positives: list[tuple[int, float]], pool: _Pool,
                       stats: dict[str, Any]) -> None:
     """Anti-bubble discover: top-rated titles from under-represented
     genres (one genre per call) plus the least-visited decade."""
@@ -399,28 +385,26 @@ def _tmdb_serendipity(conn: sqlite3.Connection, api_key: str, domain: str,
         for r in (data or {}).get("results") or []:
             parsed = _tmdb_result(domain, r)
             if parsed:
-                item_id, title, year, ids_d, meta, score = parsed
-                pool.add(item_id, domain, title, year, ids_d, meta,
+                key, title, year, meta, score = parsed
+                pool.add(domain, "tmdb", key, title, year, meta,
                          "serendipity_tmdb", None, score)
 
 
 # ── Last.fm ──────────────────────────────────────────────────────────
 
 
-def _artist_query_params(conn: sqlite3.Connection, item_id: str, api_key: str,
+def _artist_query_params(conn: sqlite3.Connection, item_id: int, api_key: str,
                          limit: int) -> dict[str, Any] | None:
     """artist.getsimilar params for an item, mbid-first; None when the
     item offers neither an mbid nor a usable name."""
-    _, ns, key = ids.parse(item_id)
-    row = conn.execute("SELECT title, ids FROM items WHERE id=?", (item_id,)).fetchone()
-    stored = json.loads(row["ids"]) if row else {}
-    mbid = key if ns == "mbid" else stored.get("mbid")
+    idents = db.identities_of(conn, item_id)
     params: dict[str, Any] = {"method": "artist.getsimilar", "api_key": api_key,
                               "format": "json", "limit": limit}
-    if mbid:
+    if mbid := idents.get("mbid"):
         params["mbid"] = mbid
     else:
-        name = row["title"] if row and row["title"] else (key if ns == "lastfm" else None)
+        row = conn.execute("SELECT title FROM items WHERE id=?", (item_id,)).fetchone()
+        name = (row["title"] if row else None) or idents.get("name")
         if not name:
             return None
         params["artist"] = name
@@ -435,32 +419,36 @@ def _similar_artists(data: Any) -> list[dict[str, Any]]:
 
 
 def _resolve_artist(conn: sqlite3.Connection, pool: _Pool,
-                    a: dict[str, Any]) -> tuple[str, str, str | None, float] | None:
-    """(item_id, name, mbid, match) for one similar-artist entry."""
+                    a: dict[str, Any]) -> tuple[str, str, str, str | None, float] | None:
+    """(ns, key, name, mbid, match) for one similar-artist entry.
+
+    Entries carrying an mbid resolve the item and teach it the name too:
+    Last.fm asserting name↔mbid identity beats the fuzzy MusicBrainz
+    search enrich relies on, so a name-keyed twin (scrobbles often omit
+    the mbid) merges into the mbid item and one artist never lives on as
+    two rows. A verdict on either half must survive the merge, so the
+    winner inherits the pool exclusion."""
     name = a.get("name")
     if not name:
         return None
     mb = a.get("mbid") or None
     if mb:
-        item_id = ids.make("artist", "mbid", mb)
-        fallback = ids.make("artist", "lastfm", name)
-        # Last.fm asserting name↔mbid identity beats the fuzzy
-        # MusicBrainz search enrich relies on: fold any name-keyed
-        # twin (scrobbles often omit the mbid) into the canonical
-        # item so one artist never lives on as two ids.
-        db.merge_item(conn, fallback, item_id)
-        if fallback in pool.excluded:
-            pool.excluded.add(item_id)
+        item_id = db.resolve_item(conn, "artist", "mbid", mb, title=name)
+        twin = db.lookup_item(conn, "artist", "name", name)
+        winner = db.attach_identity(conn, item_id, "name", name)
+        if pool.excluded & {item_id, twin}:
+            pool.excluded.add(winner)
+        ns, key = "mbid", mb
     else:
-        item_id = ids.make("artist", "lastfm", name)
+        ns, key = "name", name
     try:
         score = float(a.get("match") or 0.0)
     except (TypeError, ValueError):
         score = 0.0
-    return item_id, name, mb, score
+    return ns, key, name, mb, score
 
 
-def _lastfm_similar(conn: sqlite3.Connection, api_key: str, seed_ids: list[str],
+def _lastfm_similar(conn: sqlite3.Connection, api_key: str, seed_ids: list[int],
                     pool: _Pool, stats: dict[str, Any]) -> None:
     used = 0
     for seed_id in seed_ids:
@@ -477,9 +465,8 @@ def _lastfm_similar(conn: sqlite3.Connection, api_key: str, seed_ids: list[str],
             resolved = _resolve_artist(conn, pool, a)
             if resolved is None:
                 continue
-            item_id, name, mb, score = resolved
-            pool.add(item_id, "artist", name, None, {"mbid": mb} if mb else {}, {},
-                     "lastfm_similar", seed_id, score)
+            ns, key, name, _mb, score = resolved
+            pool.add("artist", ns, key, name, None, {}, "lastfm_similar", seed_id, score)
     # accumulate: run() calls this once per profile
     stats["seeds"]["artist"] = stats["seeds"].get("artist", 0) + used
 
@@ -487,13 +474,8 @@ def _lastfm_similar(conn: sqlite3.Connection, api_key: str, seed_ids: list[str],
 # ── Last.fm: top albums ──────────────────────────────────────────────
 
 
-def _artist_mbid(conn: sqlite3.Connection, item_id: str) -> str | None:
-    _, ns, key = ids.parse(item_id)
-    if ns == "mbid":
-        return key
-    row = conn.execute("SELECT ids FROM items WHERE id=?", (item_id,)).fetchone()
-    mbid = json.loads(row["ids"]).get("mbid") if row else None
-    return str(mbid) if mbid else None
+def _artist_mbid(conn: sqlite3.Connection, item_id: int) -> str | None:
+    return db.identities_of(conn, item_id).get("mbid")
 
 
 def _top_albums(data: Any) -> list[dict[str, Any]]:
@@ -503,7 +485,7 @@ def _top_albums(data: Any) -> list[dict[str, Any]]:
     return albums
 
 
-def _lastfm_top_albums(conn: sqlite3.Connection, api_key: str, seed_ids: list[str],
+def _lastfm_top_albums(conn: sqlite3.Connection, api_key: str, seed_ids: list[int],
                        pool: _Pool, stats: dict[str, Any]) -> None:
     """Most-played albums of the liked artists.
 
@@ -538,13 +520,13 @@ def _lastfm_top_albums(conn: sqlite3.Connection, api_key: str, seed_ids: list[st
             artist = album.get("artist") or {}
             artist_mbid = artist.get("mbid") or mbid
             score = max(ALBUM_RANK_FLOOR, 1.0 - ALBUM_RANK_STEP * rank)
-            # artist_mbid lands in ids (the actuate/Lidarr contract) and is
-            # mirrored with the name into meta for the UI and enrich.
+            # artist_mbid is a relation to another item, not a name of this
+            # one, so it lives in meta (for actuate, the UI and enrich) —
+            # never in identities.
             meta: dict[str, Any] = {"artist_mbid": artist_mbid}
             if artist.get("name"):
                 meta["artist"] = artist["name"]
-            pool.add(ids.make("album", "mbid", album_mbid), "album", title, None,
-                     {"mbid": album_mbid, "artist_mbid": artist_mbid}, meta,
+            pool.add("album", "mbid", album_mbid, title, None, meta,
                      "lastfm_top_albums", seed_id, score)
     # accumulate: run() calls this once per profile
     stats["seeds"]["album"] = stats["seeds"].get("album", 0) + used
@@ -554,7 +536,7 @@ def _lastfm_top_albums(conn: sqlite3.Connection, api_key: str, seed_ids: list[st
 
 
 def _lastfm_serendipity(conn: sqlite3.Connection, api_key: str,
-                        positives: list[tuple[str, float]], pool: _Pool,
+                        positives: list[tuple[int, float]], pool: _Pool,
                         stats: dict[str, Any]) -> None:
     """2-hop neighbourhood: getSimilar on the strongest hop-1 candidates
     (never library rows or seeds), scores damped for the extra hop."""
@@ -579,15 +561,14 @@ def _lastfm_serendipity(conn: sqlite3.Connection, api_key: str,
             resolved = _resolve_artist(conn, pool, a)
             if resolved is None:
                 continue
-            item_id, name, mb, score = resolved
-            item_id = db.canonical_id(conn, item_id)
+            ns, key, name, _mb, score = resolved
             # anything already reachable at hop 1 (or via another source)
             # is bubble-adjacent, not serendipity — leave it be
-            known = conn.execute(
-                "SELECT 1 FROM candidates WHERE profile=? AND item_id=?"
-                " AND source!='serendipity_lastfm'",
-                (pool.profile, item_id)).fetchone()
-            if known is not None:
+            item_id = db.lookup_item(conn, "artist", ns, key)
+            if item_id is not None and conn.execute(
+                    "SELECT 1 FROM candidates WHERE profile=? AND item_id=?"
+                    " AND source!='serendipity_lastfm'",
+                    (pool.profile, item_id)).fetchone() is not None:
                 continue
-            pool.add(item_id, "artist", name, None, {"mbid": mb} if mb else {}, {},
+            pool.add("artist", ns, key, name, None, {},
                      "serendipity_lastfm", hop_id, score * SERENDIPITY_DAMPING)

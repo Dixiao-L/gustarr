@@ -143,27 +143,33 @@ def test_cf_candidates_scores_and_artist_aggregation(conn, cfg, monkeypatch):
     assert stats["cf_artists"] == 2
     assert stats["profiles"] == 1 and stats["profiles_skipped"] == 0
 
-    row = candidate(conn, f"track:mbid:{MBID_A}", "listenbrainz_cf")
+    track_a = db.lookup_item(conn, "track", "mbid", MBID_A)
+    row = candidate(conn, track_a, "listenbrainz_cf")
     assert row["external_score"] == pytest.approx(0.9)
     # legacy single-user config: rows belong to the synthesized default
     assert row["profile"] == "default"
-    item = conn.execute("SELECT * FROM items WHERE id=?", (f"track:mbid:{MBID_A}",)).fetchone()
+    item = conn.execute("SELECT * FROM items WHERE id=?", (track_a,)).fetchone()
     assert item["title"] == "Song A"
     assert json.loads(item["meta"])["artist"] == "Artist One"
-    assert json.loads(item["ids"])["mbid"] == MBID_A
+    assert db.identities_of(conn, track_a)["mbid"] == MBID_A
 
     # artist score is the max over that artist's CF tracks this run (0.9 > 0.7)
-    arow = candidate(conn, f"artist:mbid:{ARTIST_1}", "listenbrainz_cf_artist")
+    artist_1 = db.lookup_item(conn, "artist", "mbid", ARTIST_1)
+    arow = candidate(conn, artist_1, "listenbrainz_cf_artist")
     assert arow["external_score"] == pytest.approx(0.9)
-    aitem = conn.execute("SELECT * FROM items WHERE id=?", (f"artist:mbid:{ARTIST_1}",)).fetchone()
+    aitem = conn.execute("SELECT * FROM items WHERE id=?", (artist_1,)).fetchone()
     assert aitem["title"] == "Artist One"
+    # the mbid credit also teaches the spelling: one item, two names
+    assert db.lookup_item(conn, "artist", "name", "Artist One") == artist_1
 
-    # artist with no MBID falls back to the name-keyed lastfm namespace
-    fb = candidate(conn, "artist:lastfm:the unknowns", "listenbrainz_cf_artist")
+    # artist with no MBID resolves on the name namespace
+    unknowns = db.lookup_item(conn, "artist", "name", "The Unknowns")
+    fb = candidate(conn, unknowns, "listenbrainz_cf_artist")
     assert fb["external_score"] == pytest.approx(0.5)
 
     # unresolvable mbid still becomes a track candidate, just without metadata
-    assert candidate(conn, f"track:mbid:{MBID_X}", "listenbrainz_cf") is not None
+    track_x = db.lookup_item(conn, "track", "mbid", MBID_X)
+    assert candidate(conn, track_x, "listenbrainz_cf") is not None
 
     # metadata resolved in one batch with the right inc
     meta_calls = [c for c in seen if c[1] == "/1/metadata/recording/"]
@@ -183,22 +189,24 @@ def test_cf_groups_tracks_into_album_candidates(conn, cfg, monkeypatch):
 
     assert stats["cf_albums"] == 2
     # tracks A (0.9) and B (0.7) share RELEASE_1: the album takes the max
-    row = candidate(conn, f"album:mbid:{RELEASE_1}", "listenbrainz_cf_album")
+    album_1 = db.lookup_item(conn, "album", "mbid", RELEASE_1)
+    row = candidate(conn, album_1, "listenbrainz_cf_album")
     assert row["external_score"] == pytest.approx(0.9)
-    item = conn.execute(
-        "SELECT * FROM items WHERE id=?", (f"album:mbid:{RELEASE_1}",)).fetchone()
+    item = conn.execute("SELECT * FROM items WHERE id=?", (album_1,)).fetchone()
     assert item["domain"] == "album" and item["title"] == "Album A"
-    assert json.loads(item["ids"]) == {"mbid": RELEASE_1, "artist_mbid": ARTIST_1}
+    # the release mbid is the album's only identity; the artist relation
+    # lives in meta (a pointer to another item, not a name of this one)
+    assert db.identities_of(conn, album_1) == {"mbid": RELEASE_1}
     meta = json.loads(item["meta"])
     assert meta["artist"] == "Artist One" and meta["artist_mbid"] == ARTIST_1
 
     # release whose artist has no mbid still becomes an album, sans artist_mbid
-    row2 = candidate(conn, f"album:mbid:{RELEASE_2}", "listenbrainz_cf_album")
+    album_2 = db.lookup_item(conn, "album", "mbid", RELEASE_2)
+    row2 = candidate(conn, album_2, "listenbrainz_cf_album")
     assert row2["external_score"] == pytest.approx(0.5)
-    item2 = conn.execute(
-        "SELECT * FROM items WHERE id=?", (f"album:mbid:{RELEASE_2}",)).fetchone()
+    item2 = conn.execute("SELECT * FROM items WHERE id=?", (album_2,)).fetchone()
     assert item2["title"] == "Album C"
-    assert json.loads(item2["ids"]) == {"mbid": RELEASE_2}
+    assert db.identities_of(conn, album_2) == {"mbid": RELEASE_2}
     assert json.loads(item2["meta"]) == {"artist": "The Unknowns"}
 
     # metadata-less track X grew no album row: exactly the two above exist
@@ -218,17 +226,21 @@ def test_weekly_exploration_fetches_newest_playlist(conn, cfg, monkeypatch):
     playlist_calls = [c[1] for c in seen if c[1].startswith("/1/playlists/")]
     assert playlist_calls == [f"/1/playlists/{PL_NEW}"]
 
-    row = candidate(conn, f"track:mbid:{MBID_W}", "listenbrainz_weekly")
+    track_w = db.lookup_item(conn, "track", "mbid", MBID_W)
+    row = candidate(conn, track_w, "listenbrainz_weekly")
     assert row is not None
-    item = conn.execute("SELECT * FROM items WHERE id=?", (f"track:mbid:{MBID_W}",)).fetchone()
+    item = conn.execute("SELECT * FROM items WHERE id=?", (track_w,)).fetchone()
     assert item["title"] == "Song W"
-    fb_artist = conn.execute(
-        "SELECT * FROM items WHERE id=?", ("artist:lastfm:artist two",)).fetchone()
-    assert fb_artist["title"] == "Artist Two"
+    # JSPF has no artist mbid: the creator becomes a name-keyed artist item
+    fb_artist = db.lookup_item(conn, "artist", "name", "Artist Two")
+    assert fb_artist is not None
+    fb_row = conn.execute("SELECT * FROM items WHERE id=?", (fb_artist,)).fetchone()
+    assert fb_row["title"] == "Artist Two"
 
     # a track found by both CF and the playlist keeps both provenance rows
+    track_a = db.lookup_item(conn, "track", "mbid", MBID_A)
     sources = {r["source"] for r in conn.execute(
-        "SELECT source FROM candidates WHERE item_id=?", (f"track:mbid:{MBID_A}",))}
+        "SELECT source FROM candidates WHERE item_id=?", (track_a,))}
     assert sources == {"listenbrainz_cf", "listenbrainz_weekly"}
 
 

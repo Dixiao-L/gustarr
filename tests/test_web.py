@@ -13,11 +13,6 @@ from gustarr import config as C
 from gustarr import db, scheduler
 from gustarr.web.app import create_app
 
-MATRIX = "movie:tmdb:603"
-BLADE = "movie:tmdb:78"
-RADIOHEAD = "artist:mbid:a74b1b7f"
-IN_RAINBOWS = "album:mbid:rg-1"
-
 
 @pytest.fixture
 def web(tmp_path):
@@ -26,24 +21,30 @@ def web(tmp_path):
     cfg = C._build({"core": {"data_dir": str(tmp_path)},
                     "web": {"allowed_hosts": ["testserver"]}})
     conn = db.connect(cfg.db_path)
-    db.upsert_item(conn, MATRIX, "movie", "The Matrix", 1999,
-                   {"tmdb": 603}, {"genres": ["Action", "Science Fiction"]})
-    db.upsert_item(conn, BLADE, "movie", "Blade Runner", 1982,
-                   {"tmdb": 78}, {"genres": ["Science Fiction"]})
-    db.upsert_item(conn, RADIOHEAD, "artist", "Radiohead", None,
-                   {"mbid": "a74b1b7f"}, {"genres": ["rock"]})
+    # resolve_item is THE write path since schema v3: items carry surrogate
+    # int ids; each external id becomes an identities row.
+    matrix = db.resolve_item(conn, "movie", "tmdb", "603", title="The Matrix", year=1999,
+                             meta={"genres": ["Action", "Science Fiction"]})
+    blade = db.resolve_item(conn, "movie", "tmdb", "78", title="Blade Runner", year=1982,
+                            meta={"genres": ["Science Fiction"]})
+    radiohead = db.resolve_item(conn, "artist", "mbid", "a74b1b7f", title="Radiohead",
+                                meta={"genres": ["rock"]})
     ts = db.now()
-    why = json.dumps({"neighbors": [[BLADE, 0.82]], "sources": ["tmdb_similar"]})
+    # why JSON references neighbours by surrogate int id; /why joins the
+    # titles back in server-side.
+    why = json.dumps({"neighbors": [{"item_id": blade, "sim": 0.82}],
+                      "sources": ["tmdb_similar"]})
     movie_rec = conn.execute(
         "INSERT INTO recommendations (run_id, ts, domain, item_id, score, why)"
-        " VALUES ('r1',?,?,?,?,?)", (ts, "movie", MATRIX, 0.91, why)).lastrowid
+        " VALUES ('r1',?,?,?,?,?)", (ts, "movie", matrix, 0.91, why)).lastrowid
     artist_rec = conn.execute(
         "INSERT INTO recommendations (run_id, ts, domain, item_id, score, why)"
         " VALUES ('r1',?,?,?,?,?)",
-        (ts, "artist", RADIOHEAD, 0.62, '{"sources": ["lastfm_similar"]}')).lastrowid
+        (ts, "artist", radiohead, 0.62, '{"sources": ["lastfm_similar"]}')).lastrowid
     conn.commit()
     conn.close()
-    return TestClient(create_app(cfg)), cfg, movie_rec, artist_rec
+    items = {"matrix": matrix, "blade": blade, "radiohead": radiohead}
+    return TestClient(create_app(cfg)), cfg, movie_rec, artist_rec, items
 
 
 def _fetch(cfg, sql, *params):
@@ -59,14 +60,13 @@ def _add_album_rec(cfg):
     # so the album rec is opt-in for the tests that need one.
     conn = db.connect(cfg.db_path)
     try:
-        db.upsert_item(conn, IN_RAINBOWS, "album", "In Rainbows", 2007,
-                       {"mbid": "rg-1", "artist_mbid": "a74b1b7f"},
-                       {"artist": "Radiohead", "type": "Album",
-                        "image": "https://img.example/ir.jpg"})
+        album = db.resolve_item(conn, "album", "mbid", "rg-1", title="In Rainbows", year=2007,
+                                meta={"artist": "Radiohead", "type": "Album",
+                                      "image": "https://img.example/ir.jpg"})
         rec = conn.execute(
             "INSERT INTO recommendations (run_id, ts, domain, item_id, score, why)"
             " VALUES ('r1',?,?,?,?,?)",
-            (db.now(), "album", IN_RAINBOWS, 0.7, "{}")).lastrowid
+            (db.now(), "album", album, 0.7, "{}")).lastrowid
         conn.commit()
         return rec
     finally:
@@ -74,7 +74,7 @@ def _add_album_rec(cfg):
 
 
 def test_list_recs(web):
-    client, _, movie_rec, artist_rec = web
+    client, _, movie_rec, artist_rec, items = web
     resp = client.get("/api/recs")
     assert resp.status_code == 200
     rows = resp.json()
@@ -84,6 +84,11 @@ def test_list_recs(web):
     assert by_id[movie_rec]["title"] == "The Matrix"
     assert by_id[movie_rec]["year"] == 1999
     assert by_id[movie_rec]["genres"] == ["Action", "Science Fiction"]
+    # v3 row shape: surrogate int item_id plus the external-ids dict
+    # actuation reads (tvdb for Sonarr, mbid for Lidarr, ...)
+    assert by_id[movie_rec]["item_id"] == items["matrix"]
+    assert isinstance(by_id[movie_rec]["item_id"], int)
+    assert by_id[movie_rec]["ids"].get("tmdb") == "603"
 
     movies = client.get("/api/recs", params={"domain": "movie"}).json()
     assert [r["id"] for r in movies] == [movie_rec]
@@ -92,7 +97,7 @@ def test_list_recs(web):
 
 
 def test_music_domain_alias_and_album_fields(web):
-    client, cfg, movie_rec, artist_rec = web
+    client, cfg, _, artist_rec, _ = web
     album_rec = _add_album_rec(cfg)
 
     rows = client.get("/api/recs", params={"domain": "music"}).json()
@@ -113,7 +118,7 @@ def test_music_domain_alias_and_album_fields(web):
 
 
 def test_approve_flips_status_and_records_event(web):
-    client, cfg, movie_rec, _ = web
+    client, cfg, movie_rec, _, items = web
     resp = client.post(f"/api/recs/{movie_rec}/approve")
     assert resp.status_code == 200
     assert resp.json()["status"] == "approved"
@@ -122,42 +127,45 @@ def test_approve_flips_status_and_records_event(web):
     assert row["status"] == "approved"
     assert row["acted_at"]
     events = _fetch(cfg, "SELECT weight, source FROM events WHERE item_id=? AND kind='approve'",
-                    MATRIX)
+                    items["matrix"])
     assert len(events) == 1
     assert events[0]["weight"] == 1.0
     assert events[0]["source"] == "user"
 
 
 def test_reject_flips_status_and_records_event(web):
-    client, cfg, _, artist_rec = web
+    client, cfg, _, artist_rec, items = web
     assert client.post(f"/api/recs/{artist_rec}/reject").status_code == 200
     (row,) = _fetch(cfg, "SELECT status FROM recommendations WHERE id=?", artist_rec)
     assert row["status"] == "rejected"
-    events = _fetch(cfg, "SELECT weight FROM events WHERE item_id=? AND kind='reject'", RADIOHEAD)
+    events = _fetch(cfg, "SELECT weight FROM events WHERE item_id=? AND kind='reject'",
+                    items["radiohead"])
     assert len(events) == 1
     assert events[0]["weight"] == -1.0
 
 
 def test_double_act_conflicts(web):
-    client, _, movie_rec, _ = web
+    client, _, movie_rec, *_ = web
     assert client.post(f"/api/recs/{movie_rec}/approve").status_code == 200
     assert client.post(f"/api/recs/{movie_rec}/approve").status_code == 409
     assert client.post("/api/recs/99999/approve").status_code == 409
 
 
 def test_why_text(web):
-    client, _, movie_rec, _ = web
+    client, _, movie_rec, *_ = web
     resp = client.get(f"/api/recs/{movie_rec}/why")
     assert resp.status_code == 200
     text = resp.json()["text"]
     assert isinstance(text, str)
     assert "The Matrix" in text
     assert "tmdb_similar" in text
+    # the neighbour arrived as a bare int item id; the endpoint must have
+    # joined the title back in — a raw surrogate id is meaningless to people
     assert "Blade Runner" in text
 
 
 def test_stats(web):
-    client, _, *_ = web
+    client, *_ = web
     resp = client.get("/api/stats")
     assert resp.status_code == 200
     stats = resp.json()
@@ -291,7 +299,7 @@ def test_settings_put_invalid_returns_400(web):
 
 
 def test_snooze_flips_status_without_event(web):
-    client, cfg, movie_rec, _ = web
+    client, cfg, movie_rec, _, items = web
     resp = client.post(f"/api/recs/{movie_rec}/snooze")
     assert resp.status_code == 200
     assert resp.json()["status"] == "snoozed"
@@ -299,34 +307,35 @@ def test_snooze_flips_status_without_event(web):
     (row,) = _fetch(cfg, "SELECT status, acted_at FROM recommendations WHERE id=?", movie_rec)
     assert row["status"] == "snoozed"
     assert row["acted_at"]
-    assert _fetch(cfg, "SELECT 1 FROM events WHERE item_id=?", MATRIX) == []
+    assert _fetch(cfg, "SELECT 1 FROM events WHERE item_id=?", items["matrix"]) == []
     # snoozed is not re-snoozable; and only proposed recs can be snoozed
     assert client.post(f"/api/recs/{movie_rec}/snooze").status_code == 409
 
 
 def test_snooze_only_from_proposed(web):
-    client, _, _, artist_rec = web
+    client, _, _, artist_rec, _ = web
     assert client.post(f"/api/recs/{artist_rec}/approve").status_code == 200
     assert client.post(f"/api/recs/{artist_rec}/snooze").status_code == 409
     assert client.post("/api/recs/99999/snooze").status_code == 409
 
 
 def test_forgive_expires_rec_and_deletes_reject_event(web):
-    client, cfg, _, artist_rec = web
+    client, cfg, _, artist_rec, items = web
     assert client.post(f"/api/recs/{artist_rec}/reject").status_code == 200
     assert len(_fetch(cfg, "SELECT 1 FROM events WHERE item_id=? AND kind='reject'",
-                      RADIOHEAD)) == 1
+                      items["radiohead"])) == 1
 
     resp = client.post(f"/api/recs/{artist_rec}/forgive")
     assert resp.status_code == 200
     assert resp.json()["status"] == "expired"
     (row,) = _fetch(cfg, "SELECT status FROM recommendations WHERE id=?", artist_rec)
     assert row["status"] == "expired"
-    assert _fetch(cfg, "SELECT 1 FROM events WHERE item_id=? AND kind='reject'", RADIOHEAD) == []
+    assert _fetch(cfg, "SELECT 1 FROM events WHERE item_id=? AND kind='reject'",
+                  items["radiohead"]) == []
 
 
 def test_forgive_requires_rejected(web):
-    client, _, movie_rec, _ = web
+    client, _, movie_rec, *_ = web
     assert client.post(f"/api/recs/{movie_rec}/forgive").status_code == 409
     assert client.post(f"/api/recs/{movie_rec}/approve").status_code == 200
     assert client.post(f"/api/recs/{movie_rec}/forgive").status_code == 409
@@ -346,7 +355,7 @@ def test_run_now_touches_sentinel(web):
 
 
 def test_foreign_host_rejected(web):
-    client, cfg, movie_rec, _ = web
+    client, cfg, movie_rec, *_ = web
     assert client.get("/api/recs", headers={"Host": "evil.example.com"}).status_code == 403
     resp = client.post(f"/api/recs/{movie_rec}/approve",
                        headers={"Host": "attacker.rebind.net"})
@@ -356,18 +365,19 @@ def test_foreign_host_rejected(web):
 
 
 def test_cross_origin_post_rejected(web):
-    client, cfg, movie_rec, _ = web
+    client, cfg, movie_rec, _, items = web
     resp = client.post(f"/api/recs/{movie_rec}/approve",
                        headers={"Origin": "https://evil.example.com"})
     assert resp.status_code == 403
     (row,) = _fetch(cfg, "SELECT status FROM recommendations WHERE id=?", movie_rec)
     assert row["status"] == "proposed"
-    events = _fetch(cfg, "SELECT 1 FROM events WHERE item_id=? AND kind='approve'", MATRIX)
+    events = _fetch(cfg, "SELECT 1 FROM events WHERE item_id=? AND kind='approve'",
+                    items["matrix"])
     assert events == []
 
 
 def test_no_origin_and_allowlisted_origin_posts_allowed(web):
-    client, _, movie_rec, artist_rec = web
+    client, _, movie_rec, artist_rec, _ = web
     # CLI clients and same-origin navigations send no Origin header.
     assert client.post(f"/api/recs/{artist_rec}/reject").status_code == 200
     # Same-origin fetch from the served UI carries an allowlisted Origin.
@@ -392,16 +402,16 @@ def _profiles_cfg(tmp_path, **web_extra):
 def multi(tmp_path):
     cfg = _profiles_cfg(tmp_path)
     conn = db.connect(cfg.db_path)
-    db.upsert_item(conn, MATRIX, "movie", "The Matrix", 1999, {"tmdb": 603}, {})
-    db.upsert_item(conn, BLADE, "movie", "Blade Runner", 1982, {"tmdb": 78}, {})
+    matrix = db.resolve_item(conn, "movie", "tmdb", "603", title="The Matrix", year=1999)
+    blade = db.resolve_item(conn, "movie", "tmdb", "78", title="Blade Runner", year=1982)
     # Same-item recs under two profiles are legal: the open-rec unique
     # index is (profile, item_id) — each person gets their own verdict.
     alice_rec = conn.execute(
         "INSERT INTO recommendations (profile, run_id, ts, domain, item_id, score, why)"
-        " VALUES ('alice','r1',?,?,?,?,?)", (db.now(), "movie", MATRIX, 0.9, "{}")).lastrowid
+        " VALUES ('alice','r1',?,?,?,?,?)", (db.now(), "movie", matrix, 0.9, "{}")).lastrowid
     bob_rec = conn.execute(
         "INSERT INTO recommendations (profile, run_id, ts, domain, item_id, score, why)"
-        " VALUES ('bob','r1',?,?,?,?,?)", (db.now(), "movie", BLADE, 0.8, "{}")).lastrowid
+        " VALUES ('bob','r1',?,?,?,?,?)", (db.now(), "movie", blade, 0.8, "{}")).lastrowid
     conn.commit()
     conn.close()
     return TestClient(create_app(cfg)), cfg, alice_rec, bob_rec
@@ -646,7 +656,6 @@ def test_web_process_has_no_scheduler(tmp_path):
     # one process, one job: the web app must never own scheduling
     import gustarr.web.app as app_mod
     assert not hasattr(app_mod, "scheduler")
-
 
 
 def test_configured_allowed_hosts_honored(tmp_path):

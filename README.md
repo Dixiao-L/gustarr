@@ -79,7 +79,7 @@ sync arr ─────────┘                                       �
 | stage        | what it does                                                            |
 |--------------|-------------------------------------------------------------------------|
 | `sync *`     | idempotent, incremental signal collection (history, loves, library)     |
-| `enrich`     | TMDb / MusicBrainz metadata; upgrades name-keyed ids to canonical       |
+| `enrich`     | TMDb / MusicBrainz metadata; attaches authoritative ids to name-only items |
 | `candidates` | TMDb similar+discover, Last.fm similar, ListenBrainz CF, serendipity    |
 | `embed`      | multilingual sentence embeddings of item metadata (GPU or CPU, fp16)    |
 | `train`      | per-domain logistic preference head over embeddings (numpy, ms)         |
@@ -151,8 +151,9 @@ $ uv run gustarr web             # or approve in the browser at 127.0.0.1:8790
 One more command worth knowing: `gustarr dedupe` merges items that are the
 same thing under different spellings — the same CJK artist arriving
 romanized from one source and in kana/kanji from another otherwise splits
-one person's history across duplicate items. It re-normalizes name-keyed
-ids and folds MusicBrainz alias spellings into the canonical artist; add
+one person's history across duplicate items. It re-normalizes name
+identities and folds MusicBrainz alias spellings into the artist that owns
+the MBID; add
 `--fetch` to pull missing alias lists from MusicBrainz (rate-limited,
 capped by `--limit`). Not a pipeline stage — run it once after upgrading
 Gustarr or after importing history from a new source; every pass is

@@ -3,6 +3,9 @@
 Each scrobble/loved lands on BOTH the track item and its artist item —
 they are separate domains, so artist events drive artist recommendations
 while track events stay available for album/track granularity later.
+Rows resolve through db.resolve_item: mbid when Last.fm supplies one,
+the spelling otherwise, so re-syncs and spelling variants converge on
+one item instead of minting twins.
 """
 
 from __future__ import annotations
@@ -13,7 +16,7 @@ from typing import Any, Iterator
 
 import httpx
 
-from .. import db, ids
+from .. import db
 from ..http import get_json
 from ..signals import WEIGHTS
 
@@ -56,53 +59,44 @@ def _walk(
         page += 1
 
 
-def _merge_name_twin(conn: sqlite3.Connection, artist_name: str, mbid_id: str) -> None:
-    """Fold a previously minted artist:lastfm:<name> item into the mbid
-    item the moment Last.fm itself pairs the name with an mbid — its own
-    assertion beats enrich's fuzzy MusicBrainz name search."""
-    try:
-        fallback_id = ids.make("artist", "lastfm", artist_name)
-    except ValueError:
-        return
-    if fallback_id != mbid_id and conn.execute(
-            "SELECT 1 FROM items WHERE id=?", (fallback_id,)).fetchone():
-        db.merge_item(conn, fallback_id, mbid_id)
+def _resolve_pair(conn: sqlite3.Connection, t: dict) -> tuple[int, int]:
+    """Resolve one API row to its (track, artist) item ids, post-merge.
 
-
-def _upsert_pair(conn: sqlite3.Connection, t: dict) -> tuple[str, str]:
-    """Mint/refresh artist + track items for one API row; returns their
-    effective ids (merge-resolved, so never a merged-away fallback).
-
-    Raises ValueError (from ids.make) when the row has no usable names/mbids.
+    Raises ValueError when the row carries no usable names/mbids.
     """
     artist = t.get("artist") or {}
     # extended=1 gives {"name": ...}; unextended fallback is {"#text": ...}
-    artist_name = artist.get("name") or artist.get("#text") or ""
+    artist_name = (artist.get("name") or artist.get("#text") or "").strip()
     artist_mbid = artist.get("mbid") or ""
     if artist_mbid:
-        artist_id = ids.make("artist", "mbid", artist_mbid)
+        artist_id = db.resolve_item(conn, "artist", "mbid", artist_mbid,
+                                    title=artist_name or None)
+        if artist_name:
+            # Last.fm pairing the name with an mbid folds any name-minted
+            # twin into the mbid item — its own assertion beats enrich's
+            # fuzzy MusicBrainz name search; continue with the survivor.
+            artist_id = db.attach_identity(conn, artist_id, "name", artist_name)
+    elif artist_name:
+        artist_id = db.resolve_item(conn, "artist", "name", artist_name, title=artist_name)
     else:
-        artist_id = ids.make("artist", "lastfm", artist_name)
-    db.upsert_item(conn, artist_id, "artist", title=artist_name,
-                   ids={"mbid": artist_mbid} if artist_mbid else None)
-    if artist_mbid:
-        _merge_name_twin(conn, artist_name, artist_id)
-    # follow-up writes must land on the live row, not a merged fallback
-    artist_id = db.canonical_id(conn, artist_id)
+        raise ValueError("row has no artist mbid or name")
 
-    track_name = t.get("name") or ""
+    track_name = (t.get("name") or "").strip()
     track_mbid = t.get("mbid") or ""
-    if track_mbid:
-        track_id = ids.make("track", "mbid", track_mbid)
-    else:
-        track_id = ids.make("track", "lastfm", artist_name, track_name)
     meta: dict[str, Any] = {"artist": artist_name, "artist_id": artist_id}
     album_name = (t.get("album") or {}).get("#text") or ""
     if album_name:  # never merge an empty album over a known one
         meta["album"] = album_name
-    db.upsert_item(conn, track_id, "track", title=track_name,
-                   ids={"mbid": track_mbid} if track_mbid else None, meta=meta)
-    return db.canonical_id(conn, track_id), artist_id
+    if track_mbid:
+        track_id = db.resolve_item(conn, "track", "mbid", track_mbid,
+                                   title=track_name or None, meta=meta)
+    elif artist_name and track_name:
+        # the artist name disambiguates covers; normalize_key folds spacing
+        track_id = db.resolve_item(conn, "track", "name", f"{artist_name} {track_name}",
+                                   title=track_name, meta=meta)
+    else:
+        raise ValueError("row has no track mbid or name")
+    return track_id, artist_id
 
 
 def sync(
@@ -138,7 +132,7 @@ def _sync_profile(
     stats: dict[str, Any],
 ) -> None:
     """One profile's walk: its own uts cursor, events under its profile."""
-    seen_items: set[str] = set()
+    seen_items: set[int] = set()
     base = {"api_key": api_key, "user": user, "format": "json", "limit": PAGE_LIMIT}
 
     cursor = None if full else db.pget_state(conn, profile, CURSOR_KEY)
@@ -154,17 +148,17 @@ def _sync_profile(
         if not uts:
             continue
         try:
-            track_id, artist_id = _upsert_pair(conn, t)
+            track_id, artist_id = _resolve_pair(conn, t)
         except ValueError:
             continue
         ts = _iso(uts)
         if db.add_event(conn, ts, track_id, "scrobble", WEIGHTS["scrobble"], "lastfm",
                         profile=profile):
             stats["scrobbles"] += 1
-        # dedup=track_id: two different tracks scrobbled the same second
+        # dedup=track id: two different tracks scrobbled the same second
         # must both count on the artist item; re-syncs still collide.
         db.add_event(conn, ts, artist_id, "scrobble", WEIGHTS["scrobble"], "lastfm",
-                     dedup=track_id, profile=profile)
+                     dedup=str(track_id), profile=profile)
         seen_items.update((track_id, artist_id))
         max_uts = max(max_uts, uts)
 
@@ -173,7 +167,7 @@ def _sync_profile(
         if not uts:
             continue
         try:
-            track_id, artist_id = _upsert_pair(conn, t)
+            track_id, artist_id = _resolve_pair(conn, t)
         except ValueError:
             continue
         ts = _iso(uts)
@@ -181,7 +175,7 @@ def _sync_profile(
                         profile=profile):
             stats["loved"] += 1
         db.add_event(conn, ts, artist_id, "loved", WEIGHTS["loved"], "lastfm",
-                     dedup=track_id, profile=profile)
+                     dedup=str(track_id), profile=profile)
         seen_items.update((track_id, artist_id))
 
     if max_uts:

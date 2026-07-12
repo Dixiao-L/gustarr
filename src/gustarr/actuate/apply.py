@@ -20,7 +20,21 @@ from .. import db, http, settings
 from ..config import Config
 from . import jellyfin_collections
 from .arr_client import ArrConfigError, ArrError, LidarrClient, RadarrClient, SonarrClient
-from .jellyfin_collections import external_id
+
+
+def _ext_id(conn: sqlite3.Connection, item_id: int, ns: str) -> str | None:
+    """The external id actuation addresses an arr with, straight from the
+    item's identities — the only place external names live in v3."""
+    return db.identities_of(conn, item_id).get(ns)
+
+
+def _music_mbid(conn: sqlite3.Connection, row: sqlite3.Row) -> str | None:
+    """Albums prefer the release-group mbid enrich stashed in meta —
+    Lidarr's album lookup keys on release groups, while the identities
+    mbid may be any MB id a collector first saw. Artists (and albums
+    enrich hasn't reached) fall back to the identities mbid."""
+    rg = json.loads(row["meta"] or "{}").get("release_group_mbid")
+    return str(rg) if rg else _ext_id(conn, row["item_id"], "mbid")
 
 
 def _iso(dt: datetime) -> str:
@@ -147,7 +161,7 @@ def _apply_music_domain(
     # property, not a per-person allowance.
     auto = settings.get(conn, cfg, "music_mode") == "auto"
     rows = conn.execute(
-        "SELECT r.id, r.item_id, r.profile, r.status, r.why, i.title, i.ids"
+        "SELECT r.id, r.item_id, r.profile, r.status, r.why, i.title, i.meta"
         " FROM recommendations r JOIN items i ON i.id = r.item_id"
         " WHERE r.domain=? AND r.status IN ('approved','proposed')"
         " ORDER BY r.status='approved' DESC, r.score DESC", (domain,)).fetchall()
@@ -158,7 +172,7 @@ def _apply_music_domain(
         approved = row["status"] == "approved"
         if not approved and (not auto or auto_picked >= budget):
             continue
-        mbid = external_id(row, "mbid")
+        mbid = _music_mbid(conn, row)
         if mbid is None:
             # an approved rec we cannot address fails loudly instead
             # of being stranded forever; a proposed one is just skipped.
@@ -204,7 +218,7 @@ def _apply_video(
     # mode's per-run cap bounds writes to the shared arrs, so the top
     # proposals of every profile compete for it on score.
     sql = (
-        "SELECT r.id, r.item_id, r.profile, r.domain, r.status, r.why, i.title, i.ids"
+        "SELECT r.id, r.item_id, r.profile, r.domain, r.status, r.why, i.title"
         " FROM recommendations r JOIN items i ON i.id = r.item_id"
         " WHERE r.status=? AND r.domain IN ('movie','series') ORDER BY r.score DESC")
     rows = conn.execute(sql, ("approved",)).fetchall()
@@ -217,7 +231,8 @@ def _apply_video(
         for row in conn.execute(sql, ("proposed",)):
             if cap <= 0:
                 break
-            if external_id(row, "tmdb" if row["domain"] == "movie" else "tvdb") is not None:
+            ns = "tmdb" if row["domain"] == "movie" else "tvdb"
+            if _ext_id(conn, row["item_id"], ns) is not None:
                 rows.append(row)
                 cap -= 1
     if not rows:
@@ -236,7 +251,7 @@ def _apply_video(
             stats["errors"].append(f"{title}: ready but {arr_name} is not configured")
             continue
         ns_key = "tmdb" if domain == "movie" else "tvdb"
-        ext = external_id(row, ns_key)
+        ext = _ext_id(conn, row["item_id"], ns_key)
         if ext is None:
             stats["errors"].append(f"{title}: no {ns_key} id, cannot add to {arr_name}")
             _mark(conn, row["id"], "failed", ts)

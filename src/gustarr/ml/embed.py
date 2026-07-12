@@ -83,7 +83,7 @@ def run(conn: sqlite3.Connection, cfg: Config) -> dict[str, int]:
         (model_name,),
     ).fetchall()
 
-    ids: list[str] = []
+    ids: list[int] = []
     docs: list[str] = []
     skipped = 0
     for row in rows:

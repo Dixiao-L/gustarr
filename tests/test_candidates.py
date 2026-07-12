@@ -1,4 +1,9 @@
-"""Offline tests for candidates.run: seeding, fan-out, exclusions, caps."""
+"""Offline tests for candidates.run: seeding, fan-out, exclusions, caps.
+
+Identity v3: fixtures mint items through db.resolve_item and tests find
+them back through db.lookup_item — candidate/exclusion plumbing is all
+plain integer item ids now.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from gustarr import config as C
-from gustarr import db, http, ids
+from gustarr import db, http
 from gustarr.candidates import SNOOZE_DAYS, _excluded_ids, _tmdb_result, run
 
 TMDB = "https://api.themoviedb.org/3"
@@ -66,10 +71,16 @@ def router(monkeypatch):
     return r
 
 
+def item(conn, domain, ns, key):
+    """Int id of an item the test expects to exist under this identity."""
+    iid = db.lookup_item(conn, domain, ns, key)
+    assert iid is not None, f"no item for {domain}:{ns}:{key}"
+    return iid
+
+
 def seed_movie(conn, tmdb_id, title, genres=None, ts=None, year=None, profile="default"):
-    item_id = ids.make("movie", "tmdb", str(tmdb_id))
-    db.upsert_item(conn, item_id, "movie", title=title, year=year, ids={"tmdb": tmdb_id},
-                   meta={"genres": genres} if genres else None)
+    item_id = db.resolve_item(conn, "movie", "tmdb", str(tmdb_id), title=title, year=year,
+                              meta={"genres": genres} if genres else None)
     db.add_event(conn, ts or iso(1), item_id, "complete", 0.8, "jellyfin", profile=profile)
     return item_id
 
@@ -88,8 +99,7 @@ def test_movie_similar_discover_and_exclusions(conn, cfg, router):
     seed = seed_movie(conn, 603, "The Matrix", genres=["Science Fiction", "Action"])
     excluded = {}
     for tmdb_id, reason in ((100, "library"), (101, "reject"), (102, "open_rec")):
-        iid = ids.make("movie", "tmdb", str(tmdb_id))
-        db.upsert_item(conn, iid, "movie", title=f"M{tmdb_id}")
+        iid = db.resolve_item(conn, "movie", "tmdb", str(tmdb_id), title=f"M{tmdb_id}")
         excluded[reason] = iid
         if reason == "library":
             conn.execute("INSERT INTO library (item_id, arr) VALUES (?, 'radarr')", (iid,))
@@ -116,18 +126,18 @@ def test_movie_similar_discover_and_exclusions(conn, cfg, router):
     stats = run(conn, cfg, domain="movie")
 
     rows = candidate_rows(conn)
-    m200 = ids.make("movie", "tmdb", "200")
+    m200 = item(conn, "movie", "tmdb", "200")
     assert rows[(m200, "tmdb_similar")]["external_score"] == 8.0  # max of 7.5 and 8.0
     assert rows[(m200, "tmdb_similar")]["seed_item_id"] == seed
-    assert (ids.make("movie", "tmdb", "201"), "tmdb_similar") in rows
-    disc = rows[(ids.make("movie", "tmdb", "300"), "tmdb_discover")]
+    assert (item(conn, "movie", "tmdb", "201"), "tmdb_similar") in rows
+    disc = rows[(item(conn, "movie", "tmdb", "300"), "tmdb_discover")]
     assert disc["seed_item_id"] is None
     for iid in excluded.values():
         assert not any(k[0] == iid for k in rows)
 
-    item = conn.execute("SELECT * FROM items WHERE id=?", (m200,)).fetchone()
-    assert item["title"] == "M200" and item["year"] == 2021
-    meta = json.loads(item["meta"])
+    row = conn.execute("SELECT * FROM items WHERE id=?", (m200,)).fetchone()
+    assert row["title"] == "M200" and row["year"] == 2021
+    meta = json.loads(row["meta"])
     assert meta["popularity"] == 12.3
     assert meta["overview"] == "about 200"
     assert meta["poster_path"] == "/p200.jpg"
@@ -168,7 +178,7 @@ def test_rerun_idempotent_score_max_and_genre_cache(conn, cfg, router):
     router.route("/discover/movie", discover)
 
     run(conn, cfg, domain="movie")
-    m200 = ids.make("movie", "tmdb", "200")
+    m200 = item(conn, "movie", "tmdb", "200")
     first = conn.execute(
         "SELECT * FROM candidates WHERE item_id=? AND source='tmdb_similar'", (m200,)).fetchone()
 
@@ -184,6 +194,9 @@ def test_rerun_idempotent_score_max_and_genre_cache(conn, cfg, router):
     assert again["external_score"] == 7.0
     assert stats["new"] == {}
     assert stats["updated"] == {"tmdb_similar": 1, "tmdb_discover": 1}
+    # re-resolving tmdb id 200 must land on the same item row, not mint one
+    assert conn.execute(
+        "SELECT count(*) c FROM items WHERE domain='movie'").fetchone()["c"] == 3
 
     genre_calls = [u for u, _ in router.calls if "/genre/movie/list" in u]
     assert len(genre_calls) == 1  # second run served from state cache
@@ -204,18 +217,17 @@ def test_cap_200_new_rows_per_source(conn, cfg, router):
     assert n == 200
     assert stats["new"] == {"tmdb_similar": 200}
     assert stats["capped"] == ["tmdb_similar"]
+    # capped results must not mint items rank will never see (seed + 200)
+    assert conn.execute("SELECT count(*) c FROM items").fetchone()["c"] == 201
 
 
 def test_artist_lastfm_similar(conn, cfg, router):
     mb = "5b11f4ce-a62d-471e-81fc-a69a8278c7da"
-    seed_mb = ids.make("artist", "mbid", mb)
-    db.upsert_item(conn, seed_mb, "artist", title="Nirvana", ids={"mbid": mb})
+    seed_mb = db.resolve_item(conn, "artist", "mbid", mb, title="Nirvana")
     db.add_event(conn, iso(1), seed_mb, "loved", 1.0, "lastfm")
-    seed_name = ids.make("artist", "lastfm", "Radiohead")
-    db.upsert_item(conn, seed_name, "artist", title="Radiohead")
+    seed_name = db.resolve_item(conn, "artist", "name", "Radiohead", title="Radiohead")
     db.add_event(conn, iso(2), seed_name, "loved", 1.0, "lastfm")
-    rejected = ids.make("artist", "lastfm", "Nickelback")
-    db.upsert_item(conn, rejected, "artist", title="Nickelback")
+    rejected = db.resolve_item(conn, "artist", "name", "Nickelback", title="Nickelback")
     db.add_event(conn, iso(3), rejected, "reject", -1.0, "user")
 
     def similar(params):
@@ -235,15 +247,15 @@ def test_artist_lastfm_similar(conn, cfg, router):
     stats = run(conn, cfg, domain="artist")
 
     rows = candidate_rows(conn)
-    hole = rows[(ids.make("artist", "mbid", "abc-123"), "lastfm_similar")]
+    hole_id = item(conn, "artist", "mbid", "abc-123")
+    hole = rows[(hole_id, "lastfm_similar")]
     assert hole["external_score"] == pytest.approx(0.87)
     assert hole["seed_item_id"] == seed_mb
-    assert (ids.make("artist", "lastfm", "Bush"), "lastfm_similar") in rows
-    assert (ids.make("artist", "lastfm", "Thom Yorke"), "lastfm_similar") in rows
+    assert (item(conn, "artist", "name", "Bush"), "lastfm_similar") in rows
+    assert (item(conn, "artist", "name", "Thom Yorke"), "lastfm_similar") in rows
     assert not any(k[0] == rejected for k in rows)
-    assert conn.execute(
-        "SELECT ids FROM items WHERE id=?",
-        (ids.make("artist", "mbid", "abc-123"),)).fetchone()["ids"] == '{"mbid": "abc-123"}'
+    # the mbid entry also taught the item its name spelling (normalized)
+    assert db.identities_of(conn, hole_id) == {"mbid": "abc-123", "name": "hole"}
     assert stats["seeds"]["artist"] == 2
     assert stats["skipped"] == 1
 
@@ -253,23 +265,23 @@ def test_tmdb_result_truncates_overview_and_skips_missing_art():
                                   "overview": "x" * 400, "poster_path": "/p42.jpg",
                                   "vote_average": 7.0})
     assert full is not None
-    meta = full[4]
+    key, _title, _year, meta, _score = full
+    assert key == "42"
     assert meta["overview"] == "x" * 300  # capped so items.meta stays lean
     assert meta["poster_path"] == "/p42.jpg"
 
     bare = _tmdb_result("movie", {"id": 43, "title": "M43", "poster_path": None})
     assert bare is not None
-    assert "poster_path" not in bare[4] and "overview" not in bare[4]
+    assert "poster_path" not in bare[3] and "overview" not in bare[3]
 
 
 def test_series_seeds_resolve_tmdb_id(conn, cfg, router):
-    s1 = ids.make("series", "tvdb", "81189")
-    db.upsert_item(conn, s1, "series", title="Breaking Bad",
-                   ids={"tvdb": 81189, "tmdb": 1396}, meta={"genres": ["Drama"]})
+    s1 = db.resolve_item(conn, "series", "tvdb", "81189", title="Breaking Bad",
+                         meta={"genres": ["Drama"]})
+    db.attach_identity(conn, s1, "tmdb", "1396")
     db.add_event(conn, iso(1), s1, "complete", 0.8, "jellyfin")
-    # positive but no tmdb id anywhere: must be skipped, not fetched
-    s2 = ids.make("series", "tvdb", "999")
-    db.upsert_item(conn, s2, "series", title="No Tmdb", ids={"tvdb": 999})
+    # positive but no tmdb identity anywhere: must be skipped, not fetched
+    s2 = db.resolve_item(conn, "series", "tvdb", "999", title="No Tmdb")
     db.add_event(conn, iso(1), s2, "complete", 0.8, "jellyfin")
 
     router.route("/tv/1396/recommendations", {"results": [
@@ -290,12 +302,12 @@ def test_series_seeds_resolve_tmdb_id(conn, cfg, router):
 
     assert stats["seeds"]["series"] == 1
     rows = candidate_rows(conn)
-    bcs = ids.make("series", "tmdb", "60059")
+    bcs = item(conn, "series", "tmdb", "60059")
     assert rows[(bcs, "tmdb_similar")]["seed_item_id"] == s1
-    assert (ids.make("series", "tmdb", "1399"), "tmdb_discover") in rows
-    item = conn.execute("SELECT * FROM items WHERE id=?", (bcs,)).fetchone()
-    assert item["title"] == "Better Call Saul" and item["year"] == 2015
-    meta = json.loads(item["meta"])
+    assert (item(conn, "series", "tmdb", "1399"), "tmdb_discover") in rows
+    row = conn.execute("SELECT * FROM items WHERE id=?", (bcs,)).fetchone()
+    assert row["title"] == "Better Call Saul" and row["year"] == 2015
+    meta = json.loads(row["meta"])
     assert meta["poster_path"] == "/bcs.jpg" and meta["overview"] == "spinoff"
     assert not any("/tv/999" in u for u, _ in router.calls)
     # tv decade probe uses first_air_date; no positive years -> tie
@@ -315,8 +327,7 @@ def test_seed_threshold_and_top25_limit(conn, cfg, router):
         seed_movie(conn, 1000 + i, f"R{i}", ts=iso(1))
     for i in range(5):
         seed_movie(conn, 2000 + i, f"O{i}", ts=iso(400))
-    neg = ids.make("movie", "tmdb", "3000")
-    db.upsert_item(conn, neg, "movie", title="Skipped")
+    neg = db.resolve_item(conn, "movie", "tmdb", "3000", title="Skipped")
     db.add_event(conn, iso(1), neg, "skip", -0.1, "jellyfin")
 
     empty = {"results": []}
@@ -344,8 +355,7 @@ def test_failed_rec_never_reenters_pool(conn, cfg, router):
     # 'failed' is terminal (un-actuatable add): re-proposing would just
     # re-fail in apply, so the item must be blocked at insert time.
     seed_movie(conn, 603, "The Matrix")
-    failed = ids.make("movie", "tmdb", "700")
-    db.upsert_item(conn, failed, "movie", title="M700")
+    failed = db.resolve_item(conn, "movie", "tmdb", "700", title="M700")
     conn.execute(
         "INSERT INTO recommendations (run_id, ts, domain, item_id, score, status)"
         " VALUES ('r1', ?, 'movie', ?, 0.5, 'failed')", (iso(2), failed))
@@ -360,19 +370,18 @@ def test_failed_rec_never_reenters_pool(conn, cfg, router):
     assert stats["skipped"] == 1
 
 
-def add_snoozed_rec(conn, item_id, days_ago):
-    db.upsert_item(conn, item_id, "movie", title=item_id)
+def add_snoozed_rec(conn, tmdb_id, days_ago):
+    iid = db.resolve_item(conn, "movie", "tmdb", str(tmdb_id), title=f"M{tmdb_id}")
     conn.execute(
         "INSERT INTO recommendations (run_id, ts, domain, item_id, score, status, acted_at)"
         " VALUES ('r1', ?, 'movie', ?, 0.5, 'snoozed', ?)",
-        (iso(days_ago), item_id, iso(days_ago)))
+        (iso(days_ago), iid, iso(days_ago)))
+    return iid
 
 
 def test_excluded_ids_snooze_window(conn):
-    active = ids.make("movie", "tmdb", "800")
-    add_snoozed_rec(conn, active, days_ago=SNOOZE_DAYS - 1)
-    lapsed = ids.make("movie", "tmdb", "801")
-    add_snoozed_rec(conn, lapsed, days_ago=SNOOZE_DAYS + 1)
+    active = add_snoozed_rec(conn, 800, days_ago=SNOOZE_DAYS - 1)
+    lapsed = add_snoozed_rec(conn, 801, days_ago=SNOOZE_DAYS + 1)
 
     excluded = _excluded_ids(conn, "default")
 
@@ -382,10 +391,8 @@ def test_excluded_ids_snooze_window(conn):
 
 def test_snoozed_item_blocked_only_while_active(conn, cfg, router):
     seed_movie(conn, 603, "The Matrix")
-    active = ids.make("movie", "tmdb", "800")
-    add_snoozed_rec(conn, active, days_ago=2)
-    lapsed = ids.make("movie", "tmdb", "801")
-    add_snoozed_rec(conn, lapsed, days_ago=SNOOZE_DAYS + 1)
+    active = add_snoozed_rec(conn, 800, days_ago=2)
+    lapsed = add_snoozed_rec(conn, 801, days_ago=SNOOZE_DAYS + 1)
     router.route("/movie/603/recommendations", {"results": [
         movie_result(800), movie_result(801)]})
     router.route("/movie/603/similar", {"results": []})
@@ -400,20 +407,20 @@ def test_snoozed_item_blocked_only_while_active(conn, cfg, router):
     assert stats["skipped"] == 1
 
 
-def test_excluded_ids_cover_alternate_namespaces(conn):
-    owned = ids.make("series", "tvdb", "81189")
-    db.upsert_item(conn, owned, "series", title="Breaking Bad",
-                   ids={"tvdb": 81189, "tmdb": 1396})
+def test_excluded_ids_plain_ints_and_profile_scope(conn):
+    owned = db.resolve_item(conn, "series", "tvdb", "81189", title="Breaking Bad")
+    db.attach_identity(conn, owned, "tmdb", "1396")
     conn.execute("INSERT INTO library (item_id, arr) VALUES (?, 'sonarr')", (owned,))
-    rejected = ids.make("movie", "tmdb", "603")
-    db.upsert_item(conn, rejected, "movie", title="The Matrix",
-                   ids={"tmdb": 603, "imdb": "tt0133093"})
+    rejected = db.resolve_item(conn, "movie", "tmdb", "603", title="The Matrix")
     db.add_event(conn, iso(1), rejected, "reject", -1.0, "user")
 
     excluded = _excluded_ids(conn, "default")
 
-    assert {owned, ids.make("series", "tmdb", "1396"),
-            rejected, ids.make("movie", "imdb", "tt0133093")} <= excluded
+    # identity resolution keeps one item per entity, so the int block
+    # list needs no alternate-namespace synthesis: every spelling of the
+    # owned series resolves to the same excluded id
+    assert {owned, rejected} <= excluded
+    assert db.lookup_item(conn, "series", "tmdb", "1396") == owned
     # library rows block every profile; the reject only blocks its own
     assert owned in _excluded_ids(conn, "other")
     assert rejected not in _excluded_ids(conn, "other")
@@ -422,12 +429,11 @@ def test_excluded_ids_cover_alternate_namespaces(conn):
 def test_owned_series_excluded_across_namespaces(conn, cfg, router):
     # Sonarr keys series by tvdb; TMDb mints tmdb ids — an owned show must
     # not slip back into the pool under the other namespace.
-    seed = ids.make("series", "tvdb", "1")
-    db.upsert_item(conn, seed, "series", title="Seed", ids={"tvdb": 1, "tmdb": 500})
+    seed = db.resolve_item(conn, "series", "tvdb", "1", title="Seed")
+    db.attach_identity(conn, seed, "tmdb", "500")
     db.add_event(conn, iso(1), seed, "complete", 0.8, "jellyfin")
-    owned = ids.make("series", "tvdb", "81189")
-    db.upsert_item(conn, owned, "series", title="Breaking Bad",
-                   ids={"tvdb": 81189, "tmdb": 1396})
+    owned = db.resolve_item(conn, "series", "tvdb", "81189", title="Breaking Bad")
+    db.attach_identity(conn, owned, "tmdb", "1396")
     conn.execute("INSERT INTO library (item_id, arr) VALUES (?, 'sonarr')", (owned,))
     router.route("/tv/500/recommendations", {"results": [
         {"id": 1396, "name": "Breaking Bad", "first_air_date": "2008-01-20",
@@ -441,68 +447,65 @@ def test_owned_series_excluded_across_namespaces(conn, cfg, router):
     stats = run(conn, cfg, domain="series")
 
     rows = candidate_rows(conn)
-    assert (ids.make("series", "tmdb", "60059"), "tmdb_similar") in rows
-    assert not any(k[0] == ids.make("series", "tmdb", "1396") for k in rows)
+    assert (item(conn, "series", "tmdb", "60059"), "tmdb_similar") in rows
+    assert not any(k[0] == owned for k in rows)
     assert stats["skipped"] == 1
 
 
 def test_lastfm_mbid_merges_name_keyed_twin(conn, cfg, router):
     mb = "5b11f4ce-a62d-471e-81fc-a69a8278c7da"
-    seed = ids.make("artist", "mbid", mb)
-    db.upsert_item(conn, seed, "artist", title="Nirvana", ids={"mbid": mb})
+    seed = db.resolve_item(conn, "artist", "mbid", mb, title="Nirvana")
     db.add_event(conn, iso(1), seed, "loved", 1.0, "lastfm")
     # scrobbles minted a name-keyed twin before any mbid was known
-    twin = ids.make("artist", "lastfm", "Hole")
-    db.upsert_item(conn, twin, "artist", title="Hole")
+    twin = db.resolve_item(conn, "artist", "name", "Hole", title="Hole")
     db.add_event(conn, iso(2), twin, "scrobble", 0.3, "lastfm")
 
     router.route("lastfm:artist.getsimilar", {"similarartists": {"artist": [
         {"name": "Hole", "mbid": "abc-123", "match": "0.87"}]}})
     run(conn, cfg, domain="artist")
 
-    canon = ids.make("artist", "mbid", "abc-123")
+    winner = item(conn, "artist", "mbid", "abc-123")
+    # the twin merged into the mbid holder: its row is gone, both
+    # identities and its history now point at the winner
+    assert winner != twin
     assert conn.execute("SELECT 1 FROM items WHERE id=?", (twin,)).fetchone() is None
-    assert db.canonical_id(conn, twin) == canon
+    assert db.lookup_item(conn, "artist", "name", "Hole") == winner
     ev = conn.execute("SELECT item_id FROM events WHERE kind='scrobble'").fetchone()
-    assert ev["item_id"] == canon
+    assert ev["item_id"] == winner
     rows = candidate_rows(conn)
-    assert (canon, "lastfm_similar") in rows
+    assert (winner, "lastfm_similar") in rows
     assert not any(k[0] == twin for k in rows)
 
 
-def test_candidate_insert_follows_alias(conn, cfg, router):
+def test_name_keyed_entry_lands_on_existing_item(conn, cfg, router):
     mb = "5b11f4ce-a62d-471e-81fc-a69a8278c7da"
-    seed = ids.make("artist", "mbid", mb)
-    db.upsert_item(conn, seed, "artist", title="Nirvana", ids={"mbid": mb})
+    seed = db.resolve_item(conn, "artist", "mbid", mb, title="Nirvana")
     db.add_event(conn, iso(1), seed, "loved", 1.0, "lastfm")
-    # enrich previously merged the name-keyed item away; a similar-artist
-    # entry without mbid re-mints the fallback id, which must redirect to
-    # the canonical row instead of FK-failing on the candidates insert.
-    fallback = ids.make("artist", "lastfm", "Bush")
-    canon = ids.make("artist", "mbid", "xyz-1")
-    db.upsert_item(conn, fallback, "artist", title="Bush")
-    db.merge_item(conn, fallback, canon)
+    # enrich already taught the canonical item its name; a similar-artist
+    # entry without mbid (any spelling of it) must resolve to that row
+    # instead of minting a twin
+    canon = db.resolve_item(conn, "artist", "mbid", "xyz-1", title="Bush")
+    db.attach_identity(conn, canon, "name", "Bush")
 
     router.route("lastfm:artist.getsimilar", {"similarartists": {"artist": [
-        {"name": "Bush", "mbid": "", "match": "0.5"}]}})
+        {"name": "BUSH", "mbid": "", "match": "0.5"}]}})
     stats = run(conn, cfg, domain="artist")
 
     rows = candidate_rows(conn)
     assert (canon, "lastfm_similar") in rows
-    assert not any(k[0] == fallback for k in rows)
     assert stats["new"] == {"lastfm_similar": 1}
+    assert conn.execute(
+        "SELECT count(*) c FROM items WHERE domain='artist'").fetchone()["c"] == 2
 
 
 def test_rejected_artist_stays_excluded_when_mbid_appears(conn, cfg, router):
     mb = "5b11f4ce-a62d-471e-81fc-a69a8278c7da"
-    seed = ids.make("artist", "mbid", mb)
-    db.upsert_item(conn, seed, "artist", title="Nirvana", ids={"mbid": mb})
+    seed = db.resolve_item(conn, "artist", "mbid", mb, title="Nirvana")
     db.add_event(conn, iso(1), seed, "loved", 1.0, "lastfm")
-    rejected = ids.make("artist", "lastfm", "Nickelback")
-    db.upsert_item(conn, rejected, "artist", title="Nickelback")
+    rejected = db.resolve_item(conn, "artist", "name", "Nickelback", title="Nickelback")
     db.add_event(conn, iso(2), rejected, "reject", -1.0, "user")
 
-    # the reject lives on the name-keyed id; the freshly revealed mbid
+    # the reject lives on the name-keyed item; the freshly revealed mbid
     # must not smuggle the artist back into the pool post-merge
     router.route("lastfm:artist.getsimilar", {"similarartists": {"artist": [
         {"name": "Nickelback", "mbid": "nb-1", "match": "0.4"}]}})
@@ -510,10 +513,10 @@ def test_rejected_artist_stays_excluded_when_mbid_appears(conn, cfg, router):
 
     assert candidate_rows(conn) == {}
     assert stats["skipped"] == 1
-    canon = ids.make("artist", "mbid", "nb-1")
-    assert db.canonical_id(conn, rejected) == canon
+    winner = item(conn, "artist", "mbid", "nb-1")
+    assert db.lookup_item(conn, "artist", "name", "Nickelback") == winner
     ev = conn.execute("SELECT item_id FROM events WHERE kind='reject'").fetchone()
-    assert ev["item_id"] == canon
+    assert ev["item_id"] == winner
 
 
 # ── top albums ───────────────────────────────────────────────────────
@@ -521,11 +524,9 @@ def test_rejected_artist_stays_excluded_when_mbid_appears(conn, cfg, router):
 
 def seed_artist(conn, name, mb=None, ts=None):
     if mb:
-        iid = ids.make("artist", "mbid", mb)
-        db.upsert_item(conn, iid, "artist", title=name, ids={"mbid": mb})
+        iid = db.resolve_item(conn, "artist", "mbid", mb, title=name)
     else:
-        iid = ids.make("artist", "lastfm", name)
-        db.upsert_item(conn, iid, "artist", title=name)
+        iid = db.resolve_item(conn, "artist", "name", name, title=name)
     db.add_event(conn, ts or iso(1), iid, "loved", 1.0, "lastfm")
     return iid
 
@@ -541,8 +542,7 @@ def test_album_top_albums_fanout_rank_normalized(conn, cfg, router):
     seed1 = seed_artist(conn, "Nirvana", mb=mb1, ts=iso(1))
     seed2 = seed_artist(conn, "Radiohead", mb=mb2, ts=iso(2))
     seed_artist(conn, "Name Only", ts=iso(3))  # no mbid anywhere: never queried
-    owned = ids.make("album", "mbid", "alb-own")
-    db.upsert_item(conn, owned, "album", title="Owned")
+    owned = db.resolve_item(conn, "album", "mbid", "alb-own", title="Owned")
     conn.execute("INSERT INTO library (item_id, arr) VALUES (?, 'lidarr')", (owned,))
 
     def top_albums(params):
@@ -566,29 +566,33 @@ def test_album_top_albums_fanout_rank_normalized(conn, cfg, router):
     assert stats["seeds"]["album"] == 2
 
     rows = candidate_rows(conn)
-    top = rows[(ids.make("album", "mbid", "alb-1"), "lastfm_top_albums")]
+    alb1 = item(conn, "album", "mbid", "alb-1")
+    top = rows[(alb1, "lastfm_top_albums")]
     assert top["external_score"] == pytest.approx(1.0)  # playcount #1
     assert top["seed_item_id"] == seed1
     # rank includes the skipped mbid-less entry: In Utero is playcount #3
-    assert rows[(ids.make("album", "mbid", "alb-2"), "lastfm_top_albums")][
-        "external_score"] == pytest.approx(0.8)
-    third = rows[(ids.make("album", "mbid", "alb-3"), "lastfm_top_albums")]
+    alb2 = item(conn, "album", "mbid", "alb-2")
+    assert rows[(alb2, "lastfm_top_albums")]["external_score"] == pytest.approx(0.8)
+    third = rows[(item(conn, "album", "mbid", "alb-3"), "lastfm_top_albums")]
     assert third["external_score"] == pytest.approx(1.0)
     assert third["seed_item_id"] == seed2
     assert not any(k[0] == owned for k in rows)  # item exclusions apply unchanged
     albums = [k for k in rows if k[1] == "lastfm_top_albums"]
-    assert len(albums) == 3  # mbid-less entry never became an item
+    assert len(albums) == 3
 
-    item = conn.execute("SELECT * FROM items WHERE id=?",
-                        (ids.make("album", "mbid", "alb-1"),)).fetchone()
-    assert item["domain"] == "album" and item["title"] == "Nevermind"
-    assert json.loads(item["ids"]) == {"mbid": "alb-1", "artist_mbid": mb1}
-    meta = json.loads(item["meta"])
+    row = conn.execute("SELECT * FROM items WHERE id=?", (alb1,)).fetchone()
+    assert row["domain"] == "album" and row["title"] == "Nevermind"
+    # the album's own mbid is its identity; artist_mbid is a relation to
+    # another item, so it lives in meta only
+    assert db.identities_of(conn, alb1) == {"mbid": "alb-1"}
+    meta = json.loads(row["meta"])
     assert meta["artist"] == "Nirvana" and meta["artist_mbid"] == mb1
     # entry carried no artist mbid: the seed artist's fills in
-    in_utero = conn.execute("SELECT * FROM items WHERE id=?",
-                            (ids.make("album", "mbid", "alb-2"),)).fetchone()
-    assert json.loads(in_utero["ids"])["artist_mbid"] == mb1
+    in_utero = conn.execute("SELECT meta FROM items WHERE id=?", (alb2,)).fetchone()
+    assert json.loads(in_utero["meta"])["artist_mbid"] == mb1
+    # the mbid-less entry never became an item
+    assert conn.execute(
+        "SELECT count(*) c FROM items WHERE domain='album'").fetchone()["c"] == 4
 
     assert stats["new"] == {"lastfm_top_albums": 3}
     assert stats["skipped"] == 1
@@ -609,7 +613,7 @@ def test_album_cap_100_and_rank_floor(conn, cfg, router):
     assert stats["capped"] == ["lastfm_top_albums"]
     rows = candidate_rows(conn)
     # deep ranks clamp at the 0.3 floor instead of going negative
-    assert rows[(ids.make("album", "mbid", "alb-50"), "lastfm_top_albums")][
+    assert rows[(item(conn, "album", "mbid", "alb-50"), "lastfm_top_albums")][
         "external_score"] == pytest.approx(0.3)
 
 
@@ -625,7 +629,7 @@ def test_album_domain_in_default_run(conn, cfg, router):
     stats = run(conn, cfg)
 
     assert stats["new"] == {"lastfm_top_albums": 1}
-    assert (ids.make("album", "mbid", "alb-1"), "lastfm_top_albums") in candidate_rows(conn)
+    assert (item(conn, "album", "mbid", "alb-1"), "lastfm_top_albums") in candidate_rows(conn)
 
 
 # ── serendipity ──────────────────────────────────────────────────────
@@ -664,7 +668,7 @@ def test_serendipity_prefers_under_represented_genres(conn, cfg, router):
     assert [p["with_genres"] for p in probes] == ["18", "14", "27", "35"]
     assert all(p["vote_count.gte"] == 500 and p["page"] == 1 for p in seren)
     rows = candidate_rows(conn)
-    row = rows[(ids.make("movie", "tmdb", "900"), "serendipity_tmdb")]
+    row = rows[(item(conn, "movie", "tmdb", "900"), "serendipity_tmdb")]
     assert row["external_score"] == 8.2
     assert row["seed_item_id"] is None
     assert stats["new"]["serendipity_tmdb"] == 1
@@ -675,8 +679,7 @@ def test_serendipity_decade_probe_targets_least_seen_decade(conn, cfg, router):
     # one positive per decade except the 2010s -> probe the 2010s
     for i, year in enumerate((1965, 1975, 1985, 1995, 2005)):
         seed_movie(conn, 700 + i, f"D{i}", year=year)
-    owned = ids.make("movie", "tmdb", "902")
-    db.upsert_item(conn, owned, "movie", title="M902")
+    owned = db.resolve_item(conn, "movie", "tmdb", "902", title="M902")
     conn.execute("INSERT INTO library (item_id, arr) VALUES (?, 'radarr')", (owned,))
     empty = {"results": []}
     for i in range(5):
@@ -697,7 +700,8 @@ def test_serendipity_decade_probe_targets_least_seen_decade(conn, cfg, router):
     assert probes[0]["primary_release_date.lte"] == "2019-12-31"
     assert probes[0]["vote_count.gte"] == 500
     rows = candidate_rows(conn)
-    assert rows[(ids.make("movie", "tmdb", "901"), "serendipity_tmdb")]["external_score"] == 8.4
+    m901 = item(conn, "movie", "tmdb", "901")
+    assert rows[(m901, "serendipity_tmdb")]["external_score"] == 8.4
     assert not any(k[0] == owned for k in rows)  # exclusions apply unchanged
     assert stats["skipped"] == 1
     assert stats["serendipity"] == 1
@@ -705,8 +709,7 @@ def test_serendipity_decade_probe_targets_least_seen_decade(conn, cfg, router):
 
 def test_serendipity_skipped_without_positives(conn, cfg, router):
     # nothing positive yet: no taste baseline to diverge from
-    neg = ids.make("movie", "tmdb", "3000")
-    db.upsert_item(conn, neg, "movie", title="Skipped")
+    neg = db.resolve_item(conn, "movie", "tmdb", "3000", title="Skipped")
     db.add_event(conn, iso(1), neg, "skip", -0.1, "jellyfin")
 
     stats = run(conn, cfg, domain="movie")
@@ -741,9 +744,7 @@ def test_serendipity_cap_100_new_rows(conn, cfg, router):
 
 def test_serendipity_lastfm_two_hop_damped_and_deduped(conn, cfg, router):
     mb = "5b11f4ce-a62d-471e-81fc-a69a8278c7da"
-    seed = ids.make("artist", "mbid", mb)
-    db.upsert_item(conn, seed, "artist", title="Nirvana", ids={"mbid": mb})
-    db.add_event(conn, iso(1), seed, "loved", 1.0, "lastfm")
+    seed_artist(conn, "Nirvana", mb=mb)
 
     def similar(params):
         if params.get("mbid") == mb:
@@ -767,11 +768,11 @@ def test_serendipity_lastfm_two_hop_damped_and_deduped(conn, cfg, router):
     hop2 = [p for _, p in router.calls if p.get("limit") == 20]
     assert [p["mbid"] for p in hop2] == ["h-1", "m-1"]  # best hop-1 first
     rows = candidate_rows(conn)
-    babes = rows[(ids.make("artist", "mbid", "b-1"), "serendipity_lastfm")]
+    babes = rows[(item(conn, "artist", "mbid", "b-1"), "serendipity_lastfm")]
     assert babes["external_score"] == pytest.approx(0.48)  # 0.6 match damped by 0.8
-    assert babes["seed_item_id"] == ids.make("artist", "mbid", "h-1")
+    assert babes["seed_item_id"] == item(conn, "artist", "mbid", "h-1")
     # melvins is hop-1 reachable: bubble-adjacent, never serendipity
-    melvins = ids.make("artist", "mbid", "m-1")
+    melvins = item(conn, "artist", "mbid", "m-1")
     assert (melvins, "lastfm_similar") in rows
     assert (melvins, "serendipity_lastfm") not in rows
     assert stats["new"] == {"lastfm_similar": 2, "serendipity_lastfm": 1}
@@ -781,8 +782,7 @@ def test_serendipity_lastfm_two_hop_damped_and_deduped(conn, cfg, router):
 def test_serendipity_hop1_skips_library_seeds_and_caps_at_5(conn, cfg, router):
     # pre-existing hop-1 pool from earlier runs: 8 lastfm_similar rows
     def hop1(name, score):
-        iid = ids.make("artist", "lastfm", name)
-        db.upsert_item(conn, iid, "artist", title=name)
+        iid = db.resolve_item(conn, "artist", "name", name, title=name)
         conn.execute(
             "INSERT INTO candidates (item_id, source, external_score, first_seen, last_seen)"
             " VALUES (?, 'lastfm_similar', ?, ?, ?)", (iid, score, iso(3), iso(3)))
@@ -804,11 +804,9 @@ def test_serendipity_hop1_skips_library_seeds_and_caps_at_5(conn, cfg, router):
 
 def test_serendipity_honors_domain_filter(conn, cfg, router):
     seed_movie(conn, 603, "The Matrix")
-    artist = ids.make("artist", "lastfm", "Nirvana")
-    db.upsert_item(conn, artist, "artist", title="Nirvana")
+    artist = db.resolve_item(conn, "artist", "name", "Nirvana", title="Nirvana")
     db.add_event(conn, iso(1), artist, "loved", 1.0, "lastfm")
-    hop = ids.make("artist", "lastfm", "Hole")
-    db.upsert_item(conn, hop, "artist", title="Hole")
+    hop = db.resolve_item(conn, "artist", "name", "Hole", title="Hole")
     conn.execute(
         "INSERT INTO candidates (item_id, source, external_score, first_seen, last_seen)"
         " VALUES (?, 'lastfm_similar', 0.9, ?, ?)", (hop, iso(3), iso(3)))
@@ -838,8 +836,7 @@ def test_two_profiles_independent_seeds_and_exclusions(conn, tmp_path, router):
     seed_movie(conn, 603, "The Matrix", profile="alice")
     seed_movie(conn, 700, "Heat", profile="bob")
     # bob rejected 200; alice holds no grudge, so it may still reach her pool
-    rejected = ids.make("movie", "tmdb", "200")
-    db.upsert_item(conn, rejected, "movie", title="M200")
+    rejected = db.resolve_item(conn, "movie", "tmdb", "200", title="M200")
     db.add_event(conn, iso(2), rejected, "reject", -1.0, "user", profile="bob")
 
     router.route("/movie/603/recommendations",
@@ -857,8 +854,8 @@ def test_two_profiles_independent_seeds_and_exclusions(conn, tmp_path, router):
     rows = {(r["profile"], r["item_id"]) for r in conn.execute(
         "SELECT profile, item_id FROM candidates WHERE source='tmdb_similar'")}
     assert rows == {
-        ("alice", rejected), ("alice", ids.make("movie", "tmdb", "201")),
-        ("bob", ids.make("movie", "tmdb", "202")),
+        ("alice", rejected), ("alice", item(conn, "movie", "tmdb", "201")),
+        ("bob", item(conn, "movie", "tmdb", "202")),
     }
     # each profile fanned out only from its own seed, exactly once
     recs = [u for u, _ in router.calls if u.endswith("/recommendations")]

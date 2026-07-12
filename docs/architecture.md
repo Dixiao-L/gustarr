@@ -37,8 +37,9 @@ single flaky source shouldn't flip a systemd unit red every night.
    manage (never recommend what you own) and treats manual library adds as a
    taste signal.
 2. **`enrich`** — fill `items.meta` from TMDb (movies/series) and
-   MusicBrainz + Last.fm (music). This is also where weak ids get upgraded to
-   canonical namespaces (see below). Permanent per-item failures (bad ids,
+   MusicBrainz + Last.fm (music). This is also where name-only items get
+   their authoritative identity attached (see below). Permanent per-item
+   failures (bad ids,
    4xx) are stamped so one bad item never wedges the queue; transient
    failures retry next run. First-run backlogs are bounded per night
    (`ENRICH_BATCH_LIMIT = 1500`, priority-ordered) because MusicBrainz
@@ -82,9 +83,9 @@ One SQLite database, WAL mode, created on first connect (`db.py`):
 
 | table | role |
 |---|---|
-| `items` | canonical catalogue: `id`, `domain`, `title`, `year`, `ids` (JSON id map), `meta` (genres, overview, trailer, …), `enriched_at` — global |
+| `items` | canonical catalogue: surrogate integer `id`, `domain`, `title`, `year`, `meta` (genres, overview, trailer, …), `enriched_at` — global |
+| `identities` | every external id or name an item is known by: `(domain, ns, key) → item_id` — global |
 | `events` | append-only taste signals owned by a profile: `profile`, `ts`, `item_id`, `kind`, `weight`, `source`, `dedup`, `meta`; unique on `(profile, ts, item_id, kind, source, dedup)` so re-syncs are idempotent |
-| `item_aliases` | fallback → canonical id redirects recorded by merges — global |
 | `library` | what the *arrs already manage — never recommended; global |
 | `candidates` | the pool rank scores; PK `(profile, item_id, source)` so one item found by several sources keeps all its provenance per profile, with `seed_item_id` for "why" |
 | `recommendations` | the per-profile queue: `profile`, `run_id`, `score`, `why` JSON, `status`, `acted_at` |
@@ -113,49 +114,61 @@ proposed ──▶ approved ──▶ added        (apply pushed it to the *arr)
 `added`, `auto_added` and `failed` are terminal — the item has left the
 queue's control, so a late approve/reject would be a lie and is refused.
 
-## Id namespaces
+## Identity
 
-Every item has exactly one id of the form `domain:ns:key` (`ids.py`):
+An item's `id` is a surrogate integer that means nothing outside the store.
+Everything the world calls that item lives in one table:
 
 ```
-movie:tmdb:603              series:tvdb:81189
-artist:mbid:5b11f4ce-...    album:mbid:1b022e01-...
-track:lastfm:radiohead␟paranoid android      (fallback when no MBID)
+identities(domain, ns, key) → item_id
 ```
 
-Domains are `movie | series | artist | album | track`. The namespace is the
-*most authoritative* id known for that item, with a per-domain priority:
+Domains are `movie | series | artist | album | track`; namespaces are
+`tmdb | tvdb | imdb | mbid | jellyfin | name`. `name` holds every human
+spelling — Last.fm artist names, MusicBrainz aliases, width/case/script
+variants — normalized once (`ids.normalize_key`: NFKC, casefold, whitespace
+collapse) so ＹＯＡＳＯＢＩ and YOASOBI are the same key. Kana vs. romaji is
+a different *script*, not a width variant; those spellings are bridged by
+MusicBrainz aliases arriving as additional `name` identities.
 
-| domain | namespaces, strongest first |
-|---|---|
-| movie | `tmdb`, `imdb` |
-| series | `tvdb`, `tmdb`, `imdb` |
-| artist / album / track | `mbid`, `lastfm` (name-keyed fallback) |
+Two functions are the whole API:
 
-`series` is canonically `tvdb`-keyed because Sonarr can only add by TVDB id;
-enrich resolves it via TMDb's external-id mapping, so no TVDB API key is ever
-needed. Multi-part keys join with the ASCII unit separator (`\x1f`), which
-never occurs in artist/track names.
+- `db.resolve_item(domain, ns, key, …) → item_id` — the single write path.
+  A known `(domain, ns, key)` returns the existing item (fields folded in
+  non-destructively); an unknown one creates it.
+- `db.attach_identity(item_id, ns, key) → item_id` — teaches an item another
+  name. If that identity already belongs to a *different* item and the
+  collision **proves** they are one entity, they merge: the holder of the
+  more authoritative namespace wins, children (`events`, `candidates`,
+  `recommendations`, `library`, `embeddings`) re-point with
+  `UPDATE OR IGNORE` + delete so rows that exist under both ids (the same
+  scrobble synced under two spellings) dedupe instead of erroring, and the
+  caller continues with the returned winner id.
 
-## Merge & alias semantics
+What counts as proof matters. A collision on an authoritative key (one tmdb
+id, one mbid — one entity) always merges. A collision on a `name` key does
+not when **both** items hold their own authoritative identity: MusicBrainz
+alias lists legitimately carry *other* entities' names — The Kinks list
+"The Ravens" (their former name), personas list their performer — so two
+mbid holders sharing a spelling are proof of difference, and the attach is
+refused (the spelling stays with its current owner; enrich and dedupe count
+it as `alias_conflicts`). Name merges therefore only absorb name-only
+twins — the CJK-healing case they exist for.
 
-Collectors often only know a weak id (a Last.fm artist name, an IMDb id).
-They mint the fallback form; `enrich` later resolves the authoritative id and
-calls `db.merge_item`, which:
+Authority per domain, strongest first (`ids.NS_PRIORITY`): movie
+`tmdb, imdb`; series `tvdb, tmdb, imdb`; artist/album/track `mbid, name`.
+`series` actuates by TVDB id because Sonarr can only add by it; enrich
+resolves it via TMDb's external-id mapping, so no TVDB API key is ever
+needed. An item whose identities include no authoritative namespace is
+*pending*: enrich upgrades it when it can (TMDb `find` for IMDb-only movies,
+MusicBrainz search for name-only artists) by attaching the authoritative id.
+Fuzzy MusicBrainz name matches below score 90 are **not** auto-attached —
+keeping a name-keyed item beats pointing someone's scrobble history at the
+wrong artist.
 
-1. non-destructively folds the fallback row's `ids`/`meta` into the canonical
-   item,
-2. records the redirect in `item_aliases` (re-pointing older aliases too),
-3. re-points `events`, `candidates`, `library` and `recommendations` rows —
-   using `UPDATE OR IGNORE` + delete so rows that would collide with existing
-   canonical rows (the same scrobble synced under both ids) dedupe instead of
-   erroring,
-4. drops the fallback item and its embeddings.
-
-From then on `db.canonical_id` transparently redirects any collector that
-re-mints the fallback id, so merged items never come back to life. Fuzzy
-MusicBrainz name matches below score 90 are *not* auto-merged — keeping a
-fallback id beats pointing someone's scrobble history at the wrong artist.
+Merged identities stay in the table pointing at the winner, so a collector
+that re-encounters any historical spelling resolves straight to the merged
+item — merged items never come back to life.
 
 ## Signal weighting
 
@@ -208,12 +221,6 @@ Known structural shortcuts, documented so nobody has to discover them the
 hard way. None is load-bearing for correctness today; all have a planned
 fix.
 
-- **Item identity is spread across three mechanisms**: namespaced id
-  minting with per-domain priority (`ids.py`), `item_aliases` redirects
-  consulted via `db.canonical_id` at write time, and the merge/upgrade
-  passes in `enrich` and `dedupe`. Each is individually sound, but "what
-  id does this thing have?" has three answers depending on where you ask.
-  Planned: consolidation behind a single resolver.
 - **Recommendation status transitions are written from several call
   sites**: `queue.set_status`/`forgive` (approve/reject/snooze/un-reject),
   `apply` (added/auto_added/failed, TTL and overflow expiry) and `rank`

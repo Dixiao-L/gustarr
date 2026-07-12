@@ -81,6 +81,14 @@ def conn(tmp_path):
     c.close()
 
 
+def matrix(conn):
+    return db.lookup_item(conn, "movie", "tmdb", "603")
+
+
+def heat(conn):
+    return db.lookup_item(conn, "movie", "tmdb", "949")
+
+
 def test_first_sync_items_library_events(conn, cfg, fake_http):
     stats = arr.sync(conn, cfg)
     assert stats["items"] == 4
@@ -89,27 +97,30 @@ def test_first_sync_items_library_events(conn, cfg, fake_http):
     assert stats["rejects"] == 0
     assert stats["removed"] == 0
 
-    row = conn.execute("SELECT * FROM items WHERE id='movie:tmdb:603'").fetchone()
+    row = conn.execute("SELECT * FROM items WHERE id=?", (matrix(conn),)).fetchone()
     assert row["title"] == "The Matrix" and row["year"] == 1999
-    assert json.loads(row["ids"]) == {"tmdb": 603, "imdb": "tt0133093"}
+    # the canonical id resolves the item, secondary ids become identities
+    assert db.identities_of(conn, matrix(conn)) == {"tmdb": "603", "imdb": "tt0133093"}
     assert json.loads(row["meta"])["genres"] == ["Action", "Science Fiction"]
     assert conn.execute("SELECT COUNT(*) FROM items").fetchone()[0] == 4
-    assert conn.execute("SELECT id FROM items WHERE domain='series'").fetchone()[0] \
-        == "series:tvdb:79126"
+    wire = db.lookup_item(conn, "series", "tvdb", "79126")
+    assert conn.execute("SELECT id FROM items WHERE domain='series'").fetchone()[0] == wire
+    assert db.lookup_item(conn, "series", "imdb", "tt0306414") == wire
 
-    lib = conn.execute("SELECT * FROM library WHERE item_id='movie:tmdb:603'").fetchone()
+    lib = conn.execute("SELECT * FROM library WHERE item_id=?", (matrix(conn),)).fetchone()
     assert lib["arr"] == "radarr" and lib["arr_id"] == 11
     assert lib["status"] == "monitored" and lib["added_at"] == "2024-01-05T10:00:00Z"
     assert json.loads(lib["meta"]) == {}
 
-    tagged = conn.execute("SELECT * FROM library WHERE item_id='movie:tmdb:949'").fetchone()
+    tagged = conn.execute("SELECT * FROM library WHERE item_id=?", (heat(conn),)).fetchone()
     assert json.loads(tagged["meta"]) == {"gustarr": True}
 
+    radiohead = db.lookup_item(conn, "artist", "mbid", MBID)
     artist_lib = conn.execute("SELECT * FROM library WHERE arr='lidarr'").fetchone()
-    assert artist_lib["item_id"] == f"artist:mbid:{MBID}"
+    assert artist_lib["item_id"] == radiohead
     assert artist_lib["status"] == "unmonitored"
 
-    ev = conn.execute("SELECT * FROM events WHERE item_id='movie:tmdb:603'").fetchone()
+    ev = conn.execute("SELECT * FROM events WHERE item_id=?", (matrix(conn),)).fetchone()
     assert ev["kind"] == "library_add" and ev["source"] == "arr"
     assert ev["ts"] == "2024-01-05T10:00:00Z"
     assert ev["weight"] == WEIGHTS["library_add"]
@@ -117,11 +128,12 @@ def test_first_sync_items_library_events(conn, cfg, fake_http):
     assert ev["profile"] == "default"
     # the gustarr-tagged add produced no event
     assert conn.execute(
-        "SELECT COUNT(*) FROM events WHERE item_id='movie:tmdb:949'").fetchone()[0] == 0
+        "SELECT COUNT(*) FROM events WHERE item_id=?", (heat(conn),)).fetchone()[0] == 0
 
+    # known state keys on the *arr's external ids — merge-proof, no item ids
     known = json.loads(db.get_state(conn, "arr:known:radarr"))
-    assert known == {"movie:tmdb:603": 11, "movie:tmdb:949": 12}
-    assert json.loads(db.get_state(conn, "arr:known:lidarr")) == {f"artist:mbid:{MBID}": 31}
+    assert known == {"603": 11, "949": 12}
+    assert json.loads(db.get_state(conn, "arr:known:lidarr")) == {MBID: 31}
 
 
 def test_resync_is_idempotent(conn, cfg, fake_http):
@@ -135,6 +147,7 @@ def test_resync_is_idempotent(conn, cfg, fake_http):
 
 def test_deleted_gustarr_item_becomes_reject(conn, cfg, fake_http, responses):
     arr.sync(conn, cfg)
+    heat_id = heat(conn)
     # user deletes both radarr movies: only the gustarr-tagged one is a signal
     responses[f"{RADARR}/api/v3/movie"] = []
     stats = arr.sync(conn, cfg)
@@ -144,7 +157,7 @@ def test_deleted_gustarr_item_becomes_reject(conn, cfg, fake_http, responses):
     rejects = conn.execute("SELECT * FROM events WHERE kind='reject'").fetchall()
     assert len(rejects) == 1
     rej = rejects[0]
-    assert rej["item_id"] == "movie:tmdb:949"
+    assert rej["item_id"] == heat_id
     # no recommendations row owns the add: damped household evidence
     assert rej["weight"] == WEIGHTS["reject"] * 0.3
     assert rej["source"] == "arr"
@@ -154,6 +167,24 @@ def test_deleted_gustarr_item_becomes_reject(conn, cfg, fake_http, responses):
     assert json.loads(db.get_state(conn, "arr:known:radarr")) == {}
     # untouched arrs keep their rows and produce nothing new
     assert conn.execute("SELECT COUNT(*) FROM library").fetchone()[0] == 2
+
+
+def test_v2_known_state_migrates_on_read(conn, cfg, fake_http):
+    """A store upgraded from v2 still holds text item ids in arr:known; the
+    first sync must read them as the same library instead of mass-removing
+    (and mass-rejecting) everything once."""
+    arr.sync(conn, cfg)
+    db.set_state(conn, "arr:known:radarr",
+                 json.dumps({"movie:tmdb:603": 11, "movie:tmdb:949": 12}))
+    db.set_state(conn, "arr:known:lidarr", json.dumps({f"artist:mbid:{MBID}": 31}))
+
+    stats = arr.sync(conn, cfg)
+
+    assert stats["rejects"] == 0 and stats["removed"] == 0
+    assert conn.execute("SELECT COUNT(*) FROM library").fetchone()[0] == 4
+    # the state is rewritten in the new external-id format
+    assert json.loads(db.get_state(conn, "arr:known:radarr")) == {"603": 11, "949": 12}
+    assert json.loads(db.get_state(conn, "arr:known:lidarr")) == {MBID: 31}
 
 
 def test_unconfigured_arrs_skipped(conn, tmp_path, monkeypatch, responses):
@@ -183,7 +214,8 @@ def test_events_fan_out_to_every_profile(conn, tmp_path, fake_http, responses):
 
     assert stats["events"] == 2  # one library_add per profile (Heat is tagged)
     adds = {r["profile"] for r in conn.execute(
-        "SELECT profile FROM events WHERE kind='library_add' AND item_id='movie:tmdb:603'")}
+        "SELECT profile FROM events WHERE kind='library_add' AND item_id=?",
+        (matrix(conn),))}
     assert adds == {"alice", "bob"}
     # library stays global: one row, no profile dimension
     assert conn.execute("SELECT COUNT(*) FROM library").fetchone()[0] == 2
@@ -191,12 +223,13 @@ def test_events_fan_out_to_every_profile(conn, tmp_path, fake_http, responses):
     # deleting the gustarr-tagged movie with no rec on record falls back
     # to the household fan-out — damped and flagged shared, since it says
     # little about any one person's taste
+    heat_id = heat(conn)
     responses[f"{RADARR}/api/v3/movie"] = []
     stats = arr.sync(conn, cfg)
     assert stats["rejects"] == 2
     rejects = {(r["profile"], r["item_id"]) for r in conn.execute(
         "SELECT profile, item_id FROM events WHERE kind='reject'")}
-    assert rejects == {("alice", "movie:tmdb:949"), ("bob", "movie:tmdb:949")}
+    assert rejects == {("alice", heat_id), ("bob", heat_id)}
     for r in conn.execute("SELECT weight, meta FROM events WHERE kind='reject'"):
         assert r["weight"] == WEIGHTS["reject"] * 0.3
         assert json.loads(r["meta"]) == {"deleted": True, "shared": True}
@@ -213,12 +246,13 @@ def test_deleted_gustarr_item_reject_hits_owning_profile_only(
         "profiles": {"alice": {}, "bob": {}},
     })
     arr.sync(conn, cfg)
+    heat_id = heat(conn)
 
     def add_rec(profile, status, acted_at):
         conn.execute(
             "INSERT INTO recommendations (profile, run_id, ts, domain, item_id, score,"
             " status, acted_at) VALUES (?,?,?,?,?,?,?,?)",
-            (profile, "test", acted_at, "movie", "movie:tmdb:949", 0.5, status, acted_at))
+            (profile, "test", acted_at, "movie", heat_id, 0.5, status, acted_at))
 
     add_rec("bob", "added", "2024-01-01T00:00:00Z")  # superseded by alice's newer add
     add_rec("alice", "auto_added", "2024-06-01T00:00:00Z")
@@ -230,7 +264,7 @@ def test_deleted_gustarr_item_reject_hits_owning_profile_only(
     rejects = conn.execute("SELECT * FROM events WHERE kind='reject'").fetchall()
     assert len(rejects) == 1
     rej = rejects[0]
-    assert rej["item_id"] == "movie:tmdb:949"
+    assert rej["item_id"] == heat_id
     assert rej["profile"] == "alice"  # the newest owner, nobody else
     assert rej["weight"] == WEIGHTS["reject"]  # her own add: full strength
     assert json.loads(rej["meta"]) == {"deleted": True}

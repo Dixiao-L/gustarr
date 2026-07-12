@@ -3,6 +3,8 @@
 Unlike the history collectors this one writes no events — ListenBrainz's
 collaborative filtering is an external recommender, so its output feeds
 the candidate pool (with provenance) rather than the taste-signal store.
+Items resolve through db.resolve_item on their MBIDs (spellings when the
+credit carries none), so candidate rows always point at live item ids.
 """
 
 from __future__ import annotations
@@ -10,7 +12,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
-from .. import db, ids
+from .. import db
 from ..config import Config
 from ..http import get_json, post_json
 
@@ -25,7 +27,7 @@ def _headers(cfg: Config) -> dict[str, str]:
 
 
 def _upsert_candidate(
-    conn: sqlite3.Connection, profile: str, item_id: str, source: str,
+    conn: sqlite3.Connection, profile: str, item_id: int, source: str,
     score: float | None, ts: str
 ) -> None:
     conn.execute(
@@ -37,23 +39,22 @@ def _upsert_candidate(
     )
 
 
-def _artist_ref(artist: dict[str, Any]) -> tuple[str | None, str | None]:
-    """(item_id, name) for the first credited artist; lastfm fallback when no MBID."""
+def _artist_ref(conn: sqlite3.Connection,
+                artist: dict[str, Any]) -> tuple[int | None, str | None, str | None]:
+    """(item id, name, mbid) for the first credited artist; name-keyed
+    item when there is no MBID, all-None when the credit is empty."""
     credited = artist.get("artists") or []
     first = credited[0] if credited else {}
     name = artist.get("name") or first.get("name")
     mbid = first.get("artist_mbid")
     if mbid:
-        return ids.make("artist", "mbid", mbid), name
+        item = db.resolve_item(conn, "artist", "mbid", mbid, title=name)
+        if name:  # teach the spelling so name-keyed twins converge
+            item = db.attach_identity(conn, item, "name", name)
+        return item, name, mbid
     if name:
-        return ids.make("artist", "lastfm", name), name
-    return None, None
-
-
-def _upsert_artist(conn: sqlite3.Connection, artist_id: str, name: str | None) -> None:
-    _, ns, key = ids.parse(artist_id)
-    db.upsert_item(conn, artist_id, "artist", title=name,
-                   ids={"mbid": key} if ns == "mbid" else {})
+        return db.resolve_item(conn, "artist", "name", name, title=name), name, None
+    return None, None, None
 
 
 def _fetch_metadata(mbids: list[str], headers: dict[str, str]) -> dict[str, Any]:
@@ -86,17 +87,17 @@ def _sync_cf(conn: sqlite3.Connection, profile: str, user: str, headers: dict[st
 
     metadata = _fetch_metadata(list(scores), headers)
     ts = db.now()
-    artist_best: dict[str, tuple[str | None, float]] = {}
-    # album id → (title, artist_name, artist_id, best track score): several
-    # CF tracks off one record are a stronger album signal than any single
-    # track, so the album inherits the max.
+    artist_best: dict[int, float] = {}
+    # release mbid → (title, artist name, artist mbid, best track score):
+    # several CF tracks off one record are a stronger album signal than any
+    # single track, so the album inherits the max.
     album_best: dict[str, tuple[str, str | None, str | None, float]] = {}
     for mbid, score in scores.items():
         info = metadata.get(mbid) or {}
         recording = info.get("recording") or {}
         artist = info.get("artist") or {}
         release = info.get("release") or {}
-        artist_id, artist_name = _artist_ref(artist)
+        artist_id, artist_name, artist_mbid = _artist_ref(conn, artist)
         meta: dict[str, Any] = {}
         if artist_name:
             meta["artist"] = artist_name
@@ -104,39 +105,35 @@ def _sync_cf(conn: sqlite3.Connection, profile: str, user: str, headers: dict[st
             meta["album"] = release["name"]
         if release.get("mbid"):
             meta["release_mbid"] = release["mbid"]
-        track_id = ids.make("track", "mbid", mbid)
-        db.upsert_item(conn, track_id, "track", title=recording.get("name"),
-                       ids={"mbid": mbid}, meta=meta)
+        track_id = db.resolve_item(conn, "track", "mbid", mbid,
+                                   title=recording.get("name"), meta=meta)
         _upsert_candidate(conn, profile, track_id, "listenbrainz_cf", score, ts)
         stats["cf_tracks"] += 1
         numeric = float(score) if isinstance(score, (int, float)) else 0.0
-        if artist_id:
-            _upsert_artist(conn, artist_id, artist_name)
+        if artist_id is not None:
             prev = artist_best.get(artist_id)
-            if prev is None or numeric > prev[1]:
-                artist_best[artist_id] = (artist_name, numeric)
+            if prev is None or numeric > prev:
+                artist_best[artist_id] = numeric
         if release.get("mbid") and release.get("name"):
             # LB hands back RELEASE mbids, not release-groups; store as-is,
             # enrich owns upgrading them to the release-group Lidarr wants.
-            album_id = ids.make("album", "mbid", release["mbid"])
-            aprev = album_best.get(album_id)
+            aprev = album_best.get(release["mbid"])
             if aprev is None or numeric > aprev[3]:
-                album_best[album_id] = (release["name"], artist_name, artist_id, numeric)
+                album_best[release["mbid"]] = (release["name"], artist_name,
+                                               artist_mbid, numeric)
 
-    for artist_id, (_, best) in artist_best.items():
+    for artist_id, best in artist_best.items():
         _upsert_candidate(conn, profile, artist_id, "listenbrainz_cf_artist", best, ts)
         stats["cf_artists"] += 1
 
-    for album_id, (title, artist_name, artist_id, best) in album_best.items():
-        ids_d: dict[str, Any] = {"mbid": ids.parse(album_id)[2]}
+    for release_mbid, (title, artist_name, artist_mbid, best) in album_best.items():
         meta = {"artist": artist_name} if artist_name else {}
-        if artist_id:
-            _, ns, key = ids.parse(artist_id)
-            if ns == "mbid":
-                # ids for the actuate/Lidarr contract, meta for the UI/enrich.
-                ids_d["artist_mbid"] = key
-                meta["artist_mbid"] = key
-        db.upsert_item(conn, album_id, "album", title=title, ids=ids_d, meta=meta)
+        if artist_mbid:
+            # the album→artist relation actuation/Lidarr needs: a pointer to
+            # another item, never one of the album's own identities
+            meta["artist_mbid"] = artist_mbid
+        album_id = db.resolve_item(conn, "album", "mbid", release_mbid,
+                                   title=title, meta=meta)
         _upsert_candidate(conn, profile, album_id, "listenbrainz_cf_album", best, ts)
         stats["cf_albums"] += 1
 
@@ -170,12 +167,11 @@ def _sync_weekly(conn: sqlite3.Connection, profile: str, user: str, headers: dic
         if not mbid:
             continue
         creator = track.get("creator")
-        track_id = ids.make("track", "mbid", mbid)
-        db.upsert_item(conn, track_id, "track", title=track.get("title"),
-                       ids={"mbid": mbid}, meta={"artist": creator} if creator else {})
+        track_id = db.resolve_item(conn, "track", "mbid", mbid, title=track.get("title"),
+                                   meta={"artist": creator} if creator else None)
         if creator:
             # JSPF carries no artist MBID; enrich upgrades this later.
-            _upsert_artist(conn, ids.make("artist", "lastfm", creator), creator)
+            db.resolve_item(conn, "artist", "name", creator, title=creator)
         _upsert_candidate(conn, profile, track_id, "listenbrainz_weekly", None, ts)
         stats["weekly_tracks"] += 1
 

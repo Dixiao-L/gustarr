@@ -342,8 +342,17 @@ def resolve_item(
 
 def attach_identity(conn: sqlite3.Connection, item_id: int, ns: str, key: str) -> int:
     """Teach an item another of its names. When the identity already points
-    at a DIFFERENT item, the two were one all along: they merge, and the
-    surviving id is returned (callers must continue with it)."""
+    at a DIFFERENT item, they merge — *if* the collision proves they are one
+    entity — and the surviving id is returned (callers must continue with it).
+
+    A collision on an authoritative key (tmdb/tvdb/imdb/mbid) or a Jellyfin
+    id is proof: those namespaces map one key to one real-world entity. A
+    collision on a 'name' key is not — MusicBrainz alias lists legitimately
+    carry OTHER entities' names (former band names, personas, tributes), so
+    when both items hold their own authoritative identity a name collision
+    proves they are DIFFERENT, and the attach is refused: the key stays with
+    its current owner and item_id comes back unchanged. Distinguish refusal
+    from no-op with lookup_item when it matters (conflict stats)."""
     domain = conn.execute(
         "SELECT domain FROM items WHERE id=?", (item_id,)).fetchone()["domain"]
     norm = ids_mod.normalize_key(str(key))
@@ -357,6 +366,8 @@ def attach_identity(conn: sqlite3.Connection, item_id: int, ns: str, key: str) -
         return item_id
     other = row["item_id"]
     if other == item_id:
+        return item_id
+    if ns == "name" and _authority(conn, other) > 0 and _authority(conn, item_id) > 0:
         return item_id
     # Authoritative-ns holders win so external references stay stable:
     # merging a name-only item into an mbid item, not the reverse.
@@ -405,10 +416,10 @@ def merge_items(conn: sqlite3.Connection, loser: int, winner: int) -> None:
     conn.execute("UPDATE OR IGNORE embeddings SET item_id=? WHERE item_id=?", (winner, loser))
     conn.execute("DELETE FROM embeddings WHERE item_id=?", (loser,))
     # Merge metadata non-destructively (winner's keys win), then drop.
-    l = conn.execute("SELECT * FROM items WHERE id=?", (loser,)).fetchone()
-    if l is not None:
-        upsert_item_fields(conn, winner, title=None, year=l["year"],
-                           meta=json.loads(l["meta"]), prefer_existing=True)
+    row = conn.execute("SELECT * FROM items WHERE id=?", (loser,)).fetchone()
+    if row is not None:
+        upsert_item_fields(conn, winner, title=None, year=row["year"],
+                           meta=json.loads(row["meta"]), prefer_existing=True)
         conn.execute("DELETE FROM items WHERE id=?", (loser,))
 
 

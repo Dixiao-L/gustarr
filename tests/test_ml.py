@@ -1,6 +1,11 @@
 """Offline tests for the ml slice: embed doc building + selection,
 head/centroid training on synthetic separable vectors, and ranking
-end-to-end on a fabricated store. Never imports sentence-transformers."""
+end-to-end on a fabricated store. Never imports sentence-transformers.
+
+Identity v3: fixtures mint items through db.resolve_item and carry the
+returned integer ids everywhere — embeddings, candidates, exemplars and
+why-json all speak ints now.
+"""
 
 from __future__ import annotations
 
@@ -46,6 +51,18 @@ def axis(i, dim=DIM):
 def put_vec(conn, item_id, vec, model):
     v16 = np.asarray(vec, dtype=np.float16)
     db.put_embedding(conn, item_id, model, v16.tobytes(), len(v16))
+
+
+def movie(conn, key, title=None):
+    return db.resolve_item(conn, "movie", "tmdb", key, title=title or key.upper())
+
+
+def artist(conn, key, title=None):
+    return db.resolve_item(conn, "artist", "mbid", key, title=title or key)
+
+
+def album(conn, key, title=None):
+    return db.resolve_item(conn, "album", "mbid", key, title=title or key.upper())
 
 
 def add_candidate(conn, item_id, source="tmdb_similar", seed=None, ext=None,
@@ -121,41 +138,47 @@ def test_embed_run_selects_and_stores(tmp_path, monkeypatch):
 
     meta = {"genres": ["Drama"], "overview": "A film."}
     ts = db.now()
+
+    def enriched_movie(key, title, year=None):
+        iid = db.resolve_item(conn, "movie", "tmdb", key, title=title, year=year, meta=meta)
+        db.upsert_item_fields(conn, iid, enriched=True)
+        return iid
+
     # a: enriched + event → embedded
-    db.upsert_item(conn, "movie:tmdb:a", "movie", title="A", year=2000, meta=meta, enriched=True)
-    db.add_event(conn, ts, "movie:tmdb:a", "play", 0.3, "jellyfin")
+    a = enriched_movie("a", "A", year=2000)
+    db.add_event(conn, ts, a, "play", 0.3, "jellyfin")
     # b: enriched + candidate → embedded
-    db.upsert_item(conn, "movie:tmdb:b", "movie", title="B", meta=meta, enriched=True)
-    add_candidate(conn, "movie:tmdb:b")
+    b = enriched_movie("b", "B")
+    add_candidate(conn, b)
     # c: enriched but not relevant anywhere → ignored
-    db.upsert_item(conn, "movie:tmdb:c", "movie", title="C", meta=meta, enriched=True)
+    enriched_movie("c", "C")
     # d: relevant but not enriched → ignored
-    db.upsert_item(conn, "movie:tmdb:d", "movie", title="D", enriched=False)
-    db.add_event(conn, ts, "movie:tmdb:d", "play", 0.3, "jellyfin")
+    d = db.resolve_item(conn, "movie", "tmdb", "d", title="D")
+    db.add_event(conn, ts, d, "play", 0.3, "jellyfin")
     # e: relevant + enriched but already embedded → not re-embedded
-    db.upsert_item(conn, "movie:tmdb:e", "movie", title="E", meta=meta, enriched=True)
-    add_candidate(conn, "movie:tmdb:e")
-    put_vec(conn, "movie:tmdb:e", axis(0), model)
+    e = enriched_movie("e", "E")
+    add_candidate(conn, e)
+    put_vec(conn, e, axis(0), model)
 
     stats = embed_mod.run(conn, cfg)
     assert stats == {"embedded": 2, "skipped": 0}
     assert calls["model"] == model
     assert calls["kw"]["batch_size"] == 32
     assert calls["kw"]["normalize_embeddings"] is True
-    assert any(d.startswith("movie: A (2000)") for d in calls["docs"])
+    assert any(d_.startswith("movie: A (2000)") for d_ in calls["docs"])
     rows = {r["item_id"]: r for r in conn.execute(
         "SELECT item_id, dim, vec FROM embeddings WHERE model=?", (model,))}
-    assert set(rows) == {"movie:tmdb:a", "movie:tmdb:b", "movie:tmdb:e"}
-    assert rows["movie:tmdb:a"]["dim"] == DIM
-    assert len(rows["movie:tmdb:a"]["vec"]) == DIM * 2  # float16 bytes
+    assert set(rows) == {a, b, e}
+    assert rows[a]["dim"] == DIM
+    assert len(rows[a]["vec"]) == DIM * 2  # float16 bytes
 
 
 def test_embed_requires_ml_extra(tmp_path, monkeypatch):
     conn = db.connect(tmp_path / "t.db")
     cfg = make_cfg(tmp_path)
-    db.upsert_item(conn, "movie:tmdb:a", "movie", title="A",
-                   meta={"overview": "x"}, enriched=True)
-    db.add_event(conn, db.now(), "movie:tmdb:a", "play", 0.3, "jellyfin")
+    iid = db.resolve_item(conn, "movie", "tmdb", "a", title="A", meta={"overview": "x"})
+    db.upsert_item_fields(conn, iid, enriched=True)
+    db.add_event(conn, db.now(), iid, "play", 0.3, "jellyfin")
     monkeypatch.setitem(sys.modules, "sentence_transformers", None)
     with pytest.raises(RuntimeError, match="uv sync --extra ml"):
         embed_mod.run(conn, cfg)
@@ -171,19 +194,18 @@ def test_train_head_separates_and_persists(tmp_path):
     rng = np.random.default_rng(42)
     ts = db.now()
 
+    pos_ids = []
     for i in range(10):  # positives cluster on +e0
-        iid = f"movie:tmdb:p{i}"
-        db.upsert_item(conn, iid, "movie", title=f"P{i}")
+        iid = movie(conn, f"p{i}", f"P{i}")
+        pos_ids.append(iid)
         put_vec(conn, iid, unit(axis(0) + 0.1 * rng.normal(size=DIM)), model)
         db.add_event(conn, ts, iid, "loved", 1.0, "jellyfin")
     for i in range(3):  # explicit negatives cluster on -e0
-        iid = f"movie:tmdb:n{i}"
-        db.upsert_item(conn, iid, "movie", title=f"N{i}")
+        iid = movie(conn, f"n{i}", f"N{i}")
         put_vec(conn, iid, unit(-axis(0) + 0.1 * rng.normal(size=DIM)), model)
         db.add_event(conn, ts, iid, "reject", -1.0, "user")
     for i in range(25):  # event-less candidates → weak negative pool
-        iid = f"movie:tmdb:w{i}"
-        db.upsert_item(conn, iid, "movie", title=f"W{i}")
+        iid = movie(conn, f"w{i}", f"W{i}")
         put_vec(conn, iid, unit(rng.normal(size=DIM)), model)
         add_candidate(conn, iid)
 
@@ -211,6 +233,9 @@ def test_train_head_separates_and_persists(tmp_path):
     assert float(unit(neg_c) @ axis(0)) < -0.9
     assert len(cent["exemplars"]) == 10
     assert all(len(e) == 2 for e in cent["exemplars"])
+    # exemplars persist plain int item ids — json numbers round-trip
+    assert {e[0] for e in cent["exemplars"]} == set(pos_ids)
+    assert all(isinstance(e[0], int) for e in cent["exemplars"])
     labels = [e[1] for e in cent["exemplars"]]
     assert labels == sorted(labels, reverse=True)
     assert db.pget_state(conn, "default", "model:artist") is None
@@ -224,8 +249,7 @@ def test_train_few_positives_centroid_only(tmp_path):
     model = cfg.model.embed_model
     ts = db.now()
     for i in range(3):  # below the 8-positive head guard
-        iid = f"series:tvdb:{i}"
-        db.upsert_item(conn, iid, "series", title=f"S{i}")
+        iid = db.resolve_item(conn, "series", "tvdb", str(i), title=f"S{i}")
         put_vec(conn, iid, unit(axis(1) + 0.05 * axis(i + 2)), model)
         db.add_event(conn, ts, iid, "library_add", 0.6, "arr")
 
@@ -244,10 +268,11 @@ def test_train_two_profiles_independent_centroids(tmp_path):
     cfg = make_cfg(tmp_path, profiles=["alice", "bob"])
     model = cfg.model.embed_model
     ts = db.now()
+    ids = {"alice": set(), "bob": set()}
     for profile, ax in (("alice", 0), ("bob", 1)):
         for i in range(3):
-            iid = f"movie:tmdb:{profile}{i}"
-            db.upsert_item(conn, iid, "movie", title=f"{profile}-{i}")
+            iid = movie(conn, f"{profile}{i}", f"{profile}-{i}")
+            ids[profile].add(iid)
             put_vec(conn, iid, unit(axis(ax) + 0.05 * axis(i + 2)), model)
             db.add_event(conn, ts, iid, "loved", 1.0, "jellyfin", profile=profile)
 
@@ -263,8 +288,8 @@ def test_train_two_profiles_independent_centroids(tmp_path):
     assert float(unit(b_pos) @ axis(1)) > 0.9
     # exemplars are the training evidence — one profile's must never
     # surface in the other's "because you liked ..." explanations
-    assert {e[0] for e in alice["exemplars"]} == {f"movie:tmdb:alice{i}" for i in range(3)}
-    assert {e[0] for e in bob["exemplars"]} == {f"movie:tmdb:bob{i}" for i in range(3)}
+    assert {e[0] for e in alice["exemplars"]} == ids["alice"]
+    assert {e[0] for e in bob["exemplars"]} == ids["bob"]
     assert db.get_state(conn, "centroid:movie") is None  # no global leftovers
 
 
@@ -290,32 +315,35 @@ def test_rank_end_to_end(tmp_path):
         "m9": unit(-e[0] + 0.2 * e[5]),
         "m10": e[6],
     }
-    db.upsert_item(conn, "movie:tmdb:seed1", "movie", title="Seed Movie")
+    seed1 = movie(conn, "seed1", "Seed Movie")
+    iids: dict[str, int] = {}
     for name, v in vecs.items():
-        iid = f"movie:tmdb:{name}"
-        db.upsert_item(conn, iid, "movie", title=name.upper())
+        iid = movie(conn, name)
+        iids[name] = iid
         put_vec(conn, iid, v, model)
-        add_candidate(conn, iid, seed="movie:tmdb:seed1")
+        add_candidate(conn, iid, seed=seed1)
 
     # exclusions: in library / rejected / already openly recommended —
     # all e0-aligned so they would top the ranking if the filter leaked
+    blocked = {}
     for name in ("lib1", "rej1", "open1"):
-        iid = f"movie:tmdb:{name}"
-        db.upsert_item(conn, iid, "movie", title=name)
+        iid = movie(conn, name)
+        blocked[name] = iid
         put_vec(conn, iid, e[0], model)
         add_candidate(conn, iid)
-    conn.execute("INSERT INTO library (item_id, arr) VALUES ('movie:tmdb:lib1','radarr')")
-    db.add_event(conn, db.now(), "movie:tmdb:rej1", "reject", -1.0, "user")
+    conn.execute("INSERT INTO library (item_id, arr) VALUES (?, 'radarr')",
+                 (blocked["lib1"],))
+    db.add_event(conn, db.now(), blocked["rej1"], "reject", -1.0, "user")
     conn.execute(
         "INSERT INTO recommendations (run_id, ts, domain, item_id, score, status)"
-        " VALUES ('old', ?, 'movie', 'movie:tmdb:open1', 0.9, 'proposed')", (db.now(),))
+        " VALUES ('old', ?, 'movie', ?, 0.9, 'proposed')", (db.now(), blocked["open1"]))
 
     # stale proposal → should expire (default TTL 30 days)
-    db.upsert_item(conn, "movie:tmdb:stale", "movie", title="stale")
+    stale = movie(conn, "stale")
     old_ts = (datetime.now(timezone.utc) - timedelta(days=100)).strftime("%Y-%m-%dT%H:%M:%SZ")
     conn.execute(
         "INSERT INTO recommendations (run_id, ts, domain, item_id, score, status)"
-        " VALUES ('old2', ?, 'movie', 'movie:tmdb:stale', 0.5, 'proposed')", (old_ts,))
+        " VALUES ('old2', ?, 'movie', ?, 0.5, 'proposed')", (old_ts, stale))
 
     db.pset_state(conn, "default", "model:movie", json.dumps({
         "w": b64(4.0 * e[0]), "b": -1.0, "dim": DIM, "embed_model": model,
@@ -323,8 +351,7 @@ def test_rank_end_to_end(tmp_path):
     exemplars = []
     for i, v in enumerate([e[0], unit(0.9 * e[0] + 0.436 * e[1]),
                            unit(0.8 * e[0] + 0.6 * e[3])], 1):
-        iid = f"movie:tmdb:ex{i}"
-        db.upsert_item(conn, iid, "movie", title=f"Liked {i}")
+        iid = movie(conn, f"ex{i}", f"Liked {i}")
         put_vec(conn, iid, v, model)
         exemplars.append([iid, round(1.0 - 0.1 * i, 2)])
     db.pset_state(conn, "default", "centroid:movie", json.dumps({
@@ -340,23 +367,27 @@ def test_rank_end_to_end(tmp_path):
     assert stats["proposed"] == 5
     assert stats["movie"] == 5
     picked = {r["item_id"] for r in rows}
-    assert "movie:tmdb:m1" in picked
-    assert "movie:tmdb:m2" not in picked  # MMR suppresses the near-duplicate
-    assert not picked & {"movie:tmdb:lib1", "movie:tmdb:rej1", "movie:tmdb:open1"}
+    assert iids["m1"] in picked
+    assert iids["m2"] not in picked  # MMR suppresses the near-duplicate
+    assert not picked & set(blocked.values())
 
-    pv = [vecs[i.split(":")[-1]] for i in picked]
+    names_by_id = {v: k for k, v in iids.items()}
+    pv = [vecs[names_by_id[i]] for i in picked]
     for a in range(len(pv)):
         for b_ in range(a + 1, len(pv)):
             assert float(pv[a] @ pv[b_]) < 0.9  # no near-duplicate pair got through
 
+    ex_ids = {ex[0] for ex in exemplars}
     flags = []
     for row in rows:
         why = json.loads(row["why"])
         assert why["sources"] == ["tmdb_similar"]
-        assert why["seeds"] == ["Seed Movie"]
+        # seeds/neighbors carry int item ids; display names resolve at read time
+        assert why["seeds"] == [seed1]
         assert 1 <= len(why["neighbors"]) <= 3
         for n in why["neighbors"]:
             assert set(n) == {"item_id", "title", "sim"}
+            assert n["item_id"] in ex_ids
             assert n["title"].startswith("Liked ")
         sims = [n["sim"] for n in why["neighbors"]]
         assert sims == sorted(sims, reverse=True)
@@ -365,13 +396,11 @@ def test_rank_end_to_end(tmp_path):
     assert sum(flags) == 1  # round(5 * 0.2) exploration slot
 
     assert stats["expired"] == 1
-    assert conn.execute("SELECT status FROM recommendations WHERE item_id='movie:tmdb:stale'")
-    stale = conn.execute(
-        "SELECT status, acted_at FROM recommendations WHERE item_id='movie:tmdb:stale'"
-    ).fetchone()
-    assert stale["status"] == "expired" and stale["acted_at"]
+    stale_row = conn.execute(
+        "SELECT status, acted_at FROM recommendations WHERE item_id=?", (stale,)).fetchone()
+    assert stale_row["status"] == "expired" and stale_row["acted_at"]
     still_open = conn.execute(
-        "SELECT status FROM recommendations WHERE item_id='movie:tmdb:open1'").fetchone()
+        "SELECT status FROM recommendations WHERE item_id=?", (blocked["open1"],)).fetchone()
     assert still_open["status"] == "proposed"
 
 
@@ -391,9 +420,10 @@ def test_rank_serendipity_wins_exploration_slots(tmp_path):
         "sr": unit(-0.4 * axis(0) + 0.917 * axis(5)),           # serendipity, sub-band score
         "sj": -axis(0),                                         # serendipity, bottom decile
     }
+    iids = {}
     for name, v in vecs.items():
-        iid = f"movie:tmdb:{name}"
-        db.upsert_item(conn, iid, "movie", title=name.upper())
+        iid = movie(conn, name)
+        iids[name] = iid
         put_vec(conn, iid, v, model)
         source = "serendipity_tmdb" if name in ("sr", "sj") else "tmdb_similar"
         add_candidate(conn, iid, source=source)
@@ -411,14 +441,14 @@ def test_rank_serendipity_wins_exploration_slots(tmp_path):
     # 3 MMR + 2 exploration: sr beats b1 (band member with the higher
     # score) for the first slot; the remainder fills from the band. sj is
     # serendipity too but scores in the bottom decile — sanity floor.
-    assert set(whys) == {f"movie:tmdb:{n}" for n in ("s1", "s2", "s3", "sr", "b1")}
-    sr = whys["movie:tmdb:sr"]
+    assert set(whys) == {iids[n] for n in ("s1", "s2", "s3", "sr", "b1")}
+    sr = whys[iids["sr"]]
     assert sr["exploration"] is True and sr["serendipity"] is True
     assert sr["sources"] == ["serendipity_tmdb"]
-    b1 = whys["movie:tmdb:b1"]
+    b1 = whys[iids["b1"]]
     assert b1["exploration"] is True and "serendipity" not in b1
     for name in ("s1", "s2", "s3"):
-        w = whys[f"movie:tmdb:{name}"]
+        w = whys[iids[name]]
         assert w["exploration"] is False and "serendipity" not in w
 
 
@@ -441,9 +471,10 @@ def test_rank_exploration_novelty_gate_excludes_near_core(tmp_path):
         "j1": -axis(1) - 0.05 * axis(0),
         "j2": -axis(1) + 0.05 * axis(0) + 0.1 * axis(6),
     }
+    iids = {}
     for name, v in vecs.items():
-        iid = f"movie:tmdb:{name}"
-        db.upsert_item(conn, iid, "movie", title=name.upper())
+        iid = movie(conn, name)
+        iids[name] = iid
         put_vec(conn, iid, v, model)
         add_candidate(conn, iid)
     db.pset_state(conn, "default", "model:movie", json.dumps({
@@ -457,9 +488,9 @@ def test_rank_exploration_novelty_gate_excludes_near_core(tmp_path):
     assert stats["proposed"] == 3
     whys = {r["item_id"]: json.loads(r["why"]) for r in conn.execute(
         "SELECT item_id, why FROM recommendations WHERE status='proposed'")}
-    assert set(whys) == {"movie:tmdb:h1", "movie:tmdb:h2", "movie:tmdb:novel"}
-    assert whys["movie:tmdb:novel"]["exploration"] is True
-    assert "serendipity" not in whys["movie:tmdb:novel"]
+    assert set(whys) == {iids["h1"], iids["h2"], iids["novel"]}
+    assert whys[iids["novel"]]["exploration"] is True
+    assert "serendipity" not in whys[iids["novel"]]
 
 
 def test_rank_exploration_fallback_without_serendipity(tmp_path):
@@ -476,9 +507,10 @@ def test_rank_exploration_fallback_without_serendipity(tmp_path):
         "f4": axis(4),
         "f5": -axis(1),
     }
+    iids = {}
     for name, v in vecs.items():
-        iid = f"movie:tmdb:{name}"
-        db.upsert_item(conn, iid, "movie", title=name.upper())
+        iid = movie(conn, name)
+        iids[name] = iid
         put_vec(conn, iid, v, model)
         add_candidate(conn, iid)
     db.pset_state(conn, "default", "model:movie", json.dumps({
@@ -493,9 +525,9 @@ def test_rank_exploration_fallback_without_serendipity(tmp_path):
     whys = {r["item_id"]: json.loads(r["why"]) for r in conn.execute(
         "SELECT item_id, why FROM recommendations WHERE status='proposed'")}
     # f4 is the pre-serendipity band pick: in the 40-90 band, max distance.
-    assert set(whys) == {"movie:tmdb:f1", "movie:tmdb:f2", "movie:tmdb:f4"}
-    assert whys["movie:tmdb:f4"]["exploration"] is True
-    assert "serendipity" not in whys["movie:tmdb:f4"]
+    assert set(whys) == {iids["f1"], iids["f2"], iids["f4"]}
+    assert whys[iids["f4"]]["exploration"] is True
+    assert "serendipity" not in whys[iids["f4"]]
 
 
 def test_rank_album_domain_slots_and_video_cap_exemption(tmp_path):
@@ -507,22 +539,20 @@ def test_rank_album_domain_slots_and_video_cap_exemption(tmp_path):
     model = cfg.model.embed_model
     rng = np.random.default_rng(7)
 
-    db.upsert_item(conn, "artist:mbid:seed-a", "artist", title="Seed Artist")
+    seed_a = artist(conn, "seed-a", "Seed Artist")
     # 15 candidates: enough leftover after the 8 MMR picks that the 40-90
     # exploration band can fill both exploration slots
     for i in range(15):
-        iid = f"album:mbid:al{i}"
-        db.upsert_item(conn, iid, "album", title=f"AL{i}")
+        iid = album(conn, f"al{i}")
         put_vec(conn, iid, unit(axis(0) + 0.3 * rng.normal(size=DIM)), model)
-        add_candidate(conn, iid, source="lastfm_top_albums", seed="artist:mbid:seed-a",
+        add_candidate(conn, iid, source="lastfm_top_albums", seed=seed_a,
                       ext=1.0 - 0.05 * i)
     db.pset_state(conn, "default", "centroid:album", json.dumps({
         "pos": b64(axis(0)), "neg": None, "dim": DIM, "embed_model": model,
         "exemplars": []}))
     # movies in the same run: the video cap of 1 must bite them, not albums
     for i in range(3):
-        iid = f"movie:tmdb:m{i}"
-        db.upsert_item(conn, iid, "movie", title=f"M{i}")
+        iid = movie(conn, f"m{i}")
         put_vec(conn, iid, axis(i + 1), model)
         add_candidate(conn, iid)
     db.pset_state(conn, "default", "centroid:movie", json.dumps({
@@ -539,7 +569,7 @@ def test_rank_album_domain_slots_and_video_cap_exemption(tmp_path):
     for r in rows:
         why = json.loads(r["why"])
         assert why["sources"] == ["lastfm_top_albums"]
-        assert why["seeds"] == ["Seed Artist"]
+        assert why["seeds"] == [seed_a]
         assert isinstance(why["exploration"], bool)
         assert 0.0 <= r["score"] <= 1.2
 
@@ -548,9 +578,10 @@ def test_rank_centroid_fallback_artist(tmp_path):
     conn = db.connect(tmp_path / "t.db")
     cfg = make_cfg(tmp_path)
     model = cfg.model.embed_model
+    iids = {}
     for name, v in {"a1": axis(0), "a2": axis(1), "a3": -axis(0)}.items():
-        iid = f"artist:mbid:{name}"
-        db.upsert_item(conn, iid, "artist", title=name)
+        iid = artist(conn, name)
+        iids[name] = iid
         put_vec(conn, iid, v, model)
         add_candidate(conn, iid, source="lastfm_similar")
     db.pset_state(conn, "default", "centroid:artist", json.dumps({
@@ -561,12 +592,12 @@ def test_rank_centroid_fallback_artist(tmp_path):
     assert stats["proposed"] == 3  # pool smaller than the 10 artist slots
     scores = {r["item_id"]: r["score"] for r in conn.execute(
         "SELECT item_id, score FROM recommendations WHERE domain='artist'")}
-    s1, s2, s3 = (scores[f"artist:mbid:a{i}"] for i in (1, 2, 3))
+    s1, s2, s3 = (scores[iids[f"a{i}"]] for i in (1, 2, 3))
     assert s1 > s2 > s3
     assert abs(s1 - 1.03) < 0.02  # (cos+1)/2 mapping + one-source bonus
     assert abs(s2 - 0.53) < 0.02
     why = json.loads(conn.execute(
-        "SELECT why FROM recommendations WHERE item_id='artist:mbid:a1'").fetchone()["why"])
+        "SELECT why FROM recommendations WHERE item_id=?", (iids["a1"],)).fetchone()["why"])
     assert why["neighbors"] == [] and why["sources"] == ["lastfm_similar"]
 
 
@@ -579,27 +610,27 @@ def test_rank_rescores_open_proposals_with_current_scorer(tmp_path):
     ts = db.now()
 
     # Open proposal from an old centroid-era run with an inflated frozen score.
-    db.upsert_item(conn, "movie:tmdb:old", "movie", title="Old")
-    put_vec(conn, "movie:tmdb:old", unit(0.5 * axis(0) + float(np.sqrt(0.75)) * axis(1)), model)
+    old = movie(conn, "old", "Old")
+    put_vec(conn, old, unit(0.5 * axis(0) + float(np.sqrt(0.75)) * axis(1)), model)
     old_why = json.dumps({"sources": ["tmdb_similar"], "exploration": False})
     conn.execute(
         "INSERT INTO recommendations (run_id, ts, domain, item_id, score, why, status)"
-        " VALUES ('oldrun', ?, 'movie', 'movie:tmdb:old', 0.99, ?, 'proposed')", (ts, old_why))
+        " VALUES ('oldrun', ?, 'movie', ?, 0.99, ?, 'proposed')", (ts, old, old_why))
     # Open proposal without an embedding: keeps its old score.
-    db.upsert_item(conn, "movie:tmdb:noemb", "movie", title="NoEmb")
+    noemb = movie(conn, "noemb", "NoEmb")
     conn.execute(
         "INSERT INTO recommendations (run_id, ts, domain, item_id, score, status)"
-        " VALUES ('oldrun', ?, 'movie', 'movie:tmdb:noemb', 0.42, 'proposed')", (ts,))
+        " VALUES ('oldrun', ?, 'movie', ?, 0.42, 'proposed')", (ts, noemb))
     # Approved rec: not touched by the re-score (only 'proposed' rows are).
-    db.upsert_item(conn, "movie:tmdb:appr", "movie", title="Appr")
-    put_vec(conn, "movie:tmdb:appr", axis(0), model)
+    appr = movie(conn, "appr", "Appr")
+    put_vec(conn, appr, axis(0), model)
     conn.execute(
         "INSERT INTO recommendations (run_id, ts, domain, item_id, score, status)"
-        " VALUES ('oldrun', ?, 'movie', 'movie:tmdb:appr', 0.91, 'approved')", (ts,))
+        " VALUES ('oldrun', ?, 'movie', ?, 0.91, 'approved')", (ts, appr))
 
-    db.upsert_item(conn, "movie:tmdb:new", "movie", title="New")
-    put_vec(conn, "movie:tmdb:new", axis(0), model)
-    add_candidate(conn, "movie:tmdb:new")
+    new = movie(conn, "new", "New")
+    put_vec(conn, new, axis(0), model)
+    add_candidate(conn, new)
     db.pset_state(conn, "default", "model:movie", json.dumps({
         "w": b64(4.0 * axis(0)), "b": -1.0, "dim": DIM, "embed_model": model,
         "trained_at": ts, "n_pos": 10, "n_neg": 3, "n_weak": 20}))
@@ -608,17 +639,17 @@ def test_rank_rescores_open_proposals_with_current_scorer(tmp_path):
     assert stats["rescored"] == 1
     rows = {r["item_id"]: r for r in conn.execute("SELECT * FROM recommendations")}
 
-    old = rows["movie:tmdb:old"]
+    old_row = rows[old]
     # sigmoid(4*0.5 - 1), the current head's base score — not the frozen 0.99.
-    assert old["score"] == pytest.approx(1.0 / (1.0 + np.exp(-1.0)), abs=1e-3)
-    assert old["status"] == "proposed" and old["run_id"] == "oldrun"
-    assert old["why"] == old_why  # why untouched
-    assert rows["movie:tmdb:noemb"]["score"] == 0.42
-    assert rows["movie:tmdb:appr"]["score"] == 0.91
+    assert old_row["score"] == pytest.approx(1.0 / (1.0 + np.exp(-1.0)), abs=1e-3)
+    assert old_row["status"] == "proposed" and old_row["run_id"] == "oldrun"
+    assert old_row["why"] == old_why  # why untouched
+    assert rows[noemb]["score"] == 0.42
+    assert rows[appr]["score"] == 0.91
     # New proposal scored by the same head (+ one-source bonus): comparable.
-    new_score = rows["movie:tmdb:new"]["score"]
+    new_score = rows[new]["score"]
     assert new_score == pytest.approx(1.0 / (1.0 + np.exp(-3.0)) + 0.03, abs=1e-3)
-    assert old["score"] < new_score  # frozen 0.99 would have outranked it
+    assert old_row["score"] < new_score  # frozen 0.99 would have outranked it
 
 
 def test_rank_ignores_head_from_other_embed_model(tmp_path):
@@ -627,9 +658,10 @@ def test_rank_ignores_head_from_other_embed_model(tmp_path):
     conn = db.connect(tmp_path / "t.db")
     cfg = make_cfg(tmp_path)
     model = cfg.model.embed_model
+    iids = {}
     for name, v in {"a1": axis(0), "a2": axis(1)}.items():
-        iid = f"artist:mbid:{name}"
-        db.upsert_item(conn, iid, "artist", title=name)
+        iid = artist(conn, name)
+        iids[name] = iid
         put_vec(conn, iid, v, model)
         add_candidate(conn, iid, source="lastfm_similar")
     # Stale head points at axis(1): if it were used, a2 would win big.
@@ -646,16 +678,16 @@ def test_rank_ignores_head_from_other_embed_model(tmp_path):
     scores = {r["item_id"]: r["score"] for r in conn.execute(
         "SELECT item_id, score FROM recommendations WHERE domain='artist'")}
     # Centroid (cos+1)/2 mapping + one-source bonus, not the stale head's sigmoid.
-    assert abs(scores["artist:mbid:a1"] - 1.03) < 0.02
-    assert abs(scores["artist:mbid:a2"] - 0.53) < 0.02
+    assert abs(scores[iids["a1"]] - 1.03) < 0.02
+    assert abs(scores[iids["a2"]] - 0.53) < 0.02
 
 
 def test_rank_skips_domain_when_all_state_is_stale(tmp_path):
     conn = db.connect(tmp_path / "t.db")
     cfg = make_cfg(tmp_path)
-    db.upsert_item(conn, "artist:mbid:a1", "artist", title="a1")
-    put_vec(conn, "artist:mbid:a1", axis(0), cfg.model.embed_model)
-    add_candidate(conn, "artist:mbid:a1", source="lastfm_similar")
+    a1 = artist(conn, "a1")
+    put_vec(conn, a1, axis(0), cfg.model.embed_model)
+    add_candidate(conn, a1, source="lastfm_similar")
     db.pset_state(conn, "default", "centroid:artist", json.dumps({
         "pos": b64(axis(0)), "neg": None, "dim": DIM, "embed_model": "other/embedder",
         "exemplars": []}))
@@ -671,15 +703,16 @@ def _artist_centroid_store(tmp_path, names):
     conn = db.connect(tmp_path / "t.db")
     cfg = make_cfg(tmp_path)
     model = cfg.model.embed_model
+    iids = {}
     for name, v in names.items():
-        iid = f"artist:mbid:{name}"
-        db.upsert_item(conn, iid, "artist", title=name)
+        iid = artist(conn, name)
+        iids[name] = iid
         put_vec(conn, iid, v, model)
         add_candidate(conn, iid, source="lastfm_similar")
     db.pset_state(conn, "default", "centroid:artist", json.dumps({
         "pos": b64(axis(0)), "neg": None, "dim": DIM, "embed_model": model,
         "exemplars": []}))
-    return conn, cfg
+    return conn, cfg, iids
 
 
 def iso_days_ago(days):
@@ -687,11 +720,11 @@ def iso_days_ago(days):
 
 
 def test_rank_active_snooze_blocks_reproposal(tmp_path):
-    conn, cfg = _artist_centroid_store(tmp_path, {"a1": axis(0), "a2": axis(1)})
+    conn, cfg, iids = _artist_centroid_store(tmp_path, {"a1": axis(0), "a2": axis(1)})
     conn.execute(
         "INSERT INTO recommendations (run_id, ts, domain, item_id, score, status, acted_at)"
-        " VALUES ('r0', ?, 'artist', 'artist:mbid:a1', 0.9, 'snoozed', ?)",
-        (iso_days_ago(5), iso_days_ago(5)))
+        " VALUES ('r0', ?, 'artist', ?, 0.9, 'snoozed', ?)",
+        (iso_days_ago(5), iids["a1"], iso_days_ago(5)))
 
     stats = rank_mod.run(conn, cfg)
 
@@ -699,26 +732,26 @@ def test_rank_active_snooze_blocks_reproposal(tmp_path):
     assert stats["proposed"] == 1
     proposed = {r["item_id"] for r in conn.execute(
         "SELECT item_id FROM recommendations WHERE status='proposed'")}
-    assert proposed == {"artist:mbid:a2"}  # a1 would top the score if it leaked
+    assert proposed == {iids["a2"]}  # a1 would top the score if it leaked
     snoozed = conn.execute(
-        "SELECT status FROM recommendations WHERE item_id='artist:mbid:a1'").fetchone()
+        "SELECT status FROM recommendations WHERE item_id=?", (iids["a1"],)).fetchone()
     assert snoozed["status"] == "snoozed"
 
 
 def test_rank_lapsed_snooze_expires_and_reproposes(tmp_path):
-    conn, cfg = _artist_centroid_store(tmp_path, {"a1": axis(0)})
+    conn, cfg, iids = _artist_centroid_store(tmp_path, {"a1": axis(0)})
     conn.execute(
         "INSERT INTO recommendations (run_id, ts, domain, item_id, score, status, acted_at)"
-        " VALUES ('r0', ?, 'artist', 'artist:mbid:a1', 0.9, 'snoozed', ?)",
-        (iso_days_ago(45), iso_days_ago(31)))
+        " VALUES ('r0', ?, 'artist', ?, 0.9, 'snoozed', ?)",
+        (iso_days_ago(45), iids["a1"], iso_days_ago(31)))
 
     stats = rank_mod.run(conn, cfg)
 
     assert stats["unsnoozed"] == 1
     assert stats["proposed"] == 1
     rows = conn.execute(
-        "SELECT status, acted_at FROM recommendations WHERE item_id='artist:mbid:a1'"
-        " ORDER BY id").fetchall()
+        "SELECT status, acted_at FROM recommendations WHERE item_id=?"
+        " ORDER BY id", (iids["a1"],)).fetchall()
     assert [r["status"] for r in rows] == ["expired", "proposed"]
     assert rows[0]["acted_at"] > iso_days_ago(1)  # expiry stamped now, not snooze time
 
@@ -740,8 +773,7 @@ def test_rank_exploration_frac_override_changes_slot_split(tmp_path):
         "m9": unit(0.4 * axis(0) + 0.917 * axis(7)),
     }
     for name, v in vecs.items():
-        iid = f"movie:tmdb:{name}"
-        db.upsert_item(conn, iid, "movie", title=name.upper())
+        iid = movie(conn, name)
         put_vec(conn, iid, v, model)
         add_candidate(conn, iid)
     db.pset_state(conn, "default", "model:movie", json.dumps({
@@ -766,16 +798,18 @@ def test_rank_respects_video_queue_cap(tmp_path):
     cfg.autonomy.video_queue_max_pending = 1
     model = cfg.model.embed_model
     for i in range(4):
-        iid = f"movie:tmdb:c{i}"
-        db.upsert_item(conn, iid, "movie", title=f"C{i}")
+        iid = movie(conn, f"c{i}", f"C{i}")
         put_vec(conn, iid, axis(i), model)
         add_candidate(conn, iid)
     # one open movie proposal occupies the whole video budget
-    db.upsert_item(conn, "movie:tmdb:open1", "movie", title="Open")
+    open1 = movie(conn, "open1", "Open")
     conn.execute(
         "INSERT INTO recommendations (run_id, ts, domain, item_id, score, why, status)"
-        " VALUES ('r0', '2026-07-10T00:00:00Z', 'movie', 'movie:tmdb:open1', 0.5, '{}',"
-        " 'proposed')")
+        " VALUES ('r0', '2026-07-10T00:00:00Z', 'movie', ?, 0.5, '{}', 'proposed')",
+        (open1,))
+    db.pset_state(conn, "default", "centroid:movie", json.dumps({
+        "pos": b64(axis(0)), "neg": None, "dim": DIM, "embed_model": model,
+        "exemplars": []}))
     rank_mod.run(conn, cfg, top=5)
     open_video = conn.execute(
         "SELECT COUNT(*) FROM recommendations WHERE domain IN ('movie','series')"
@@ -789,8 +823,7 @@ def test_rank_video_cap_override_widens_budget(tmp_path):
     cfg.autonomy.video_queue_max_pending = 1
     model = cfg.model.embed_model
     for i in range(4):
-        iid = f"movie:tmdb:c{i}"
-        db.upsert_item(conn, iid, "movie", title=f"C{i}")
+        iid = movie(conn, f"c{i}", f"C{i}")
         put_vec(conn, iid, axis(i), model)
         add_candidate(conn, iid)
     db.pset_state(conn, "default", "centroid:movie", json.dumps({
@@ -812,8 +845,7 @@ def test_album_domain_falls_back_to_artist_model(tmp_path):
         "dim": DIM, "embed_model": model, "pos": b64(pos), "neg": None,
         "exemplars": []}))
     for i in range(3):
-        iid = f"album:mbid:al{i}"
-        db.upsert_item(conn, iid, "album", title=f"Album {i}")
+        iid = album(conn, f"al{i}", f"Album {i}")
         put_vec(conn, iid, unit(pos + 0.1 * axis(i + 1)), model)
         add_candidate(conn, iid, source="lastfm_top_albums")
     stats = rank_mod.run(conn, cfg, top=5)
@@ -828,41 +860,41 @@ def _two_profile_artist_store(tmp_path):
     conn = db.connect(tmp_path / "t.db")
     cfg = make_cfg(tmp_path, profiles=["alice", "bob"])
     model = cfg.model.embed_model
-    db.upsert_item(conn, "artist:mbid:x", "artist", title="Shared Pick")
-    put_vec(conn, "artist:mbid:x", axis(0), model)
+    x = artist(conn, "x", "Shared Pick")
+    put_vec(conn, x, axis(0), model)
     for profile in ("alice", "bob"):
-        add_candidate(conn, "artist:mbid:x", source="lastfm_similar", profile=profile)
+        add_candidate(conn, x, source="lastfm_similar", profile=profile)
         db.pset_state(conn, profile, "centroid:artist", json.dumps({
             "pos": b64(axis(0)), "neg": None, "dim": DIM, "embed_model": model,
             "exemplars": []}))
-    return conn, cfg
+    return conn, cfg, x
 
 
 def test_rank_proposes_same_item_to_both_profiles(tmp_path):
     """The open-rec unique index is (profile, item_id): one household,
     two queues, so both profiles may hold their own rec for one item."""
-    conn, cfg = _two_profile_artist_store(tmp_path)
+    conn, cfg, x = _two_profile_artist_store(tmp_path)
 
     stats = rank_mod.run(conn, cfg)
 
     assert stats["proposed"] == 2
     rows = conn.execute(
-        "SELECT profile FROM recommendations WHERE item_id='artist:mbid:x'"
-        " AND status='proposed'").fetchall()
+        "SELECT profile FROM recommendations WHERE item_id=? AND status='proposed'",
+        (x,)).fetchall()
     assert sorted(r["profile"] for r in rows) == ["alice", "bob"]
     # idempotence across runs: the per-profile index blocks re-queueing
     assert rank_mod.run(conn, cfg)["proposed"] == 0
 
 
 def test_rank_one_profiles_reject_does_not_block_the_other(tmp_path):
-    conn, cfg = _two_profile_artist_store(tmp_path)
-    db.add_event(conn, db.now(), "artist:mbid:x", "reject", -1.0, "user", profile="alice")
+    conn, cfg, x = _two_profile_artist_store(tmp_path)
+    db.add_event(conn, db.now(), x, "reject", -1.0, "user", profile="alice")
 
     stats = rank_mod.run(conn, cfg)
 
     assert stats["proposed"] == 1
     rows = conn.execute(
-        "SELECT profile FROM recommendations WHERE item_id='artist:mbid:x'"
-        " AND status='proposed'").fetchall()
+        "SELECT profile FROM recommendations WHERE item_id=? AND status='proposed'",
+        (x,)).fetchall()
     # alice said no — that verdict is hers alone, bob still gets the pick
     assert [r["profile"] for r in rows] == ["bob"]

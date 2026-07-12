@@ -63,7 +63,7 @@ def _unit_rows(x: np.ndarray) -> np.ndarray:
     return x / norms
 
 
-def _pool(conn: sqlite3.Connection, profile: str, domain: str) -> dict[str, dict]:
+def _pool(conn: sqlite3.Connection, profile: str, domain: str) -> dict[int, dict]:
     """Candidates still worth proposing to this profile: not owned, not
     already queued for them, not actively snoozed by them, never
     explicitly rejected by them. The library block stays global (one
@@ -85,20 +85,20 @@ def _pool(conn: sqlite3.Connection, profile: str, domain: str) -> dict[str, dict
         "                         WHERE profile = ? AND kind='reject')",
         (domain, profile, profile, snooze_cutoff(), profile),
     )
-    info: dict[str, dict] = {}
+    info: dict[int, dict] = {}
     for r in rows:
         d = info.setdefault(r["item_id"], {"sources": set(), "ext": 0.0, "seeds": set()})
         d["sources"].add(r["source"])
         if r["external_score"] is not None:
             d["ext"] = max(d["ext"], float(r["external_score"]))
-        if r["seed_item_id"]:
+        if r["seed_item_id"] is not None:
             d["seeds"].add(r["seed_item_id"])
     return info
 
 
-def _titles(conn: sqlite3.Connection, item_ids) -> dict[str, str]:
-    ids = [i for i in set(item_ids) if i]
-    out: dict[str, str] = {}
+def _titles(conn: sqlite3.Connection, item_ids) -> dict[int, str]:
+    ids = [i for i in set(item_ids) if i is not None]
+    out: dict[int, str] = {}
     for i in range(0, len(ids), 500):
         chunk = ids[i : i + 500]
         marks = ",".join("?" * len(chunk))
@@ -344,8 +344,7 @@ def _rank_profile(
             for item_id, _dim, blob in db.iter_embeddings(
                 conn, model_name, [e[0] for e in exemplars])
         }
-        seed_ids = {s for j in picked for s in info[ids[j]]["seeds"]}
-        titles = _titles(conn, [*ex_vecs, *seed_ids])
+        titles = _titles(conn, list(ex_vecs))
 
         for j in picked:
             item_id = ids[j]
@@ -358,7 +357,9 @@ def _rank_profile(
                     for e, s in sims
                 ],
                 "sources": sorted(info[item_id]["sources"]),
-                "seeds": sorted(titles.get(s) or s for s in info[item_id]["seeds"]),
+                # int item ids: queue resolves display titles at read time,
+                # so a later merge or retitle never bakes a stale name in
+                "seeds": sorted(info[item_id]["seeds"]),
                 "exploration": j in explored,
             }
             if j in explored and info[item_id]["sources"] & SERENDIPITY_SOURCES:

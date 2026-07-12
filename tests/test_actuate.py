@@ -159,6 +159,7 @@ class FakeJellyfin:
         self.items = {}  # "tmdb.603" -> jellyfin item id
         self.collections = {}  # id -> {"name": ..., "members": [...]}
         self.next_id = 1
+        self.provider_queries = []  # AnyProviderIdEquals values searched
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         if request.headers.get("X-Emby-Token") != self.api_key:
@@ -166,6 +167,7 @@ class FakeJellyfin:
         path, q = request.url.path, request.url.params
         if path == "/Items":
             if "AnyProviderIdEquals" in q:
+                self.provider_queries.append(q["AnyProviderIdEquals"])
                 jf_id = self.items.get(q["AnyProviderIdEquals"])
                 found = [{"Id": jf_id}] if jf_id else []
                 return httpx.Response(200, json={"Items": found})
@@ -267,9 +269,19 @@ def make_cfg(tmp_path, profiles=None, **autonomy):
     return C._build(raw)
 
 
-def add_rec(conn, item_id, domain, title, ids_json, status="proposed",
-            score=1.0, acted_at=None, ts=None, profile="default"):
-    db.upsert_item(conn, item_id, domain, title=title, ids=ids_json)
+def add_item(conn, domain, idents, title=None, meta=None):
+    """Item with every given identity: the first (ns, key) resolves it,
+    the rest are attached — the same two-step every collector performs."""
+    (ns, key), *rest = idents.items()
+    item_id = db.resolve_item(conn, domain, ns, str(key), title=title, meta=meta)
+    for extra_ns, extra_key in rest:
+        item_id = db.attach_identity(conn, item_id, extra_ns, str(extra_key))
+    return item_id
+
+
+def add_rec(conn, domain, title, idents, status="proposed",
+            score=1.0, acted_at=None, ts=None, profile="default", meta=None):
+    item_id = add_item(conn, domain, idents, title=title, meta=meta)
     cur = conn.execute(
         "INSERT INTO recommendations"
         " (profile, run_id, ts, domain, item_id, score, why, status, acted_at)"
@@ -282,6 +294,16 @@ def rec_row(conn, rec_id):
     return conn.execute("SELECT * FROM recommendations WHERE id=?", (rec_id,)).fetchone()
 
 
+def item_of(conn, rec_id):
+    return rec_row(conn, rec_id)["item_id"]
+
+
+def events_of(conn, item_id):
+    return conn.execute(
+        "SELECT ts, kind, weight, source, profile FROM events WHERE item_id=?",
+        (item_id,)).fetchall()
+
+
 def seed_album(net, mbid, artist_mbid, title, artist_name="Some Artist"):
     net.lidarr.album_lookup[mbid] = {
         "title": title, "artist_mbid": artist_mbid, "artist_name": artist_name}
@@ -292,10 +314,10 @@ def seed_album(net, mbid, artist_mbid, title, artist_name="Some Artist"):
 
 def test_paused_short_circuits_music_and_video(conn, tmp_path, net):
     cfg = make_cfg(tmp_path, video_mode="auto")
-    prop = add_rec(conn, "artist:mbid:mb1", "artist", "Artist 1", {"mbid": "mb1"}, score=0.9)
-    appr = add_rec(conn, "movie:tmdb:603", "movie", "The Matrix", {"tmdb": 603},
+    prop = add_rec(conn, "artist", "Artist 1", {"mbid": "mb1"}, score=0.9)
+    appr = add_rec(conn, "movie", "The Matrix", {"tmdb": 603},
                    status="approved")
-    stale = add_rec(conn, "movie:tmdb:604", "movie", "Old Prop", {"tmdb": 604},
+    stale = add_rec(conn, "movie", "Old Prop", {"tmdb": 604},
                     ts="2020-01-01T00:00:00Z")
     settings.set(conn, "paused", True)
 
@@ -319,8 +341,8 @@ def test_paused_short_circuits_music_and_video(conn, tmp_path, net):
 
 def test_music_weekly_cap_override_honored(conn, tmp_path, net):
     cfg = make_cfg(tmp_path, music_max_artists_per_week=3)
-    r1 = add_rec(conn, "artist:mbid:mb1", "artist", "Artist 1", {"mbid": "mb1"}, score=0.9)
-    r2 = add_rec(conn, "artist:mbid:mb2", "artist", "Artist 2", {"mbid": "mb2"}, score=0.8)
+    r1 = add_rec(conn, "artist", "Artist 1", {"mbid": "mb1"}, score=0.9)
+    r2 = add_rec(conn, "artist", "Artist 2", {"mbid": "mb2"}, score=0.8)
     settings.set(conn, "music_max_artists_per_week", 1)
     assert db.get_state(conn, "setting:music_max_artists_per_week") is not None
 
@@ -340,7 +362,7 @@ def test_music_weekly_cap_override_honored(conn, tmp_path, net):
 
 def test_music_mode_override_to_queue(conn, tmp_path, net):
     cfg = make_cfg(tmp_path)  # cfg says auto
-    rid = add_rec(conn, "artist:mbid:mb1", "artist", "Artist 1", {"mbid": "mb1"})
+    rid = add_rec(conn, "artist", "Artist 1", {"mbid": "mb1"})
     settings.set(conn, "music_mode", "queue")
     stats = apply_mod.run(conn, cfg)
     assert stats["music_added"] == 0
@@ -350,8 +372,8 @@ def test_music_mode_override_to_queue(conn, tmp_path, net):
 
 def test_video_cap_override_honored(conn, tmp_path, net):
     cfg = make_cfg(tmp_path, video_mode="auto", video_queue_max_pending=5)
-    top = add_rec(conn, "movie:tmdb:1", "movie", "M1", {"tmdb": 1}, score=0.9)
-    low = add_rec(conn, "movie:tmdb:2", "movie", "M2", {"tmdb": 2}, score=0.8)
+    top = add_rec(conn, "movie", "M1", {"tmdb": 1}, score=0.9)
+    low = add_rec(conn, "movie", "M2", {"tmdb": 2}, score=0.8)
     settings.set(conn, "video_queue_max_pending", 1)
     stats = apply_mod.run(conn, cfg)
     assert stats["video_added"] == 1
@@ -367,15 +389,15 @@ def test_music_weekly_cap_respected(conn, tmp_path, net):
     now = db.now()
     last_week = (datetime.now(timezone.utc) - timedelta(days=8)).strftime("%Y-%m-%dT%H:%M:%SZ")
     # two artists already acted this ISO week, one before it
-    add_rec(conn, "artist:mbid:aa1", "artist", "Acted One", {"mbid": "aa1"},
+    add_rec(conn, "artist", "Acted One", {"mbid": "aa1"},
             status="auto_added", acted_at=now)
-    add_rec(conn, "artist:mbid:aa2", "artist", "Acted Two", {"mbid": "aa2"},
+    add_rec(conn, "artist", "Acted Two", {"mbid": "aa2"},
             status="added", acted_at=now)
-    add_rec(conn, "artist:mbid:aa3", "artist", "Old Acted", {"mbid": "aa3"},
+    add_rec(conn, "artist", "Old Acted", {"mbid": "aa3"},
             status="auto_added", acted_at=last_week)
-    r1 = add_rec(conn, "artist:mbid:mb1", "artist", "Artist 1", {"mbid": "mb1"}, score=0.9)
-    r2 = add_rec(conn, "artist:mbid:mb2", "artist", "Artist 2", {"mbid": "mb2"}, score=0.8)
-    r3 = add_rec(conn, "artist:mbid:mb3", "artist", "Artist 3", {"mbid": "mb3"}, score=0.7)
+    r1 = add_rec(conn, "artist", "Artist 1", {"mbid": "mb1"}, score=0.9)
+    r2 = add_rec(conn, "artist", "Artist 2", {"mbid": "mb2"}, score=0.8)
+    r3 = add_rec(conn, "artist", "Artist 3", {"mbid": "mb3"}, score=0.7)
 
     stats = apply_mod.run(conn, cfg)
 
@@ -392,8 +414,7 @@ def test_music_weekly_cap_respected(conn, tmp_path, net):
     assert rec_row(conn, r1)["acted_at"]
     assert rec_row(conn, r2)["status"] == "proposed"
     assert rec_row(conn, r3)["status"] == "proposed"
-    events = conn.execute(
-        "SELECT ts, kind, weight, source FROM events WHERE item_id='artist:mbid:mb1'").fetchall()
+    events = events_of(conn, item_of(conn, r1))
     # audit trail only: gustarr's own add must not read as user praise
     assert [(e["kind"], e["weight"], e["source"]) for e in events] == \
         [("auto_add", 0.0, "gustarr")]
@@ -405,11 +426,11 @@ def test_music_budget_shared_across_profiles(conn, tmp_path, net):
     """One disk, one Lidarr: what alice's queue already spent this week
     is gone for bob — the acted count ignores profile by design."""
     cfg = make_cfg(tmp_path, profiles=["alice", "bob"], music_max_artists_per_week=2)
-    add_rec(conn, "artist:mbid:aa1", "artist", "Alice Spent", {"mbid": "aa1"},
+    add_rec(conn, "artist", "Alice Spent", {"mbid": "aa1"},
             status="auto_added", acted_at=db.now(), profile="alice")
-    b1 = add_rec(conn, "artist:mbid:b1", "artist", "Bob 1", {"mbid": "b1"}, score=0.9,
+    b1 = add_rec(conn, "artist", "Bob 1", {"mbid": "b1"}, score=0.9,
                  profile="bob")
-    b2 = add_rec(conn, "artist:mbid:b2", "artist", "Bob 2", {"mbid": "b2"}, score=0.8,
+    b2 = add_rec(conn, "artist", "Bob 2", {"mbid": "b2"}, score=0.8,
                  profile="bob")
 
     stats = apply_mod.run(conn, cfg)
@@ -421,13 +442,14 @@ def test_music_budget_shared_across_profiles(conn, tmp_path, net):
     assert rec_row(conn, b2)["status"] == "proposed"
     # the audit event names whose queue the add came from
     ev = conn.execute(
-        "SELECT profile, kind FROM events WHERE item_id='artist:mbid:b1'").fetchone()
+        "SELECT profile, kind FROM events WHERE item_id=?",
+        (item_of(conn, b1),)).fetchone()
     assert (ev["profile"], ev["kind"]) == ("bob", "auto_add")
 
 
 def test_music_queue_mode_leaves_proposed(conn, tmp_path, net):
     cfg = make_cfg(tmp_path, music_mode="queue")
-    r1 = add_rec(conn, "artist:mbid:mb1", "artist", "Artist 1", {"mbid": "mb1"})
+    r1 = add_rec(conn, "artist", "Artist 1", {"mbid": "mb1"})
     stats = apply_mod.run(conn, cfg)
     assert stats["music_added"] == 0
     assert net.lidarr.posted == []
@@ -437,10 +459,10 @@ def test_music_queue_mode_leaves_proposed(conn, tmp_path, net):
 def test_approved_artist_added_in_queue_mode(conn, tmp_path, net):
     # explicit approval is consent: actuated even when music_mode='queue'
     cfg = make_cfg(tmp_path, music_mode="queue")
-    rid = add_rec(conn, "artist:mbid:mb1", "artist", "Artist 1", {"mbid": "mb1"},
+    rid = add_rec(conn, "artist", "Artist 1", {"mbid": "mb1"},
                   status="approved")
     # queue already wrote the approve event when the user approved
-    db.add_event(conn, db.now(), "artist:mbid:mb1", "approve", 1.0, "user", {"rec_id": rid})
+    db.add_event(conn, db.now(), item_of(conn, rid), "approve", 1.0, "user", {"rec_id": rid})
 
     stats = apply_mod.run(conn, cfg)
 
@@ -450,16 +472,14 @@ def test_approved_artist_added_in_queue_mode(conn, tmp_path, net):
     assert row["status"] == "added"
     assert row["acted_at"]
     # no extra taste event: the approve written at approval time is enough
-    kinds = [e["kind"] for e in conn.execute(
-        "SELECT kind FROM events WHERE item_id='artist:mbid:mb1'")]
-    assert kinds == ["approve"]
+    assert [e["kind"] for e in events_of(conn, item_of(conn, rid))] == ["approve"]
 
 
 def test_approved_artist_exempt_from_weekly_budget(conn, tmp_path, net):
     cfg = make_cfg(tmp_path, music_max_artists_per_week=0)
-    rid = add_rec(conn, "artist:mbid:mb1", "artist", "Artist 1", {"mbid": "mb1"},
+    rid = add_rec(conn, "artist", "Artist 1", {"mbid": "mb1"},
                   status="approved")
-    prop = add_rec(conn, "artist:mbid:mb2", "artist", "Artist 2", {"mbid": "mb2"}, score=0.9)
+    prop = add_rec(conn, "artist", "Artist 2", {"mbid": "mb2"}, score=0.9)
     stats = apply_mod.run(conn, cfg)
     assert stats["music_budget"] == 0
     assert stats["music_added"] == 1  # the approval, not the proposal
@@ -468,8 +488,9 @@ def test_approved_artist_exempt_from_weekly_budget(conn, tmp_path, net):
 
 
 def test_approved_artist_without_mbid_marked_failed(conn, tmp_path, net):
+    # name-keyed item = no authoritative identity: unaddressable in lidarr
     cfg = make_cfg(tmp_path, music_mode="queue")
-    rid = add_rec(conn, "artist:lastfm:someband", "artist", "Some Band", {},
+    rid = add_rec(conn, "artist", "Some Band", {"name": "some band"},
                   status="approved")
     stats = apply_mod.run(conn, cfg)
     assert net.lidarr.posted == []
@@ -480,7 +501,7 @@ def test_approved_artist_without_mbid_marked_failed(conn, tmp_path, net):
 def test_approved_artist_survives_lidarr_outage(conn, tmp_path, net):
     cfg = make_cfg(tmp_path, music_mode="queue")
     net.lidarr.fail_add = (503, "service unavailable")
-    rid = add_rec(conn, "artist:mbid:mb1", "artist", "Artist 1", {"mbid": "mb1"},
+    rid = add_rec(conn, "artist", "Artist 1", {"mbid": "mb1"},
                   status="approved")
     stats = apply_mod.run(conn, cfg)
     assert stats["music_added"] == 0
@@ -498,7 +519,7 @@ def test_approved_artist_survives_lidarr_outage(conn, tmp_path, net):
 def test_approved_artist_4xx_marked_failed(conn, tmp_path, net):
     cfg = make_cfg(tmp_path, music_mode="queue")
     net.lidarr.fail_add = (400, "Invalid foreignArtistId")
-    rid = add_rec(conn, "artist:mbid:bogus", "artist", "Bogus", {"mbid": "bogus"},
+    rid = add_rec(conn, "artist", "Bogus", {"mbid": "bogus"},
                   status="approved")
     stats = apply_mod.run(conn, cfg)
     assert stats["music_added"] == 0
@@ -507,8 +528,8 @@ def test_approved_artist_4xx_marked_failed(conn, tmp_path, net):
 
 def test_music_skips_artists_without_mbid(conn, tmp_path, net):
     cfg = make_cfg(tmp_path, music_max_artists_per_week=1)
-    add_rec(conn, "artist:lastfm:someband", "artist", "Some Band", {}, score=0.99)
-    r2 = add_rec(conn, "artist:mbid:mb2", "artist", "Artist 2", {"mbid": "mb2"}, score=0.5)
+    add_rec(conn, "artist", "Some Band", {"name": "some band"}, score=0.99)
+    r2 = add_rec(conn, "artist", "Artist 2", {"mbid": "mb2"}, score=0.5)
     stats = apply_mod.run(conn, cfg)
     assert stats["music_added"] == 1
     assert net.lidarr.posted[0]["foreignArtistId"] == "mb2"
@@ -518,7 +539,7 @@ def test_music_skips_artists_without_mbid(conn, tmp_path, net):
 def test_lidarr_failure_keeps_proposed_and_counts_attempt(conn, tmp_path, net):
     cfg = make_cfg(tmp_path)
     net.lidarr.fail_add = (400, "Invalid foreignArtistId")
-    r1 = add_rec(conn, "artist:mbid:mb1", "artist", "Artist 1", {"mbid": "mb1"})
+    r1 = add_rec(conn, "artist", "Artist 1", {"mbid": "mb1"})
     stats = apply_mod.run(conn, cfg)
     assert stats["music_added"] == 0
     assert any("Artist 1" in e for e in stats["errors"])
@@ -551,18 +572,16 @@ def test_album_weekly_cap_respected(conn, tmp_path, net):
     now = db.now()
     last_week = (datetime.now(timezone.utc) - timedelta(days=8)).strftime("%Y-%m-%dT%H:%M:%SZ")
     # two albums already acted this ISO week, one before it
-    add_rec(conn, "album:mbid:done1", "album", "Done One", {"mbid": "done1"},
+    add_rec(conn, "album", "Done One", {"mbid": "done1"},
             status="auto_added", acted_at=now)
-    add_rec(conn, "album:mbid:done2", "album", "Done Two", {"mbid": "done2"},
+    add_rec(conn, "album", "Done Two", {"mbid": "done2"},
             status="added", acted_at=now)
-    add_rec(conn, "album:mbid:done3", "album", "Old Done", {"mbid": "done3"},
+    add_rec(conn, "album", "Old Done", {"mbid": "done3"},
             status="auto_added", acted_at=last_week)
     seed_album(net, "al1", "ar1", "Album 1", "Artist One")
     seed_album(net, "al2", "ar2", "Album 2", "Artist Two")
-    r1 = add_rec(conn, "album:mbid:al1", "album", "Album 1",
-                 {"mbid": "al1", "artist_mbid": "ar1"}, score=0.9)
-    r2 = add_rec(conn, "album:mbid:al2", "album", "Album 2",
-                 {"mbid": "al2", "artist_mbid": "ar2"}, score=0.8)
+    r1 = add_rec(conn, "album", "Album 1", {"mbid": "al1"}, score=0.9)
+    r2 = add_rec(conn, "album", "Album 2", {"mbid": "al2"}, score=0.8)
 
     stats = apply_mod.run(conn, cfg)
 
@@ -577,8 +596,7 @@ def test_album_weekly_cap_respected(conn, tmp_path, net):
     assert rec_row(conn, r1)["acted_at"]
     assert rec_row(conn, r2)["status"] == "proposed"
     # audit trail only: gustarr's own add must not read as user praise
-    events = conn.execute(
-        "SELECT kind, weight, source FROM events WHERE item_id='album:mbid:al1'").fetchall()
+    events = events_of(conn, item_of(conn, r1))
     assert [(e["kind"], e["weight"], e["source"]) for e in events] == \
         [("auto_add", 0.0, "gustarr")]
 
@@ -587,8 +605,8 @@ def test_album_budget_override_honored(conn, tmp_path, net):
     cfg = make_cfg(tmp_path, music_max_albums_per_week=5)
     seed_album(net, "al1", "ar1", "Album 1")
     seed_album(net, "al2", "ar2", "Album 2")
-    r1 = add_rec(conn, "album:mbid:al1", "album", "Album 1", {"mbid": "al1"}, score=0.9)
-    r2 = add_rec(conn, "album:mbid:al2", "album", "Album 2", {"mbid": "al2"}, score=0.8)
+    r1 = add_rec(conn, "album", "Album 1", {"mbid": "al1"}, score=0.9)
+    r2 = add_rec(conn, "album", "Album 2", {"mbid": "al2"}, score=0.8)
     settings.set(conn, "music_max_albums_per_week", 1)
 
     stats = apply_mod.run(conn, cfg)
@@ -602,7 +620,7 @@ def test_album_budget_override_honored(conn, tmp_path, net):
 def test_album_artist_shell_created_unmonitored_when_absent(conn, tmp_path, net):
     cfg = make_cfg(tmp_path)
     seed_album(net, "al1", "ar1", "OK Album", "New Artist")
-    rid = add_rec(conn, "album:mbid:al1", "album", "OK Album", {"mbid": "al1"})
+    rid = add_rec(conn, "album", "OK Album", {"mbid": "al1"})
 
     stats = apply_mod.run(conn, cfg)
 
@@ -622,16 +640,33 @@ def test_album_artist_shell_created_unmonitored_when_absent(conn, tmp_path, net)
     assert rec_row(conn, rid)["status"] == "auto_added"
 
 
+def test_album_prefers_release_group_mbid_from_meta(conn, tmp_path, net):
+    # the identities mbid may be whatever MB id a collector first saw;
+    # enrich stashes the release-group mbid (what lidarr looks up by) in
+    # meta — when present it must win over the identity key
+    cfg = make_cfg(tmp_path)
+    seed_album(net, "rg1", "ar1", "RG Album", "Artist One")
+    rid = add_rec(conn, "album", "RG Album", {"mbid": "release-xyz"},
+                  meta={"release_group_mbid": "rg1"})
+
+    stats = apply_mod.run(conn, cfg)
+
+    assert stats["albums_added"] == 1
+    album = next(a for a in net.lidarr.albums if a["foreignAlbumId"] == "rg1")
+    assert album["monitored"] is True
+    assert rec_row(conn, rid)["status"] == "auto_added"
+
+
 def test_approved_album_added_in_queue_mode(conn, tmp_path, net):
     # explicit approval is consent: actuated even when music_mode='queue'
     cfg = make_cfg(tmp_path, music_mode="queue")
     seed_album(net, "al1", "ar1", "Album 1", "Artist One")
     net.lidarr.register_artist("ar1", "Artist One")
-    rid = add_rec(conn, "album:mbid:al1", "album", "Album 1", {"mbid": "al1"},
+    rid = add_rec(conn, "album", "Album 1", {"mbid": "al1"},
                   status="approved")
     # queue already wrote the approve event when the user approved
-    db.add_event(conn, db.now(), "album:mbid:al1", "approve", 1.0, "user", {"rec_id": rid})
-    prop = add_rec(conn, "album:mbid:al2", "album", "Album 2", {"mbid": "al2"}, score=0.9)
+    db.add_event(conn, db.now(), item_of(conn, rid), "approve", 1.0, "user", {"rec_id": rid})
+    prop = add_rec(conn, "album", "Album 2", {"mbid": "al2"}, score=0.9)
 
     stats = apply_mod.run(conn, cfg)
 
@@ -644,9 +679,7 @@ def test_approved_album_added_in_queue_mode(conn, tmp_path, net):
     assert row["acted_at"]
     assert rec_row(conn, prop)["status"] == "proposed"  # queue mode: no auto pick
     # no extra taste event: the approve written at approval time is enough
-    kinds = [e["kind"] for e in conn.execute(
-        "SELECT kind FROM events WHERE item_id='album:mbid:al1'")]
-    assert kinds == ["approve"]
+    assert [e["kind"] for e in events_of(conn, item_of(conn, rid))] == ["approve"]
 
 
 def test_album_already_monitored_is_noop_success(conn, tmp_path, net):
@@ -654,7 +687,7 @@ def test_album_already_monitored_is_noop_success(conn, tmp_path, net):
     seed_album(net, "al1", "ar1", "Album 1", "Artist One")
     net.lidarr.album_lookup["al1"]["monitored"] = True
     net.lidarr.register_artist("ar1", "Artist One")
-    rid = add_rec(conn, "album:mbid:al1", "album", "Album 1", {"mbid": "al1"},
+    rid = add_rec(conn, "album", "Album 1", {"mbid": "al1"},
                   status="approved")
 
     stats = apply_mod.run(conn, cfg)
@@ -672,7 +705,7 @@ def test_approved_album_survives_lidarr_outage(conn, tmp_path, net):
     cfg = make_cfg(tmp_path, music_mode="queue")
     seed_album(net, "al1", "ar1", "Album 1", "Artist One")
     net.lidarr.fail_add = (503, "service unavailable")  # the artist-shell add 503s
-    rid = add_rec(conn, "album:mbid:al1", "album", "Album 1", {"mbid": "al1"},
+    rid = add_rec(conn, "album", "Album 1", {"mbid": "al1"},
                   status="approved")
     stats = apply_mod.run(conn, cfg)
     assert stats["albums_added"] == 0
@@ -689,7 +722,7 @@ def test_approved_album_survives_lidarr_outage(conn, tmp_path, net):
 
 def test_approved_album_unknown_mbid_marked_failed(conn, tmp_path, net):
     cfg = make_cfg(tmp_path, music_mode="queue")
-    rid = add_rec(conn, "album:mbid:nope", "album", "Ghost Album", {"mbid": "nope"},
+    rid = add_rec(conn, "album", "Ghost Album", {"mbid": "nope"},
                   status="approved")
     stats = apply_mod.run(conn, cfg)
     assert stats["albums_added"] == 0
@@ -702,10 +735,10 @@ def test_approved_album_unknown_mbid_marked_failed(conn, tmp_path, net):
 
 def test_approved_movie_added_without_event_duplication(conn, tmp_path, net):
     cfg = make_cfg(tmp_path)
-    rid = add_rec(conn, "movie:tmdb:603", "movie", "The Matrix", {"tmdb": 603},
+    rid = add_rec(conn, "movie", "The Matrix", {"tmdb": 603},
                   status="approved")
     # queue already wrote the approve event when the user approved
-    db.add_event(conn, db.now(), "movie:tmdb:603", "approve", 1.0, "user", {"rec_id": rid})
+    db.add_event(conn, db.now(), item_of(conn, rid), "approve", 1.0, "user", {"rec_id": rid})
 
     stats = apply_mod.run(conn, cfg)
 
@@ -721,13 +754,13 @@ def test_approved_movie_added_without_event_duplication(conn, tmp_path, net):
     assert row["status"] == "added"
     assert row["acted_at"]
     kinds = [e["kind"] for e in conn.execute(
-        "SELECT kind FROM events WHERE item_id='movie:tmdb:603'")]
+        "SELECT kind FROM events WHERE item_id=?", (item_of(conn, rid),))]
     assert kinds == ["approve"]
 
 
 def test_approved_series_added_via_sonarr(conn, tmp_path, net):
     cfg = make_cfg(tmp_path)
-    rid = add_rec(conn, "series:tvdb:81189", "series", "Breaking Bad", {"tvdb": 81189},
+    rid = add_rec(conn, "series", "Breaking Bad", {"tvdb": 81189},
                   status="approved")
     stats = apply_mod.run(conn, cfg)
     assert stats["video_added"] == 1
@@ -740,7 +773,7 @@ def test_approved_series_added_via_sonarr(conn, tmp_path, net):
 
 def test_series_with_only_tmdb_id_marked_failed(conn, tmp_path, net):
     cfg = make_cfg(tmp_path)
-    rid = add_rec(conn, "series:tmdb:1396", "series", "Some Show", {"tmdb": 1396},
+    rid = add_rec(conn, "series", "Some Show", {"tmdb": 1396},
                   status="approved")
     stats = apply_mod.run(conn, cfg)
     assert stats["video_failed"] == 1
@@ -752,7 +785,7 @@ def test_series_with_only_tmdb_id_marked_failed(conn, tmp_path, net):
 def test_approved_video_survives_arr_outage(conn, tmp_path, net):
     cfg = make_cfg(tmp_path)
     net.radarr.fail_add = (503, "service unavailable")
-    rid = add_rec(conn, "movie:tmdb:603", "movie", "The Matrix", {"tmdb": 603},
+    rid = add_rec(conn, "movie", "The Matrix", {"tmdb": 603},
                   status="approved")
     stats = apply_mod.run(conn, cfg)
     assert stats["video_added"] == 0
@@ -771,7 +804,7 @@ def test_approved_video_survives_arr_outage(conn, tmp_path, net):
 def test_approved_video_survives_connect_error(conn, tmp_path, net):
     cfg = make_cfg(tmp_path)
     net.down.add("radarr.test")
-    rid = add_rec(conn, "movie:tmdb:603", "movie", "The Matrix", {"tmdb": 603},
+    rid = add_rec(conn, "movie", "The Matrix", {"tmdb": 603},
                   status="approved")
     stats = apply_mod.run(conn, cfg)
     assert stats["video_failed"] == 0
@@ -788,7 +821,7 @@ def test_approved_video_survives_credential_failure(conn, tmp_path, net, status)
     # api-key rotation window must not burn approvals (enrich's taxonomy)
     cfg = make_cfg(tmp_path)
     net.radarr.fail_add = (status, "invalid api key")
-    rid = add_rec(conn, "movie:tmdb:603", "movie", "The Matrix", {"tmdb": 603},
+    rid = add_rec(conn, "movie", "The Matrix", {"tmdb": 603},
                   status="approved")
     stats = apply_mod.run(conn, cfg)
     assert stats["video_added"] == 0
@@ -812,7 +845,7 @@ def test_quality_profile_typo_leaves_approved(conn, tmp_path, net):
         "radarr": {"url": "http://radarr.test", "api_key": "rk",
                    "quality_profile": "Ultra-4K", "root_folder": "/movies"},
     })
-    rid = add_rec(conn, "movie:tmdb:603", "movie", "The Matrix", {"tmdb": 603},
+    rid = add_rec(conn, "movie", "The Matrix", {"tmdb": 603},
                   status="approved")
     stats = apply_mod.run(conn, cfg)
     assert stats["video_added"] == 0
@@ -830,7 +863,7 @@ def test_quality_profile_typo_leaves_approved(conn, tmp_path, net):
 def test_approved_video_4xx_marked_failed(conn, tmp_path, net):
     cfg = make_cfg(tmp_path)
     net.radarr.fail_add = (400, '[{"errorMessage": "TMDb id required"}]')
-    rid = add_rec(conn, "movie:tmdb:603", "movie", "The Matrix", {"tmdb": 603},
+    rid = add_rec(conn, "movie", "The Matrix", {"tmdb": 603},
                   status="approved")
     stats = apply_mod.run(conn, cfg)
     assert stats["video_failed"] == 1
@@ -840,7 +873,7 @@ def test_approved_video_4xx_marked_failed(conn, tmp_path, net):
 def test_radarr_already_exists_is_success(conn, tmp_path, net):
     cfg = make_cfg(tmp_path)
     net.radarr.fail_add = (400, '[{"errorMessage": "This movie has already been added"}]')
-    rid = add_rec(conn, "movie:tmdb:603", "movie", "The Matrix", {"tmdb": 603},
+    rid = add_rec(conn, "movie", "The Matrix", {"tmdb": 603},
                   status="approved")
     stats = apply_mod.run(conn, cfg)
     assert stats["video_added"] == 1
@@ -852,7 +885,7 @@ def test_exists_validator_error_code_is_success(conn, tmp_path, net):
     cfg = make_cfg(tmp_path)
     net.sonarr.fail_add = (
         400, '[{"errorCode": "SeriesExistsValidator", "errorMessage": "whatever"}]')
-    rid = add_rec(conn, "series:tvdb:81189", "series", "Breaking Bad", {"tvdb": 81189},
+    rid = add_rec(conn, "series", "Breaking Bad", {"tvdb": 81189},
                   status="approved")
     stats = apply_mod.run(conn, cfg)
     assert stats["video_added"] == 1
@@ -865,7 +898,7 @@ def test_path_conflict_400_is_not_a_duplicate(conn, tmp_path, net):
     net.radarr.fail_add = (
         400, '[{"propertyName": "Path", "errorCode": "MoviePathValidator",'
         ' "errorMessage": "Path is already configured for an existing movie"}]')
-    rid = add_rec(conn, "movie:tmdb:603", "movie", "The Matrix", {"tmdb": 603},
+    rid = add_rec(conn, "movie", "The Matrix", {"tmdb": 603},
                   status="approved")
     stats = apply_mod.run(conn, cfg)
     assert stats["video_added"] == 0
@@ -879,9 +912,9 @@ def test_path_conflict_400_is_not_a_duplicate(conn, tmp_path, net):
 
 def test_video_auto_mode_adds_proposed_within_cap(conn, tmp_path, net):
     cfg = make_cfg(tmp_path, video_mode="auto", video_queue_max_pending=2)
-    top = add_rec(conn, "movie:tmdb:1", "movie", "M1", {"tmdb": 1}, score=0.9)
-    mid = add_rec(conn, "series:tvdb:2", "series", "S2", {"tvdb": 2}, score=0.8)
-    low = add_rec(conn, "movie:tmdb:3", "movie", "M3", {"tmdb": 3}, score=0.2)
+    top = add_rec(conn, "movie", "M1", {"tmdb": 1}, score=0.9)
+    mid = add_rec(conn, "series", "S2", {"tvdb": 2}, score=0.8)
+    low = add_rec(conn, "movie", "M3", {"tmdb": 3}, score=0.2)
 
     stats = apply_mod.run(conn, cfg)
 
@@ -892,19 +925,18 @@ def test_video_auto_mode_adds_proposed_within_cap(conn, tmp_path, net):
     assert rec_row(conn, mid)["status"] == "auto_added"
     assert rec_row(conn, low)["status"] == "proposed"  # over the per-run cap
     # audit event only, invisible to training
-    events = conn.execute(
-        "SELECT kind, weight, source FROM events WHERE item_id='movie:tmdb:1'").fetchall()
+    events = events_of(conn, item_of(conn, top))
     assert [(e["kind"], e["weight"], e["source"]) for e in events] == \
         [("auto_add", 0.0, "gustarr")]
 
 
 def test_video_auto_mode_prefers_approved_and_skips_idless(conn, tmp_path, net):
     cfg = make_cfg(tmp_path, video_mode="auto", video_queue_max_pending=1)
-    approved = add_rec(conn, "movie:tmdb:10", "movie", "Approved", {"tmdb": 10},
+    approved = add_rec(conn, "movie", "Approved", {"tmdb": 10},
                        status="approved", score=0.1)
     # tvdb-less series must not burn the single auto slot
-    idless = add_rec(conn, "series:tmdb:11", "series", "No tvdb", {"tmdb": 11}, score=0.9)
-    auto = add_rec(conn, "movie:tmdb:12", "movie", "Auto", {"tmdb": 12}, score=0.5)
+    idless = add_rec(conn, "series", "No tvdb", {"tmdb": 11}, score=0.9)
+    auto = add_rec(conn, "movie", "Auto", {"tmdb": 12}, score=0.5)
 
     stats = apply_mod.run(conn, cfg)
 
@@ -916,7 +948,7 @@ def test_video_auto_mode_prefers_approved_and_skips_idless(conn, tmp_path, net):
 
 def test_video_queue_mode_ignores_proposed(conn, tmp_path, net):
     cfg = make_cfg(tmp_path)  # video_mode defaults to queue
-    rid = add_rec(conn, "movie:tmdb:1", "movie", "M1", {"tmdb": 1}, score=0.9)
+    rid = add_rec(conn, "movie", "M1", {"tmdb": 1}, score=0.9)
     stats = apply_mod.run(conn, cfg)
     assert stats["video_added"] == 0
     assert net.radarr.posted == []
@@ -930,7 +962,7 @@ def test_successful_adds_committed_immediately(conn, tmp_path, net):
     # an arr add is irreversible: its record must survive the caller
     # never reaching conn.commit() (crash later in the run)
     cfg = make_cfg(tmp_path)
-    rid = add_rec(conn, "movie:tmdb:603", "movie", "The Matrix", {"tmdb": 603},
+    rid = add_rec(conn, "movie", "The Matrix", {"tmdb": 603},
                   status="approved")
     apply_mod.run(conn, cfg)
     other = db.connect(tmp_path / "t.db")
@@ -944,10 +976,10 @@ def test_successful_adds_committed_immediately(conn, tmp_path, net):
 
 def test_video_queue_overflow_expires_lowest_scores(conn, tmp_path, net):
     cfg = make_cfg(tmp_path, video_queue_max_pending=2)
-    keep1 = add_rec(conn, "movie:tmdb:1", "movie", "M1", {"tmdb": 1}, score=0.9)
-    keep2 = add_rec(conn, "movie:tmdb:2", "movie", "M2", {"tmdb": 2}, score=0.8)
-    drop1 = add_rec(conn, "movie:tmdb:3", "movie", "M3", {"tmdb": 3}, score=0.2)
-    drop2 = add_rec(conn, "series:tvdb:4", "series", "S4", {"tvdb": 4}, score=0.1)
+    keep1 = add_rec(conn, "movie", "M1", {"tmdb": 1}, score=0.9)
+    keep2 = add_rec(conn, "movie", "M2", {"tmdb": 2}, score=0.8)
+    drop1 = add_rec(conn, "movie", "M3", {"tmdb": 3}, score=0.2)
+    drop2 = add_rec(conn, "series", "S4", {"tvdb": 4}, score=0.1)
     stats = apply_mod.run(conn, cfg)
     assert stats["overflow_expired"] == 2
     assert rec_row(conn, keep1)["status"] == "proposed"
@@ -958,7 +990,7 @@ def test_video_queue_overflow_expires_lowest_scores(conn, tmp_path, net):
 
 def test_stale_proposals_expire(conn, tmp_path, net):
     cfg = make_cfg(tmp_path)  # proposal_ttl_days default 30
-    rid = add_rec(conn, "movie:tmdb:603", "movie", "Old Prop", {"tmdb": 603},
+    rid = add_rec(conn, "movie", "Old Prop", {"tmdb": 603},
                   ts="2020-01-01T00:00:00Z")
     stats = apply_mod.run(conn, cfg)
     assert stats["expired"] == 1
@@ -970,8 +1002,8 @@ def test_stale_proposals_expire(conn, tmp_path, net):
 
 def test_dry_run_mutates_nothing(conn, tmp_path, net):
     cfg = make_cfg(tmp_path)
-    r1 = add_rec(conn, "artist:mbid:mb1", "artist", "Artist 1", {"mbid": "mb1"}, score=0.9)
-    r2 = add_rec(conn, "movie:tmdb:603", "movie", "The Matrix", {"tmdb": 603},
+    r1 = add_rec(conn, "artist", "Artist 1", {"mbid": "mb1"}, score=0.9)
+    r2 = add_rec(conn, "movie", "The Matrix", {"tmdb": 603},
                  status="approved")
 
     stats = apply_mod.run(conn, cfg, dry_run=True)
@@ -989,8 +1021,8 @@ def test_dry_run_mutates_nothing(conn, tmp_path, net):
 
 def test_tag_ensured_once_across_adds(conn, tmp_path, net):
     cfg = make_cfg(tmp_path)
-    add_rec(conn, "movie:tmdb:1", "movie", "M1", {"tmdb": 1}, status="approved", score=0.9)
-    add_rec(conn, "movie:tmdb:2", "movie", "M2", {"tmdb": 2}, status="approved", score=0.8)
+    add_rec(conn, "movie", "M1", {"tmdb": 1}, status="approved", score=0.9)
+    add_rec(conn, "movie", "M2", {"tmdb": 2}, status="approved", score=0.8)
     stats = apply_mod.run(conn, cfg)
     assert stats["video_added"] == 2
     tag_calls = [m for m, h, p in net.log if h == "radarr.test" and p == "/api/v3/tag"]
@@ -1038,9 +1070,9 @@ def test_root_folder_explicit_mismatch_raises(net):
 
 def test_jellyfin_collections_created_then_idempotent(conn, tmp_path, net):
     cfg = make_cfg(tmp_path)
-    add_rec(conn, "movie:tmdb:603", "movie", "The Matrix", {"tmdb": 603}, status="added",
+    add_rec(conn, "movie", "The Matrix", {"tmdb": 603}, status="added",
             acted_at=db.now())
-    add_rec(conn, "artist:mbid:mb1", "artist", "Artist 1", {"mbid": "mb1"},
+    add_rec(conn, "artist", "Artist 1", {"mbid": "mb1"},
             status="auto_added", acted_at=db.now())
     net.jellyfin.items["tmdb.603"] = "jf-603"
     net.jellyfin.items["musicbrainzartist.mb1"] = "jf-mb1"
@@ -1063,12 +1095,31 @@ def test_jellyfin_collection_extended_not_recreated(conn, tmp_path, net):
     cfg = make_cfg(tmp_path)
     net.jellyfin.collections["coll-pre"] = {
         "name": "Gustarr Discover: Movies", "members": ["jf-1"]}
-    add_rec(conn, "movie:tmdb:2", "movie", "M2", {"tmdb": 2}, status="added")
+    add_rec(conn, "movie", "M2", {"tmdb": 2}, status="added")
     net.jellyfin.items["tmdb.2"] = "jf-2"
     stats = jellyfin_collections.sync_collections(conn, cfg)
     assert stats["collections_created"] == 0
     assert stats["collection_adds"] == 1
     assert net.jellyfin.collections["coll-pre"]["members"] == ["jf-1", "jf-2"]
+
+
+def test_jellyfin_identity_skips_provider_search(conn, tmp_path, net):
+    # a 'jellyfin' identity IS the Jellyfin item id: no search round-trip,
+    # and it even routes items with no provider mapping at all (albums)
+    cfg = make_cfg(tmp_path)
+    add_rec(conn, "movie", "The Matrix", {"tmdb": 603, "jellyfin": "jf-direct"},
+            status="added", acted_at=db.now())
+    add_rec(conn, "album", "In Rainbows", {"mbid": "al1", "jellyfin": "jf-album"},
+            status="auto_added", acted_at=db.now())
+
+    stats = jellyfin_collections.sync_collections(conn, cfg)
+
+    assert stats == {"checked": 2, "matched": 2, "collections_created": 2,
+                     "collection_adds": 2}
+    assert net.jellyfin.provider_queries == []  # no AnyProviderIdEquals lookups
+    by_name = {c["name"]: c["members"] for c in net.jellyfin.collections.values()}
+    assert by_name["Gustarr Discover: Movies"] == ["jf-direct"]
+    assert by_name["Gustarr Discover: Music"] == ["jf-album"]
 
 
 def test_jellyfin_skipped_without_config(conn, tmp_path, net):
@@ -1078,7 +1129,7 @@ def test_jellyfin_skipped_without_config(conn, tmp_path, net):
 
 def test_jellyfin_failure_is_best_effort(conn, tmp_path, net, monkeypatch):
     cfg = make_cfg(tmp_path)
-    add_rec(conn, "movie:tmdb:603", "movie", "The Matrix", {"tmdb": 603}, status="approved")
+    add_rec(conn, "movie", "The Matrix", {"tmdb": 603}, status="approved")
 
     def boom(*a, **kw):
         raise RuntimeError("jellyfin down")

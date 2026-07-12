@@ -33,12 +33,16 @@ def cfg(tmp_path):
     })
 
 
-def add_rec(conn, item_id, domain="movie", title=None, year=None, score=0.5,
+def add_rec(conn, ident, domain="movie", title=None, year=None, score=0.5,
             why=None, status="proposed", genres=None, meta=None, profile="default"):
+    """ident is 'ns:key' — resolved through THE write path, so the same
+    spelling in two calls lands on the same item, as in production."""
+    ns, key = ident.split(":", 1)
     item_meta = dict(meta or {})
     if genres:
         item_meta["genres"] = genres
-    db.upsert_item(conn, item_id, domain, title, year, meta=item_meta or None)
+    item_id = db.resolve_item(conn, domain, ns, key, title=title, year=year,
+                              meta=item_meta or None)
     cur = conn.execute(
         "INSERT INTO recommendations (profile, run_id, ts, domain, item_id, score, why, status)"
         " VALUES (?, 'r1', ?, ?, ?, ?, ?, ?)",
@@ -46,14 +50,19 @@ def add_rec(conn, item_id, domain="movie", title=None, year=None, score=0.5,
     return cur.lastrowid
 
 
+def item_of(conn, rec_id):
+    return conn.execute(
+        "SELECT item_id FROM recommendations WHERE id=?", (rec_id,)).fetchone()["item_id"]
+
+
 # ── queue: list ──────────────────────────────────────────────────────
 
 
 def test_list_recs_default_open_queue_score_desc(conn):
-    low = add_rec(conn, "movie:tmdb:1", title="Low", year=2001, score=0.2, genres=["Drama"])
-    high = add_rec(conn, "movie:tmdb:2", title="High", year=2002, score=0.9,
+    low = add_rec(conn, "tmdb:1", title="Low", year=2001, score=0.2, genres=["Drama"])
+    high = add_rec(conn, "tmdb:2", title="High", year=2002, score=0.9,
                    why={"sources": ["tmdb_similar"]})
-    add_rec(conn, "series:tvdb:3", domain="series", title="Done", score=0.7, status="added")
+    add_rec(conn, "tvdb:3", domain="series", title="Done", score=0.7, status="added")
 
     rows = queue.list_recs(conn)
     assert [r["id"] for r in rows] == [high, low]
@@ -64,9 +73,9 @@ def test_list_recs_default_open_queue_score_desc(conn):
 
 
 def test_list_recs_surfaces_poster_and_truncated_overview(conn):
-    rich = add_rec(conn, "movie:tmdb:10", title="Rich", score=0.9,
+    rich = add_rec(conn, "tmdb:10", title="Rich", score=0.9,
                    meta={"poster_path": "/p10.jpg", "overview": "o" * 500})
-    bare = add_rec(conn, "movie:tmdb:11", title="Bare", score=0.1)
+    bare = add_rec(conn, "tmdb:11", title="Bare", score=0.1)
 
     rows = {r["id"]: r for r in queue.list_recs(conn)}
     assert rows[rich]["poster_path"] == "/p10.jpg"
@@ -77,9 +86,9 @@ def test_list_recs_surfaces_poster_and_truncated_overview(conn):
 
 
 def test_list_recs_surfaces_trailer_and_tolerates_absence(conn):
-    with_clip = add_rec(conn, "movie:tmdb:12", title="Clip", score=0.8,
+    with_clip = add_rec(conn, "tmdb:12", title="Clip", score=0.8,
                         meta={"trailer": "yt-abc123"})
-    without = add_rec(conn, "movie:tmdb:13", title="NoClip", score=0.2)
+    without = add_rec(conn, "tmdb:13", title="NoClip", score=0.2)
 
     rows = {r["id"]: r for r in queue.list_recs(conn)}
     assert rows[with_clip]["trailer"] == "yt-abc123"
@@ -88,20 +97,31 @@ def test_list_recs_surfaces_trailer_and_tolerates_absence(conn):
 
 
 def test_list_recs_filters(conn):
-    add_rec(conn, "movie:tmdb:1", title="M", score=0.4)
-    add_rec(conn, "series:tvdb:2", domain="series", title="S", score=0.6)
-    add_rec(conn, "movie:tmdb:3", title="A", score=0.5, status="approved")
+    add_rec(conn, "tmdb:1", title="M", score=0.4)
+    add_rec(conn, "tvdb:2", domain="series", title="S", score=0.6)
+    add_rec(conn, "tmdb:3", title="A", score=0.5, status="approved")
 
     assert [r["title"] for r in queue.list_recs(conn, domain="movie")] == ["M"]
     assert len(queue.list_recs(conn, status="all")) == 3
     assert [r["title"] for r in queue.list_recs(conn, status="approved")] == ["A"]
 
 
+def test_list_recs_exposes_identities_under_ids(conn):
+    rid = add_rec(conn, "tmdb:603", title="The Matrix", score=0.9)
+    db.attach_identity(conn, item_of(conn, rid), "imdb", "tt0133093")
+
+    row = queue.list_recs(conn)[0]
+    # the response key stays 'ids' for web/CLI compat (they read mbid/tvdb
+    # out of it); the content now comes from the identities table
+    assert row["ids"] == {"tmdb": "603", "imdb": "tt0133093"}
+    assert row["item_id"] == item_of(conn, rid)
+
+
 def test_list_recs_surfaces_image_artist_and_type(conn):
-    album = add_rec(conn, "album:mbid:rg1", domain="album", title="In Rainbows", year=2007,
+    album = add_rec(conn, "mbid:rg1", domain="album", title="In Rainbows", year=2007,
                     score=0.8, meta={"image": "https://img.example/ir.jpg",
                                      "artist": "Radiohead", "type": "Album"})
-    bare = add_rec(conn, "artist:mbid:aa", domain="artist", title="Radiohead", score=0.3)
+    bare = add_rec(conn, "mbid:aa", domain="artist", title="Radiohead", score=0.3)
 
     rows = {r["id"]: r for r in queue.list_recs(conn)}
     assert rows[album]["image"] == "https://img.example/ir.jpg"
@@ -114,9 +134,9 @@ def test_list_recs_surfaces_image_artist_and_type(conn):
 
 
 def test_list_recs_music_domain_alias(conn):
-    artist = add_rec(conn, "artist:mbid:aa", domain="artist", title="Artist", score=0.9)
-    album = add_rec(conn, "album:mbid:rg1", domain="album", title="Album", score=0.5)
-    add_rec(conn, "movie:tmdb:1", title="Movie", score=0.7)
+    artist = add_rec(conn, "mbid:aa", domain="artist", title="Artist", score=0.9)
+    album = add_rec(conn, "mbid:rg1", domain="album", title="Album", score=0.5)
+    add_rec(conn, "tmdb:1", title="Movie", score=0.7)
 
     # 'music' spans both audio domains; score ordering still applies
     assert [r["id"] for r in queue.list_recs(conn, domain="music")] == [artist, album]
@@ -126,9 +146,9 @@ def test_list_recs_music_domain_alias(conn):
 
 
 def test_list_recs_scoped_to_profile(conn):
-    alice = add_rec(conn, "movie:tmdb:1", title="Hers", score=0.9, profile="alice")
-    add_rec(conn, "movie:tmdb:2", title="His", score=0.8, profile="bob")
-    default = add_rec(conn, "movie:tmdb:3", title="Legacy", score=0.7)
+    alice = add_rec(conn, "tmdb:1", title="Hers", score=0.9, profile="alice")
+    add_rec(conn, "tmdb:2", title="His", score=0.8, profile="bob")
+    default = add_rec(conn, "tmdb:3", title="Legacy", score=0.7)
 
     # no profile argument = the synthesized single-user profile, so
     # pre-profile callers (web, scripts) keep seeing exactly their queue
@@ -142,7 +162,7 @@ def test_list_recs_scoped_to_profile(conn):
 
 
 def test_approve_flips_status_and_writes_event(conn):
-    rid = add_rec(conn, "movie:tmdb:603", title="The Matrix", year=1999, score=0.9)
+    rid = add_rec(conn, "tmdb:603", title="The Matrix", year=1999, score=0.9)
     stats = queue.set_status(conn, rid, "approved")
     assert stats == {"updated": 1, "events": 1}
 
@@ -151,7 +171,7 @@ def test_approve_flips_status_and_writes_event(conn):
     assert rec["acted_at"] is not None
 
     ev = conn.execute("SELECT * FROM events").fetchone()
-    assert ev["item_id"] == "movie:tmdb:603"
+    assert ev["item_id"] == item_of(conn, rid)
     assert ev["kind"] == "approve"
     assert ev["source"] == "user"
     assert ev["weight"] == WEIGHTS["approve"]
@@ -160,19 +180,19 @@ def test_approve_flips_status_and_writes_event(conn):
 
 
 def test_reject_writes_negative_event(conn):
-    rid = add_rec(conn, "artist:mbid:aa", domain="artist", title="Nickelback")
+    rid = add_rec(conn, "mbid:aa", domain="artist", title="Nickelback")
     queue.set_status(conn, rid, "rejected")
 
     rec = conn.execute("SELECT status FROM recommendations WHERE id=?", (rid,)).fetchone()
     assert rec["status"] == "rejected"
     ev = conn.execute("SELECT * FROM events WHERE kind='reject'").fetchone()
-    assert ev["item_id"] == "artist:mbid:aa"
+    assert ev["item_id"] == item_of(conn, rid)
     assert ev["weight"] == WEIGHTS["reject"] == -1.0
     assert ev["source"] == "user"
 
 
 def test_exploration_reject_is_soft(conn):
-    rid = add_rec(conn, "movie:tmdb:8", title="Wildcard", why={"exploration": True})
+    rid = add_rec(conn, "tmdb:8", title="Wildcard", why={"exploration": True})
     queue.set_status(conn, rid, "rejected")
 
     ev = conn.execute("SELECT * FROM events WHERE kind='reject'").fetchone()
@@ -184,7 +204,7 @@ def test_exploration_reject_is_soft(conn):
 
 
 def test_reject_with_falsy_exploration_stays_full_weight(conn):
-    rid = add_rec(conn, "movie:tmdb:8", title="Safe Bet", why={"exploration": False})
+    rid = add_rec(conn, "tmdb:8", title="Safe Bet", why={"exploration": False})
     queue.set_status(conn, rid, "rejected")
 
     ev = conn.execute("SELECT * FROM events WHERE kind='reject'").fetchone()
@@ -193,7 +213,7 @@ def test_reject_with_falsy_exploration_stays_full_weight(conn):
 
 
 def test_exploration_approve_keeps_full_weight(conn):
-    rid = add_rec(conn, "movie:tmdb:9", title="Wildcard", why={"exploration": True})
+    rid = add_rec(conn, "tmdb:9", title="Wildcard", why={"exploration": True})
     queue.set_status(conn, rid, "approved")
 
     ev = conn.execute("SELECT * FROM events WHERE kind='approve'").fetchone()
@@ -202,7 +222,7 @@ def test_exploration_approve_keeps_full_weight(conn):
 
 
 def test_set_status_profile_guard_and_event_attribution(conn):
-    rid = add_rec(conn, "movie:tmdb:40", title="Hers", profile="alice")
+    rid = add_rec(conn, "tmdb:40", title="Hers", profile="alice")
     # the guard only bites when a profile is supplied and wrong
     with pytest.raises(ValueError, match="belongs to profile 'alice'"):
         queue.set_status(conn, rid, "approved", profile="bob")
@@ -216,7 +236,7 @@ def test_set_status_profile_guard_and_event_attribution(conn):
 
 
 def test_forgive_and_explain_profile_guard(conn):
-    rid = add_rec(conn, "movie:tmdb:41", title="Hers", profile="alice")
+    rid = add_rec(conn, "tmdb:41", title="Hers", profile="alice")
     with pytest.raises(ValueError, match="belongs to profile 'alice'"):
         queue.explain(conn, rid, profile="bob")
     assert "Hers" in queue.explain(conn, rid, profile="alice")
@@ -227,7 +247,7 @@ def test_forgive_and_explain_profile_guard(conn):
 
 
 def test_double_approve_raises(conn):
-    rid = add_rec(conn, "movie:tmdb:1", title="M")
+    rid = add_rec(conn, "tmdb:1", title="M")
     queue.set_status(conn, rid, "approved")
     with pytest.raises(ValueError, match="already approved"):
         queue.set_status(conn, rid, "approved")
@@ -239,15 +259,15 @@ def test_set_status_guards(conn):
     with pytest.raises(ValueError, match="no recommendation"):
         queue.set_status(conn, 999, "approved")
 
-    terminal = add_rec(conn, "movie:tmdb:1", title="M", status="added")
+    terminal = add_rec(conn, "tmdb:1", title="M", status="added")
     with pytest.raises(ValueError, match="added"):
         queue.set_status(conn, terminal, "rejected")
 
-    auto = add_rec(conn, "movie:tmdb:2", title="N", status="auto_added")
+    auto = add_rec(conn, "tmdb:2", title="N", status="auto_added")
     with pytest.raises(ValueError, match="auto_added"):
         queue.set_status(conn, auto, "approved")
 
-    open_rec = add_rec(conn, "movie:tmdb:3", title="O")
+    open_rec = add_rec(conn, "tmdb:3", title="O")
     with pytest.raises(ValueError):
         queue.set_status(conn, open_rec, "added")  # apply's business, not the queue's
     assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
@@ -257,7 +277,7 @@ def test_set_status_guards(conn):
 
 
 def test_snooze_sets_acted_at_and_writes_no_event(conn):
-    rid = add_rec(conn, "movie:tmdb:20", title="Later", score=0.7)
+    rid = add_rec(conn, "tmdb:20", title="Later", score=0.7)
     stats = queue.set_status(conn, rid, "snoozed")
     assert stats == {"updated": 1, "events": 0}
 
@@ -269,24 +289,24 @@ def test_snooze_sets_acted_at_and_writes_no_event(conn):
 
 
 def test_double_snooze_raises(conn):
-    rid = add_rec(conn, "movie:tmdb:21", title="Later")
+    rid = add_rec(conn, "tmdb:21", title="Later")
     queue.set_status(conn, rid, "snoozed")
     with pytest.raises(ValueError, match="already snoozed"):
         queue.set_status(conn, rid, "snoozed")
 
 
 def test_snooze_only_from_proposed(conn):
-    approved = add_rec(conn, "movie:tmdb:22", title="Yes", status="approved")
+    approved = add_rec(conn, "tmdb:22", title="Yes", status="approved")
     with pytest.raises(ValueError, match="approved"):
         queue.set_status(conn, approved, "snoozed")
-    rejected = add_rec(conn, "movie:tmdb:23", title="No", status="rejected")
+    rejected = add_rec(conn, "tmdb:23", title="No", status="rejected")
     with pytest.raises(ValueError, match="rejected"):
         queue.set_status(conn, rejected, "snoozed")
     assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
 
 
 def test_snoozed_rec_can_still_be_approved(conn):
-    rid = add_rec(conn, "movie:tmdb:24", title="Actually Yes")
+    rid = add_rec(conn, "tmdb:24", title="Actually Yes")
     queue.set_status(conn, rid, "snoozed")
     queue.set_status(conn, rid, "approved")
     rec = conn.execute("SELECT status FROM recommendations WHERE id=?", (rid,)).fetchone()
@@ -295,8 +315,8 @@ def test_snoozed_rec_can_still_be_approved(conn):
 
 
 def test_list_recs_filters_snoozed(conn):
-    add_rec(conn, "movie:tmdb:25", title="Open")
-    snoozed = add_rec(conn, "movie:tmdb:26", title="Napping")
+    add_rec(conn, "tmdb:25", title="Open")
+    snoozed = add_rec(conn, "tmdb:26", title="Napping")
     queue.set_status(conn, snoozed, "snoozed")
 
     assert [r["title"] for r in queue.list_recs(conn, status="snoozed")] == ["Napping"]
@@ -310,12 +330,12 @@ def test_forgive_deletes_only_that_recs_reject_and_expires_it(conn):
     # two rejected recs for the SAME item (legal: the partial unique index
     # only covers open statuses) — forgiving one must not touch the other's
     # reject event
-    first = add_rec(conn, "movie:tmdb:30", title="Redeemed", score=0.5)
+    first = add_rec(conn, "tmdb:30", title="Redeemed", score=0.5)
     queue.set_status(conn, first, "rejected")
     # backdate the first verdict: same-second rejects of one item would
     # collapse into a single row under the events uniqueness key
     conn.execute("UPDATE events SET ts='2026-01-01T00:00:00Z' WHERE kind='reject'")
-    second = add_rec(conn, "movie:tmdb:30", title="Redeemed", score=0.6)
+    second = add_rec(conn, "tmdb:30", title="Redeemed", score=0.6)
     queue.set_status(conn, second, "rejected")
     assert conn.execute("SELECT COUNT(*) FROM events WHERE kind='reject'").fetchone()[0] == 2
 
@@ -331,9 +351,9 @@ def test_forgive_deletes_only_that_recs_reject_and_expires_it(conn):
 
 
 def test_forgive_spares_other_event_kinds(conn):
-    rid = add_rec(conn, "movie:tmdb:31", title="Watched Anyway")
+    rid = add_rec(conn, "tmdb:31", title="Watched Anyway")
     queue.set_status(conn, rid, "rejected")
-    db.add_event(conn, "2026-01-01T00:00:00Z", "movie:tmdb:31", "complete",
+    db.add_event(conn, "2026-01-01T00:00:00Z", item_of(conn, rid), "complete",
                  WEIGHTS["complete"], "jellyfin")
 
     assert queue.forgive(conn, rid) == {"deleted_events": 1}
@@ -344,10 +364,10 @@ def test_forgive_spares_other_event_kinds(conn):
 def test_forgive_requires_rejected(conn):
     with pytest.raises(ValueError, match="no recommendation"):
         queue.forgive(conn, 999)
-    proposed = add_rec(conn, "movie:tmdb:32", title="Open")
+    proposed = add_rec(conn, "tmdb:32", title="Open")
     with pytest.raises(ValueError, match="proposed"):
         queue.forgive(conn, proposed)
-    added = add_rec(conn, "movie:tmdb:33", title="Done", status="added")
+    added = add_rec(conn, "tmdb:33", title="Done", status="added")
     with pytest.raises(ValueError, match="added"):
         queue.forgive(conn, added)
 
@@ -356,15 +376,16 @@ def test_forgive_requires_rejected(conn):
 
 
 def test_explain_renders_all_sections(conn):
-    db.upsert_item(conn, "movie:tmdb:604", "movie", "Heat", 1995)
+    # why-json references items by their INT ids now
+    heat = db.resolve_item(conn, "movie", "tmdb", "604", title="Heat", year=1995)
     rid = add_rec(
-        conn, "movie:tmdb:603", title="The Matrix", year=1999, score=0.87,
+        conn, "tmdb:603", title="The Matrix", year=1999, score=0.87,
         genres=["Action", "Sci-Fi"],
         why={
             "sources": ["tmdb_similar", "tmdb_discover"],
-            "seeds": ["movie:tmdb:604"],
+            "seeds": [heat],
             "neighbors": [
-                {"item_id": "movie:tmdb:604", "sim": 0.82},
+                {"item_id": heat, "sim": 0.82},
                 {"title": "Blade Runner", "sim": 0.6},
             ],
             "exploration": True,
@@ -382,10 +403,23 @@ def test_explain_renders_all_sections(conn):
     assert len(text.splitlines()) >= 6
 
 
+def test_explain_resolves_bare_int_refs(conn):
+    # a bare int is looked up in items; a titleless item degrades to its
+    # id, and a numeric STRING stays text (it may be a title like "1984")
+    seed = db.resolve_item(conn, "movie", "tmdb", "604", title="Heat")
+    ghost = db.resolve_item(conn, "movie", "tmdb", "605")  # never enriched
+    rid = add_rec(conn, "tmdb:606", title="Ronin",
+                  why={"neighbors": [seed, ghost], "seeds": ["1984"]})
+    text = queue.explain(conn, rid)
+    assert "because you liked Heat" in text
+    assert f"because you liked item #{ghost}" in text
+    assert "seeded by: 1984" in text
+
+
 def test_explain_serendipity_marker(conn):
-    ser = add_rec(conn, "movie:tmdb:70", title="Left Field", year=2011,
+    ser = add_rec(conn, "tmdb:70", title="Left Field", year=2011,
                   why={"sources": ["serendipity"], "serendipity": True})
-    plain = add_rec(conn, "movie:tmdb:71", title="Safe Bet", year=2012,
+    plain = add_rec(conn, "tmdb:71", title="Safe Bet", year=2012,
                     why={"sources": ["tmdb_similar"]})
 
     assert "(serendipity)" in queue.explain(conn, ser)
@@ -401,31 +435,32 @@ def test_explain_unknown_rec_raises(conn):
 
 
 def test_store_stats(conn):
-    add_rec(conn, "movie:tmdb:1", title="M", score=0.5)
-    add_rec(conn, "movie:tmdb:2", title="N", score=0.6, status="added")
-    add_rec(conn, "movie:tmdb:4", title="Z", score=0.4, status="snoozed")
+    m1 = add_rec(conn, "tmdb:1", title="M", score=0.5)
+    m2 = add_rec(conn, "tmdb:2", title="N", score=0.6, status="added")
+    add_rec(conn, "tmdb:4", title="Z", score=0.4, status="snoozed")
     settings.set(conn, "paused", True)
-    db.upsert_item(conn, "artist:mbid:aa", "artist", "Radiohead")
-    db.add_event(conn, "2024-01-01T00:00:00Z", "artist:mbid:aa", "scrobble",
+    artist = db.resolve_item(conn, "artist", "mbid", "aa", title="Radiohead")
+    db.add_event(conn, "2024-01-01T00:00:00Z", artist, "scrobble",
                  WEIGHTS["scrobble"], "lastfm")
-    db.add_event(conn, "2024-01-02T00:00:00Z", "artist:mbid:aa", "scrobble",
+    db.add_event(conn, "2024-01-02T00:00:00Z", artist, "scrobble",
                  WEIGHTS["scrobble"], "lastfm")
-    db.add_event(conn, "2024-01-03T00:00:00Z", "movie:tmdb:1", "complete",
+    db.add_event(conn, "2024-01-03T00:00:00Z", item_of(conn, m1), "complete",
                  WEIGHTS["complete"], "jellyfin")
     conn.execute(
         "INSERT INTO candidates (item_id, source, first_seen, last_seen)"
-        " VALUES ('movie:tmdb:2', 'tmdb_similar', ?, ?)", (db.now(), db.now()))
-    db.put_embedding(conn, "artist:mbid:aa", "m", b"\x00\x00", 1)
+        " VALUES (?, 'tmdb_similar', ?, ?)", (item_of(conn, m2), db.now(), db.now()))
+    db.put_embedding(conn, artist, "m", b"\x00\x00", 1)
     # cursors and models live in the profile namespace now; arr inventory
     # stays global
     db.pset_state(conn, "default", "lastfm:last_uts", "1700000000")
-    db.set_state(conn, "arr:known:radarr", json.dumps({"movie:tmdb:1": 11}))
+    db.set_state(conn, "arr:known:radarr", json.dumps({"1": 11}))
     db.pset_state(conn, "default", "model:movie",
                   json.dumps({"trained_at": "2026-07-01T00:00:00Z"}))
 
     s = queue.store_stats(conn)
     assert s["profile"] == "default"
     assert s["tables"]["items"] == 4
+    assert s["tables"]["identities"] == 4  # one spelling each, v3's new table
     assert s["tables"]["events"] == 3
     assert s["tables"]["recommendations"] == 3
     assert s["tables"]["candidates"] == 1
@@ -442,8 +477,8 @@ def test_store_stats(conn):
 
 
 def test_store_stats_scoped_to_profile(conn):
-    add_rec(conn, "movie:tmdb:1", title="Hers", profile="alice")
-    add_rec(conn, "movie:tmdb:2", title="His", status="approved", profile="bob")
+    add_rec(conn, "tmdb:1", title="Hers", profile="alice")
+    add_rec(conn, "tmdb:2", title="His", status="approved", profile="bob")
     db.pset_state(conn, "alice", "model:movie",
                   json.dumps({"trained_at": "2026-07-01T00:00:00Z"}))
     db.pset_state(conn, "alice", "lastfm:last_uts", "1700000000")
@@ -464,15 +499,15 @@ def test_store_stats_scoped_to_profile(conn):
 def test_store_stats_diversity_entropy_and_share(conn):
     # recs: Drama x2, Comedy x2 — an even 2-genre split is exactly 1 bit;
     # the genre-less rec must be skipped, not counted as a genre
-    add_rec(conn, "movie:tmdb:1", title="A", genres=["Drama"])
-    add_rec(conn, "movie:tmdb:2", title="B", genres=["Comedy"])
-    add_rec(conn, "movie:tmdb:3", title="C", genres=["Drama", "Comedy"])
-    add_rec(conn, "movie:tmdb:4", title="D", why={"exploration": True})
+    add_rec(conn, "tmdb:1", title="A", genres=["Drama"])
+    add_rec(conn, "tmdb:2", title="B", genres=["Comedy"])
+    add_rec(conn, "tmdb:3", title="C", genres=["Drama", "Comedy"])
+    add_rec(conn, "tmdb:4", title="D", why={"exploration": True})
 
     # library: Drama x3, Sci-Fi x1 → -(0.75*log2(0.75) + 0.25*log2(0.25)) = 0.811
     for i, genre in enumerate(["Drama", "Drama", "Drama", "Sci-Fi"]):
-        item = db.upsert_item(conn, f"movie:tmdb:{100 + i}", "movie", f"L{i}",
-                              meta={"genres": [genre]})
+        item = db.resolve_item(conn, "movie", "tmdb", str(100 + i), title=f"L{i}",
+                               meta={"genres": [genre]})
         conn.execute("INSERT INTO library (item_id, arr) VALUES (?, 'radarr')", (item,))
 
     d = queue.store_stats(conn)["diversity"]
@@ -490,7 +525,7 @@ def test_store_stats_diversity_empty_store(conn):
 
 def test_store_stats_exploration_approval_rate(conn):
     def rec(i, status, exploration):
-        add_rec(conn, f"movie:tmdb:{i}", title=f"T{i}", status=status,
+        add_rec(conn, f"tmdb:{i}", title=f"T{i}", status=status,
                 why={"exploration": True} if exploration else {})
 
     rec(1, "approved", True)
@@ -506,10 +541,10 @@ def test_store_stats_exploration_approval_rate(conn):
 
 def test_store_stats_diversity_windows_last_100_recs(conn):
     # the oldest rec would poison both metrics if the 100-rec window leaked
-    add_rec(conn, "movie:tmdb:1000", title="Old", genres=["Western"],
+    add_rec(conn, "tmdb:1000", title="Old", genres=["Western"],
             why={"exploration": True})
     for i in range(100):
-        add_rec(conn, f"movie:tmdb:{i}", title=f"T{i}",
+        add_rec(conn, f"tmdb:{i}", title=f"T{i}",
                 genres=["Drama"] if i % 2 else ["Comedy"])
 
     d = queue.store_stats(conn)["diversity"]

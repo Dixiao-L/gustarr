@@ -12,13 +12,14 @@ import math
 import sqlite3
 from typing import Any, Iterable
 
-from . import db, ids, signals
+from . import db, signals
 
 # Statuses set by `apply` (or auto mode) — the item already left the
 # queue's control, so a late approve/reject would be a lie.
 TERMINAL_STATUSES = {"added", "auto_added", "failed"}
 
-_TABLES = ("items", "events", "library", "candidates", "recommendations", "embeddings", "state")
+_TABLES = ("items", "identities", "events", "library", "candidates", "recommendations",
+           "embeddings", "state")
 
 
 def list_recs(
@@ -29,7 +30,7 @@ def list_recs(
 ) -> list[dict[str, Any]]:
     sql = (
         "SELECT r.id, r.profile, r.ts, r.domain, r.item_id, r.score, r.why, r.status,"
-        " r.acted_at, i.title, i.year, i.ids, i.meta"
+        " r.acted_at, i.title, i.year, i.meta"
         " FROM recommendations r JOIN items i ON i.id = r.item_id"
     )
     # Always one profile's queue: 'default' keeps single-user setups (and
@@ -60,7 +61,10 @@ def list_recs(
             "item_id": r["item_id"],
             "title": r["title"],
             "year": r["year"],
-            "ids": json.loads(r["ids"]),
+            # still named 'ids' so web/CLI consumers keep reading mbid/tvdb
+            # from the same key; the content is now the identities table
+            # (first key per namespace), not a stored json column.
+            "ids": db.identities_of(conn, r["item_id"]),
             "genres": meta.get("genres") or [],
             "poster_path": meta.get("poster_path"),
             # Music cards need these: image is a direct URL (no TMDB prefix),
@@ -161,20 +165,18 @@ def forgive(
 
 
 def _title_for(conn: sqlite3.Connection, ref: Any) -> str:
-    """Best display name for a why-json reference: dict / item id / plain text."""
+    """Best display name for a why-json reference: dict / int item id /
+    plain text. Only genuine ints hit the items table — a bare string
+    stays text even when numeric, because "1984" may BE the title."""
     if isinstance(ref, dict):
         return ref.get("title") or _title_for(conn, ref.get("item_id") or ref.get("id") or "?")
-    ref = str(ref)
-    if ":" not in ref:
-        return ref
-    row = conn.execute("SELECT title FROM items WHERE id=?", (ref,)).fetchone()
-    if row and row["title"]:
-        return row["title"]
-    try:
-        _, _, key = ids.parse(ref)
-    except ValueError:
-        return ref
-    return key.replace("\x1f", " — ")
+    if isinstance(ref, int) and not isinstance(ref, bool):
+        row = conn.execute("SELECT title FROM items WHERE id=?", (ref,)).fetchone()
+        if row and row["title"]:
+            return row["title"]
+        # merged-away or never-enriched item: the id is all we can say
+        return f"item #{ref}"
+    return str(ref)
 
 
 def _fmt_sim(sim: Any) -> str:
