@@ -180,6 +180,18 @@ def set_status(
         raise ValueError(f"no recommendation #{rec_id}")
     _check_profile(row, rec_id, profile)
     _check_verdict_legal(rec_id, row["status"], status)
+    if status == "approved":
+        # Reviving an expired/snoozed rec whose item rank already
+        # re-proposed would double-queue the item (and trip the partial
+        # unique index): same refusal retry() gives, same pointer.
+        open_rec = conn.execute(
+            "SELECT id, status FROM recommendations WHERE profile=? AND item_id=?"
+            " AND status IN ('proposed','approved') AND id != ?",
+            (row["profile"], row["item_id"], rec_id)).fetchone()
+        if open_rec is not None:
+            raise ValueError(
+                f"recommendation #{rec_id} was already re-proposed as"
+                f" #{open_rec['id']} ({open_rec['status']}) — act on that one instead")
 
     ts = db.now()
     # Transition FIRST; the taste event is written only for a move that
@@ -187,7 +199,14 @@ def set_status(
     # status between our read and the guarded UPDATE — re-read and
     # refuse in the same voice as the guards (no event, no claimed
     # update).
-    if not transition(conn, rec_id, status, ts):
+    try:
+        moved = transition(conn, rec_id, status, ts)
+    except sqlite3.IntegrityError as exc:
+        # backstop for a twin proposed between the check and the move
+        raise ValueError(
+            f"recommendation #{rec_id} was already re-proposed — act on that"
+            " one instead") from exc
+    if not moved:
         cur = conn.execute(
             "SELECT status FROM recommendations WHERE id=?", (rec_id,)).fetchone()
         if cur is None:
@@ -309,12 +328,20 @@ def retry(
             f"recommendation #{rec_id} was already re-proposed as"
             f" #{open_rec['id']} ({open_rec['status']}) — act on that one instead")
     try:
-        transition(conn, rec_id, "approved")
+        moved = transition(conn, rec_id, "approved")
     except sqlite3.IntegrityError as exc:
         # backstop for a rec racing in between the check and the move
         raise ValueError(
             f"recommendation #{rec_id} was already re-proposed — act on that"
             " one instead") from exc
+    if not moved:
+        # a racing writer moved the rec off 'failed' between our read and
+        # the guarded UPDATE — refuse cleanly instead of claiming success
+        cur = conn.execute(
+            "SELECT status FROM recommendations WHERE id=?", (rec_id,)).fetchone()
+        current = cur["status"] if cur is not None else "gone"
+        raise ValueError(f"recommendation #{rec_id} is {current}; only failed"
+                         " recs can be retried")
     return {"updated": 1, "events": 0}
 
 

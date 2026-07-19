@@ -129,6 +129,7 @@ def _alias_pass(conn: sqlite3.Connection, stats: dict[str, int]) -> None:
         "SELECT id, title, meta FROM items WHERE domain='artist' AND EXISTS("
         " SELECT 1 FROM identities x WHERE x.item_id = items.id AND x.ns='mbid')").fetchall()
     fold = _fold_index(conn)
+    claims = _claimant_index(conn)
     for row in rows:
         if conn.execute("SELECT 1 FROM items WHERE id=?", (row["id"],)).fetchone() is None:
             continue  # merged away by an earlier row's registration
@@ -137,11 +138,12 @@ def _alias_pass(conn: sqlite3.Connection, stats: dict[str, int]) -> None:
         # MB knows no aliases) still registers the primary title and is
         # never re-fetched.
         if "aliases" in meta:
-            _register(conn, row["id"], row["title"], meta["aliases"], stats, fold)
+            _register(conn, row["id"], row["title"], meta["aliases"], stats, fold, claims)
 
 
 def _register(conn: sqlite3.Connection, item_id: int, title: str | None,
-              aliases: list, stats: dict[str, int], fold: dict[str, list[str]]) -> int:
+              aliases: list, stats: dict[str, int], fold: dict[str, list[str]],
+              claims: dict[str, set[int]]) -> int:
     """attach_identity per spelling, with the dedupe bookkeeping: a
     spelling held by a name-only twin merges the two (the authoritative
     holder survives and registration continues on it); one held by
@@ -159,6 +161,11 @@ def _register(conn: sqlite3.Connection, item_id: int, title: str | None,
             continue
         item_id = _register_one(conn, item_id, name, stats, fold)
         for twin in _spaceless_twins(fold, name):
+            if claims.get(ids.spaceless(ids.normalize_key(name)), set()) - {item_id}:
+                # another authoritative artist also answers to this
+                # folded spelling: no defensible owner — refuse the twin
+                stats["alias_conflicts"] += 1
+                continue
             item_id = _register_one(conn, item_id, twin, stats, fold)
     return item_id
 
@@ -205,6 +212,35 @@ def _fold_add(fold: dict[str, list[str]], name: str) -> None:
         keys.append(norm)
 
 
+
+
+def _claimant_index(conn) -> dict[str, set[int]]:
+    """{spaceless key: authoritative claimant item ids} — every spelling
+    an mbid-holding artist is known by (attached name identities AND the
+    alias lists enrich fetched, attached or refused alike). The twin
+    hunt refuses any bucket claimed by more than the hunting artist:
+    two authoritative artists whose spellings fold together leave no
+    defensible owner for a name-only twin, so the identity call is not
+    guessed (the same rule the exact-collision paths enforce)."""
+    claims: dict[str, set[int]] = {}
+    for r in conn.execute(
+            "SELECT i.key, i.item_id FROM identities i"
+            " WHERE i.domain='artist' AND i.ns='name' AND i.item_id IN"
+            " (SELECT item_id FROM identities WHERE domain='artist' AND ns='mbid')"):
+        claims.setdefault(ids.spaceless(r["key"]), set()).add(r["item_id"])
+    for r in conn.execute(
+            "SELECT it.id, it.title, it.meta FROM items it"
+            " WHERE it.domain='artist' AND it.meta LIKE '%\"aliases\"%' AND it.id IN"
+            " (SELECT item_id FROM identities WHERE domain='artist' AND ns='mbid')"):
+        meta = json.loads(r["meta"] or "{}")
+        for name in [r["title"], *(meta.get("aliases") or [])]:
+            if name and isinstance(name, str) and ids.normalize_key(name):
+                claims.setdefault(
+                    ids.spaceless(ids.normalize_key(name)), set()).add(r["id"])
+    return claims
+
+
+
 def _spaceless_twins(fold: dict[str, list[str]], alias: str) -> list[str]:
     """Existing artist 'name' spellings that equal this alias once spaces
     are folded out but differ as stored keys — the scrobble-spelling twins
@@ -226,6 +262,7 @@ def _fetch_pass(conn: sqlite3.Connection, stats: dict[str, int], limit: int | No
         # and only items with history have split history worth healing
         " AND EXISTS(SELECT 1 FROM events e WHERE e.item_id = items.id)").fetchall()
     fold = _fold_index(conn)
+    claims = _claimant_index(conn)
     attempts = 0
     for row in rows:
         if row["mbid"] is None:
@@ -250,7 +287,7 @@ def _fetch_pass(conn: sqlite3.Connection, stats: dict[str, int], limit: int | No
                    if isinstance(a, dict) and a.get("name")]
         db.upsert_item_fields(conn, row["id"], meta={"aliases": aliases})
         stats["fetched"] += 1
-        _register(conn, row["id"], row["title"], aliases, stats, fold)
+        _register(conn, row["id"], row["title"], aliases, stats, fold, claims)
         # MB politeness makes big runs span minutes; commit as we go so
         # an abort keeps the aliases already paid for.
         conn.commit()

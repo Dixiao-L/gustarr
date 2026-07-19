@@ -4,6 +4,28 @@ All notable changes to Gustarr are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/).
 
+## [0.5.2] - 2026-07-20
+
+### Fixed
+- The whitespace-fold twin hunt refuses when TWO different MusicBrainz
+  artists' spellings fold to the same key: a scrobble-spelling artist
+  matching both would have merged into whichever enriched first — a
+  guessed identity, order-dependent, with no undo. Claimants are indexed
+  up front (attached spellings and fetched alias lists alike) and a
+  contested fold counts as `alias_conflicts`, mirroring the rule every
+  exact-collision path already enforces.
+- Approving an expired or snoozed recommendation whose item was already
+  re-proposed refuses cleanly, naming the newer recommendation to act
+  on — previously a raw database error (web 500 / CLI traceback). The
+  system itself manufactures this state: rank re-proposes a lapsed
+  snooze in the same run that expires the old row.
+- A retry that loses a race to another writer now reports the real
+  status instead of claiming success while the store says otherwise.
+- apply's proposal-TTL pass is scoped to configured profiles, matching
+  rank and the overflow trim — a profile removed from the config keeps
+  its queue frozen, as documented, instead of being expired by the next
+  nightly.
+
 ## [0.5.1] - 2026-07-20
 
 ### Fixed

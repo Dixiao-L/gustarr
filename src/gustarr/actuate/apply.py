@@ -100,14 +100,19 @@ def run(conn: sqlite3.Connection, cfg: Config, dry_run: bool = False) -> dict[st
 
     # rank owns TTL expiry too; repeated here so apply never acts on a
     # proposal that outlived autonomy.proposal_ttl_days between runs.
+    # Scoped to configured profiles like every expiry pass: a profile
+    # removed from config keeps its rows frozen instead of silently
+    # expiring (rank documents that invariant; apply must not defeat it).
     cutoff = _iso(datetime.now(timezone.utc) - timedelta(days=cfg.autonomy.proposal_ttl_days))
+    marks = ",".join("?" * len(cfg.profiles))
     if dry_run:
         stats["would_expire"] = conn.execute(
-            "SELECT COUNT(*) FROM recommendations WHERE status='proposed' AND ts<?",
-            (cutoff,)).fetchone()[0]
+            f"SELECT COUNT(*) FROM recommendations WHERE status='proposed' AND ts<?"
+            f" AND profile IN ({marks})", (cutoff, *cfg.profiles)).fetchone()[0]
     else:
         stats["expired"] = queue.transition_where(
-            conn, "expired", "proposed", "ts<?", (cutoff,), ts=ts)
+            conn, "expired", "proposed", f"ts<? AND profile IN ({marks})",
+            (cutoff, *cfg.profiles), ts=ts)
 
     _apply_music(conn, cfg, ts, dry_run, stats)
     _apply_video(conn, cfg, ts, dry_run, stats)

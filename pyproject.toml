@@ -1,6 +1,6 @@
 [project]
 name = "gustarr"
-version = "0.5.1"
+version = "0.5.2"
 description = "Media taste learning and Servarr automation: per-person profiles learn what you like from Jellyfin/Last.fm/ListenBrainz history and drive Sonarr/Radarr/Lidarr."
 readme = "README.md"
 requires-python = ">=3.12"
