@@ -281,6 +281,48 @@ def test_set_status_guards(conn):
     assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
 
 
+def test_approve_expired_with_open_twin_refuses_cleanly(conn):
+    # rank re-proposed the item while the old rec sat expired (pre-fix
+    # stores hold such pairs): reviving it would double-queue the item
+    # and trip the partial unique index — the refusal names the open
+    # twin instead, in retry's voice, never an IntegrityError traceback
+    rid = add_rec(conn, "tmdb:60", title="Twice", status="expired")
+    twin = add_rec(conn, "tmdb:60", title="Twice", score=0.4)
+    with pytest.raises(ValueError, match=rf"re-proposed as #{twin}.*act on that one instead"):
+        queue.set_status(conn, rid, "approved")
+    # the store is untouched: no move landed, no taste event was written
+    for rec_id, status in ((rid, "expired"), (twin, "proposed")):
+        assert conn.execute("SELECT status FROM recommendations WHERE id=?",
+                            (rec_id,)).fetchone()[0] == status
+    assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+
+
+def test_approve_snoozed_with_open_twin_refuses_cleanly(conn):
+    # same pair with the old rec snoozed: "not now" lapsed into a fresh
+    # proposal for the item, so the late yes must point at that one
+    rid = add_rec(conn, "tmdb:61", title="Napped")
+    queue.set_status(conn, rid, "snoozed")
+    twin = add_rec(conn, "tmdb:61", title="Napped", score=0.4)
+    with pytest.raises(ValueError, match=rf"re-proposed as #{twin}.*act on that one instead"):
+        queue.set_status(conn, rid, "approved")
+    for rec_id, status in ((rid, "snoozed"), (twin, "proposed")):
+        assert conn.execute("SELECT status FROM recommendations WHERE id=?",
+                            (rec_id,)).fetchone()[0] == status
+    assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+
+
+def test_approve_expired_without_twin_still_revives(conn):
+    # the open-twin pre-check must not cost the standing right to
+    # re-verdict: with no twin the revive lands exactly as ever
+    rid = add_rec(conn, "tmdb:62", title="Second Chance", status="expired")
+    assert queue.set_status(conn, rid, "approved") == {"updated": 1, "events": 1}
+    rec = conn.execute("SELECT status, acted_at FROM recommendations WHERE id=?",
+                       (rid,)).fetchone()
+    assert rec["status"] == "approved"
+    assert rec["acted_at"] is not None
+    assert [r[0] for r in conn.execute("SELECT kind FROM events")] == ["approve"]
+
+
 def test_set_status_race_lost_writes_no_event_and_no_updated_lie(conn, monkeypatch):
     """A verdict that loses the race to a concurrent one must refuse in
     the guards' own voice — not write its taste event and claim
@@ -515,6 +557,28 @@ def test_retry_integrity_error_backstop_is_a_clean_refusal(conn, monkeypatch):
         queue.retry(conn, rid)
     assert conn.execute("SELECT status FROM recommendations WHERE id=?",
                         (rid,)).fetchone()[0] == "failed"
+
+
+def test_retry_race_lost_refuses_with_current_status(conn, monkeypatch):
+    """A racing writer moving the row off 'failed' between retry's
+    pre-read and the guarded UPDATE makes transition() return False:
+    retry must refuse naming the status it re-read — never claim
+    {'updated': 1} for a move that didn't land."""
+    rid = add_rec(conn, "tmdb:7", title="Raced", status="failed")
+    real = queue.transition
+
+    def racing(c, rec_id, to, ts=None, force=False):
+        # a concurrent retry wins between the pre-read and our move
+        real(c, rec_id, "approved", ts)
+        return real(c, rec_id, to, ts, force)
+
+    monkeypatch.setattr(queue, "transition", racing)
+    with pytest.raises(ValueError, match="is approved; only failed"):
+        queue.retry(conn, rid)
+    # the winner's state stands; our retry claimed nothing and wrote nothing
+    assert conn.execute("SELECT status FROM recommendations WHERE id=?",
+                        (rid,)).fetchone()[0] == "approved"
+    assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
 
 
 def _cli_store(tmp_path):

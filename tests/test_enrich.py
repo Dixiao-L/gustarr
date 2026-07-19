@@ -128,6 +128,31 @@ MB_KINOKO = {
     "aliases": [{"name": "Kinoko Teikoku"}],
 }
 
+ALPHA_MBID = "aaaa1111-2222-4333-8444-555566667777"
+BETA_MBID = "bbbb1111-2222-4333-8444-555566667777"
+
+# two authoritative artists whose alias lists fold to the SAME spaceless
+# key: "Kinoko Teikoku" and "Kinoko  Tei Koku" are both "kinokoteikoku"
+# once whitespace folds out, so a name-only "KinokoTeikoku" twin has no
+# defensible owner between them
+MB_ALPHA = {
+    "id": ALPHA_MBID,
+    "name": "Alpha",
+    "type": "Group",
+    "tags": [],
+    "genres": [],
+    "aliases": [{"name": "Kinoko Teikoku"}],
+}
+
+MB_BETA = {
+    "id": BETA_MBID,
+    "name": "Beta",
+    "type": "Group",
+    "tags": [],
+    "genres": [],
+    "aliases": [{"name": "Kinoko  Tei Koku"}],
+}
+
 
 def item(conn, item_id):
     return conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
@@ -690,6 +715,93 @@ def test_artist_spaceless_twin_with_own_mbid_is_refused(conn, tmp_path, monkeypa
     # the spaced alias itself still lands on the mbid item
     assert name_target(conn, "Kinoko Teikoku") == cid
     assert name_target(conn, "きのこ帝国") == cid
+
+
+def test_artist_two_claimant_fold_refuses_name_only_twin(conn, tmp_path, monkeypatch):
+    """Two authoritative artists' spellings fold to the same spaceless
+    key: the twin hunt then has no defensible owner for the name-only
+    scrobble twin, so the identity call is refused — the twin survives
+    with its history instead of being guessed into either artist."""
+    cfg = make_cfg(tmp_path)
+    twin = db.resolve_item(conn, "artist", "name", "KinokoTeikoku", title="KinokoTeikoku")
+    db.upsert_item_fields(conn, twin, enriched=True)
+    db.add_event(conn, "2026-01-01T00:00:00Z", twin, "scrobble", 0.15, "lastfm")
+    db.add_event(conn, "2026-02-01T00:00:00Z", twin, "loved", 1.0, "lastfm")
+    beta = db.resolve_item(conn, "artist", "mbid", BETA_MBID, title="Beta",
+                           meta={"aliases": ["Kinoko  Tei Koku"]})
+    db.upsert_item_fields(conn, beta, enriched=True)  # settled a previous run
+    alpha = db.resolve_item(conn, "artist", "mbid", ALPHA_MBID)
+    mock_api(monkeypatch, [
+        (f"/artist/{ALPHA_MBID}", MB_ALPHA),
+        ("deezer", {"data": []}),
+    ])
+
+    stats = run(conn, cfg)
+
+    assert stats == {**BASE, "enriched": 1, "alias_conflicts": 1}
+    # the twin is nobody's: it survives whole, events included
+    assert item(conn, twin) is not None
+    assert event_items(conn) == [twin, twin]
+    assert name_target(conn, "KinokoTeikoku") == twin
+    # the spaced alias itself still lands on the hunting artist
+    assert name_target(conn, "Kinoko Teikoku") == alpha
+
+
+def test_artist_two_claimant_fold_refuses_twin_either_order(conn, tmp_path, monkeypatch):
+    """THE pin is order-independence: Alpha settled first and Beta doing
+    the hunting must refuse just the same — whichever artist enriches
+    first, the twin is never absorbed."""
+    cfg = make_cfg(tmp_path)
+    twin = db.resolve_item(conn, "artist", "name", "KinokoTeikoku", title="KinokoTeikoku")
+    db.upsert_item_fields(conn, twin, enriched=True)
+    db.add_event(conn, "2026-01-01T00:00:00Z", twin, "scrobble", 0.15, "lastfm")
+    db.add_event(conn, "2026-02-01T00:00:00Z", twin, "loved", 1.0, "lastfm")
+    alpha = db.resolve_item(conn, "artist", "mbid", ALPHA_MBID, title="Alpha",
+                            meta={"aliases": ["Kinoko Teikoku"]})
+    db.upsert_item_fields(conn, alpha, enriched=True)  # settled a previous run
+    beta = db.resolve_item(conn, "artist", "mbid", BETA_MBID)
+    mock_api(monkeypatch, [
+        (f"/artist/{BETA_MBID}", MB_BETA),
+        ("deezer", {"data": []}),
+    ])
+
+    stats = run(conn, cfg)
+
+    assert stats == {**BASE, "enriched": 1, "alias_conflicts": 1}
+    assert item(conn, twin) is not None
+    assert event_items(conn) == [twin, twin]
+    assert name_target(conn, "KinokoTeikoku") == twin
+    assert name_target(conn, "Kinoko  Tei Koku") == beta
+
+
+def test_artist_attached_identity_claimant_still_refuses_twin(conn, tmp_path, monkeypatch):
+    """A claimant needs no fetched alias list: Beta holding the folded
+    spelling as an attached name identity alone (no meta.aliases) still
+    bars the hunt — the claimant index reads identities as well as the
+    alias lists enrich fetched."""
+    cfg = make_cfg(tmp_path)
+    twin = db.resolve_item(conn, "artist", "name", "KinokoTeikoku", title="KinokoTeikoku")
+    db.upsert_item_fields(conn, twin, enriched=True)
+    db.add_event(conn, "2026-01-01T00:00:00Z", twin, "scrobble", 0.15, "lastfm")
+    beta = db.resolve_item(conn, "artist", "mbid", BETA_MBID, title="Beta")
+    db.attach_identity(conn, beta, "name", "Kinoko Tei Koku")
+    db.upsert_item_fields(conn, beta, enriched=True)  # aliases never fetched
+    alpha = db.resolve_item(conn, "artist", "mbid", ALPHA_MBID)
+    mock_api(monkeypatch, [
+        (f"/artist/{ALPHA_MBID}", MB_ALPHA),
+        ("deezer", {"data": []}),
+    ])
+
+    stats = run(conn, cfg)
+
+    # both stored keys in the contested bucket (the twin's and beta's
+    # own identity) are refused to the hunter
+    assert stats == {**BASE, "enriched": 1, "alias_conflicts": 2}
+    assert item(conn, twin) is not None and item(conn, beta) is not None
+    assert event_items(conn) == [twin]
+    assert name_target(conn, "KinokoTeikoku") == twin
+    assert name_target(conn, "Kinoko Tei Koku") == beta
+    assert name_target(conn, "Kinoko Teikoku") == alpha
 
 
 def test_track_name_keyed_just_marked(conn, tmp_path, monkeypatch):

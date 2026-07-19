@@ -1149,6 +1149,40 @@ def test_stale_proposals_expire(conn, tmp_path, net):
     assert rec_row(conn, rid)["status"] == "expired"
 
 
+def test_ttl_expiry_scoped_to_configured_profiles(conn, tmp_path, net):
+    """A profile removed from config keeps its rows frozen (rank's
+    invariant): apply's repeated TTL pass must expire only configured
+    profiles' stale proposals, never silently retire a de-configured
+    queue while it is gone."""
+    cfg = make_cfg(tmp_path, profiles=["alice"])
+    stale = add_rec(conn, "movie", "Hers Old", {"tmdb": 1},
+                    ts="2020-01-01T00:00:00Z", profile="alice")
+    frozen = add_rec(conn, "movie", "Ghost Old", {"tmdb": 2},
+                     ts="2020-01-01T00:00:00Z", profile="ghost")
+
+    stats = apply_mod.run(conn, cfg)
+
+    assert stats["expired"] == 1  # alice's only
+    assert rec_row(conn, stale)["status"] == "expired"
+    assert rec_row(conn, frozen)["status"] == "proposed"  # frozen, not expired
+
+
+def test_dry_run_would_expire_counts_only_configured_profiles(conn, tmp_path, net):
+    # the preview must match what the real pass would do: the frozen
+    # profile's stale row is not counted as an expiry that never comes
+    cfg = make_cfg(tmp_path, profiles=["alice"])
+    stale = add_rec(conn, "movie", "Hers Old", {"tmdb": 1},
+                    ts="2020-01-01T00:00:00Z", profile="alice")
+    frozen = add_rec(conn, "movie", "Ghost Old", {"tmdb": 2},
+                     ts="2020-01-01T00:00:00Z", profile="ghost")
+
+    stats = apply_mod.run(conn, cfg, dry_run=True)
+
+    assert stats["would_expire"] == 1
+    assert rec_row(conn, stale)["status"] == "proposed"  # dry run mutates nothing
+    assert rec_row(conn, frozen)["status"] == "proposed"
+
+
 # ── dry run ──────────────────────────────────────────────────────────
 
 

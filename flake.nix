@@ -66,7 +66,7 @@
         in
         python.pkgs.buildPythonApplication {
           pname = "gustarr" + lib.optionalString withMl "-ml";
-          version = "0.5.1";
+          version = "0.5.2";
           pyproject = true;
           src = lib.cleanSource ./.;
 

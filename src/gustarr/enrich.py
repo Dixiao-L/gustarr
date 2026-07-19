@@ -337,6 +337,7 @@ def _bridge_artist_aliases(conn, item_id: int, names: list[str],
     is untouched. dedupe.py runs the same registration offline for
     pre-existing stores."""
     fold = _fold_index(conn)
+    claims = _claimant_index(conn)
     for raw in names:
         # aliases are stored raw; attach_identity normalizes on write, so
         # this is exactly the identity a collector would mint for that
@@ -346,6 +347,11 @@ def _bridge_artist_aliases(conn, item_id: int, names: list[str],
         item_id = _attach(conn, "artist", item_id, "name", raw, eff, stats)
         _fold_add(fold, raw)  # newly attached spellings join the huntable set
         for twin in _spaceless_twins(fold, raw):
+            if claims.get(ids.spaceless(ids.normalize_key(raw)), set()) - {item_id}:
+                # another authoritative artist also answers to this
+                # folded spelling: no defensible owner — refuse the twin
+                stats["alias_conflicts"] += 1
+                continue
             item_id = _attach(conn, "artist", item_id, "name", twin, eff, stats)
     return item_id
 
@@ -375,6 +381,35 @@ def _fold_add(fold: dict[str, list[str]], name: str) -> None:
     keys = fold.setdefault(ids.spaceless(norm), [])
     if norm not in keys:
         keys.append(norm)
+
+
+
+
+def _claimant_index(conn) -> dict[str, set[int]]:
+    """{spaceless key: authoritative claimant item ids} — every spelling
+    an mbid-holding artist is known by (attached name identities AND the
+    alias lists enrich fetched, attached or refused alike). The twin
+    hunt refuses any bucket claimed by more than the hunting artist:
+    two authoritative artists whose spellings fold together leave no
+    defensible owner for a name-only twin, so the identity call is not
+    guessed (the same rule the exact-collision paths enforce)."""
+    claims: dict[str, set[int]] = {}
+    for r in conn.execute(
+            "SELECT i.key, i.item_id FROM identities i"
+            " WHERE i.domain='artist' AND i.ns='name' AND i.item_id IN"
+            " (SELECT item_id FROM identities WHERE domain='artist' AND ns='mbid')"):
+        claims.setdefault(ids.spaceless(r["key"]), set()).add(r["item_id"])
+    for r in conn.execute(
+            "SELECT it.id, it.title, it.meta FROM items it"
+            " WHERE it.domain='artist' AND it.meta LIKE '%\"aliases\"%' AND it.id IN"
+            " (SELECT item_id FROM identities WHERE domain='artist' AND ns='mbid')"):
+        meta = json.loads(r["meta"] or "{}")
+        for name in [r["title"], *(meta.get("aliases") or [])]:
+            if name and isinstance(name, str) and ids.normalize_key(name):
+                claims.setdefault(
+                    ids.spaceless(ids.normalize_key(name)), set()).add(r["id"])
+    return claims
+
 
 
 def _spaceless_twins(fold: dict[str, list[str]], alias: str) -> list[str]:

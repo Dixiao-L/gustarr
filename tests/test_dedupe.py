@@ -254,6 +254,81 @@ def test_alias_pass_spaceless_twin_with_own_mbid_is_refused(conn, tmp_path):
     assert run(conn, make_cfg(tmp_path)) == {**ZERO_STATS, "alias_conflicts": 1}
 
 
+def test_alias_pass_two_claimant_fold_refuses_name_only_twin(conn, tmp_path):
+    """Two mbid artists whose alias lists fold to the SAME spaceless key
+    ("Kinoko Teikoku" / "Kinoko  Tei Koku" → both "kinokoteikoku") leave
+    no defensible owner for the name-only scrobble twin: the hunt refuses
+    it for BOTH hunters — counted, never guessed — and the twin survives
+    with its history."""
+    twin = db.resolve_item(conn, "artist", "name", "KinokoTeikoku", title="KinokoTeikoku")
+    db.add_event(conn, "2026-01-01T00:00:00Z", twin, "scrobble", 1.0, "lastfm", dedup="a")
+    db.add_event(conn, "2026-01-02T00:00:00Z", twin, "scrobble", 1.0, "lastfm", dedup="b")
+    alpha = db.resolve_item(conn, "artist", "mbid", MBID, title="Alpha",
+                            meta={"aliases": ["Kinoko Teikoku"]})
+    beta = db.resolve_item(conn, "artist", "mbid", OTHER_MBID, title="Beta",
+                           meta={"aliases": ["Kinoko  Tei Koku"]})
+
+    stats = run(conn, make_cfg(tmp_path))
+
+    # titles + spaced aliases attach; every hunt into the contested
+    # bucket is refused (alpha's once, beta's against both stored keys)
+    assert stats == {**ZERO_STATS, "alias_attached": 4, "alias_conflicts": 3}
+    assert not gone(conn, twin)
+    assert event_items(conn) == [twin, twin]
+    assert db.lookup_item(conn, "artist", "name", "KinokoTeikoku") == twin
+    # each hunter still owns its own spaced spelling
+    assert db.lookup_item(conn, "artist", "name", "Kinoko Teikoku") == alpha
+    assert db.lookup_item(conn, "artist", "name", "Kinoko  Tei Koku") == beta
+    # the standing conflict never resolves into a merge on the rerun
+    assert run(conn, make_cfg(tmp_path))["merged"] == 0
+    assert not gone(conn, twin)
+
+
+def test_alias_pass_two_claimant_fold_refuses_either_order(conn, tmp_path):
+    """THE pin is order-independence: Beta minted (and hunting) first,
+    same refusal — the twin must never be absorbed by whichever claimant
+    happens to register before the other's claim lands."""
+    twin = db.resolve_item(conn, "artist", "name", "KinokoTeikoku", title="KinokoTeikoku")
+    db.add_event(conn, "2026-01-01T00:00:00Z", twin, "scrobble", 1.0, "lastfm", dedup="a")
+    db.add_event(conn, "2026-01-02T00:00:00Z", twin, "scrobble", 1.0, "lastfm", dedup="b")
+    beta = db.resolve_item(conn, "artist", "mbid", OTHER_MBID, title="Beta",
+                           meta={"aliases": ["Kinoko  Tei Koku"]})
+    alpha = db.resolve_item(conn, "artist", "mbid", MBID, title="Alpha",
+                            meta={"aliases": ["Kinoko Teikoku"]})
+
+    stats = run(conn, make_cfg(tmp_path))
+
+    assert stats == {**ZERO_STATS, "alias_attached": 4, "alias_conflicts": 3}
+    assert not gone(conn, twin)
+    assert event_items(conn) == [twin, twin]
+    assert db.lookup_item(conn, "artist", "name", "KinokoTeikoku") == twin
+    assert db.lookup_item(conn, "artist", "name", "Kinoko Teikoku") == alpha
+    assert db.lookup_item(conn, "artist", "name", "Kinoko  Tei Koku") == beta
+
+
+def test_alias_pass_attached_identity_claimant_still_refuses_twin(conn, tmp_path):
+    """The claimant index reads attached name identities, not just
+    fetched alias lists: Beta with no meta.aliases at all, holding the
+    folded spelling as a plain identity, still bars Alpha's hunt."""
+    twin = db.resolve_item(conn, "artist", "name", "KinokoTeikoku", title="KinokoTeikoku")
+    db.add_event(conn, "2026-01-01T00:00:00Z", twin, "scrobble", 1.0, "lastfm")
+    beta = db.resolve_item(conn, "artist", "mbid", OTHER_MBID, title="Beta")
+    db.attach_identity(conn, beta, "name", "Kinoko Tei Koku")
+    alpha = db.resolve_item(conn, "artist", "mbid", MBID, title="Alpha",
+                            meta={"aliases": ["Kinoko Teikoku"]})
+
+    stats = run(conn, make_cfg(tmp_path))
+
+    # alpha attaches its own spellings; both stored keys in the
+    # contested bucket (twin's and beta's) are refused
+    assert stats == {**ZERO_STATS, "alias_attached": 2, "alias_conflicts": 2}
+    assert not gone(conn, twin) and not gone(conn, beta)
+    assert event_items(conn) == [twin]
+    assert db.lookup_item(conn, "artist", "name", "KinokoTeikoku") == twin
+    assert db.lookup_item(conn, "artist", "name", "Kinoko Tei Koku") == beta
+    assert db.lookup_item(conn, "artist", "name", "Kinoko Teikoku") == alpha
+
+
 class QueryLog:
     """conn wrapper recording every SQL statement (whitespace-collapsed)."""
 
