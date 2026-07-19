@@ -468,6 +468,8 @@ def test_store_stats(conn):
     assert s["events_by_kind"] == {"scrobble": 2, "complete": 1}
     # snoozed shows up like any other status — no special-casing
     assert s["recs_by_status"] == {"proposed": 1, "added": 1, "snoozed": 1}
+    # the pool's provenance mix — the anti-echo-chamber composition gauge
+    assert s["candidates_by_source"] == {"tmdb_similar": 1}
     assert s["sync"]["lastfm:last_uts"] == "1700000000"
     assert s["sync"]["arr:known:radarr"] is True
     assert s["models"]["movie"] == "2026-07-01T00:00:00Z"
@@ -494,6 +496,7 @@ def test_store_stats_scoped_to_profile(conn):
     assert s["recs_by_status"] == {"approved": 1}
     assert s["models"] == {}  # bob hasn't trained yet — alice's model isn't his
     assert s["sync"] == {}
+    assert s["candidates_by_source"] == {}  # candidate pools are per-person too
 
 
 def test_store_stats_diversity_entropy_and_share(conn):

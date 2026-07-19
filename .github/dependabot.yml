@@ -41,3 +41,13 @@ updates:
       docker-security:
         applies-to: security-updates
         patterns: ["*"]
+    ignore:
+      # A base-Python bump is gated on torch publishing x86_64 CPU wheels
+      # for that interpreter (3.14 had aarch64-only when Dependabot first
+      # proposed it, and the image build broke). Bump deliberately, with a
+      # real docker build as validation — not via a bot PR the tag-only
+      # docker CI job never builds.
+      - dependency-name: "python"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"

@@ -289,6 +289,15 @@ def store_stats(conn: sqlite3.Connection, profile: str = "default") -> dict[str,
             "SELECT status, COUNT(*) FROM recommendations WHERE profile=?"
             " GROUP BY status ORDER BY status", (profile,))
     }
+    # The pool's provenance mix is the anti-echo-chamber composition:
+    # how much of what rank sees comes from CF vs similar-to-known vs
+    # the serendipity probes. Scraped into Grafana alongside diversity.
+    candidates_by_source = {
+        r[0]: r[1]
+        for r in conn.execute(
+            "SELECT source, COUNT(*) FROM candidates WHERE profile=?"
+            " GROUP BY source ORDER BY source", (profile,))
+    }
 
     sync: dict[str, Any] = {}
     uts = db.pget_state(conn, profile, "lastfm:last_uts")
@@ -323,6 +332,7 @@ def store_stats(conn: sqlite3.Connection, profile: str = "default") -> dict[str,
         "tables": tables,
         "events_by_kind": events_by_kind,
         "recs_by_status": recs_by_status,
+        "candidates_by_source": candidates_by_source,
         "sync": sync,
         "models": models,
         "settings_overridden": conn.execute(
