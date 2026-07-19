@@ -136,6 +136,49 @@ def dedupe(ctx: Ctx, fetch: bool, limit: int) -> None:
 
 
 @main.command()
+@click.argument("name", required=False)
+@click.option("--mbid", default=None, help="MusicBrainz artist id to assert for NAME.")
+@click.option("--limit", type=int, default=25, help="Max pending artists to list.")
+@click.pass_obj
+def identify(ctx: Ctx, name: str | None, mbid: str | None, limit: int) -> None:
+    """Assert MusicBrainz ids for artists that exist only as a spelling.
+
+    Bare: list name-only artists ranked by the listening history they
+    hold. With NAME: search MusicBrainz for it. With NAME --mbid MBID:
+    assert the match — the split history merges under the existing
+    identity rules and the artist re-enriches on the next run. The one
+    identity call Gustarr never guesses at, made for the person who
+    actually knows.
+    """
+    from . import identify as identify_mod
+
+    if name is None:
+        if mbid:
+            raise click.UsageError("--mbid asserts a match for NAME; name the artist too")
+        for r in identify_mod.pending(ctx.conn, limit=limit):
+            spellings = ", ".join(r["spellings"])
+            click.echo(f"#{r['item_id']:<5} {r['events']:>5} events  "
+                       f"{r['title'] or spellings}  [{spellings}]")
+        return
+    if mbid is None:
+        for h in identify_mod.search(name):
+            extra = f" — {h['disambiguation']}" if h["disambiguation"] else ""
+            click.echo(f"{h['id']}  {h['name']}{extra}  [{h['score']}]")
+        return
+    item_id = db_mod.lookup_item(ctx.conn, "artist", "name", name)
+    if item_id is None:
+        raise click.ClickException(
+            f"no artist named {name!r} in the store (bare `gustarr identify` lists the"
+            " known spellings)")
+    try:
+        survivor = identify_mod.assert_mbid(ctx.conn, item_id, mbid)
+    except ValueError as exc:  # already identified / not an artist
+        raise click.ClickException(str(exc)) from exc
+    ctx.conn.commit()
+    click.echo(f"asserted: {name} -> {mbid} (item #{survivor})")
+
+
+@main.command()
 @click.option("--domain", default=None)
 @click.pass_obj
 def candidates(ctx: Ctx, domain: str | None) -> None:
@@ -250,6 +293,27 @@ def reject(ctx: Ctx, rec_ids: tuple[int, ...], profile: str | None) -> None:
         set_status(ctx.conn, rid, "rejected", profile=profile)
     ctx.conn.commit()
     click.echo(f"rejected: {', '.join(map(str, rec_ids))}")
+
+
+@main.command()
+@click.argument("rec_id", type=int)
+@_PROFILE_GUARD
+@click.pass_obj
+def retry(ctx: Ctx, rec_id: int, profile: str | None) -> None:
+    """Re-queue a failed recommendation (back to approved for the next `apply`).
+
+    Failures are often transient Lidarr metadata gaps, so `failed` is
+    terminal only for automation. No taste event is written — a retry is
+    plumbing, not a verdict.
+    """
+    from .queue import retry as queue_retry
+
+    try:
+        queue_retry(ctx.conn, rec_id, profile=profile)
+    except ValueError as exc:  # unknown rec / not failed / other profile's rec
+        raise click.ClickException(str(exc)) from exc
+    ctx.conn.commit()
+    click.echo(f"retried: {rec_id}")
 
 
 @main.command()

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -174,7 +176,9 @@ def test_approve_flips_status_and_writes_event(conn):
     assert ev["item_id"] == item_of(conn, rid)
     assert ev["kind"] == "approve"
     assert ev["source"] == "user"
-    assert ev["weight"] == WEIGHTS["approve"]
+    # scale is a multiplier: the label WEIGHTS['approve'] × 1 is computed
+    # at train time, so tuning WEIGHTS re-labels this verdict too
+    assert ev["scale"] == 1.0
     assert ev["ts"] == rec["acted_at"]
     assert json.loads(ev["meta"]) == {"rec_id": rid}
 
@@ -187,7 +191,11 @@ def test_reject_writes_negative_event(conn):
     assert rec["status"] == "rejected"
     ev = conn.execute("SELECT * FROM events WHERE kind='reject'").fetchone()
     assert ev["item_id"] == item_of(conn, rid)
-    assert ev["weight"] == WEIGHTS["reject"] == -1.0
+    # the negativity lives in WEIGHTS, applied at aggregation time
+    assert ev["scale"] == 1.0
+    assert WEIGHTS["reject"] == -1.0
+    assert aggregate_label([(ev["ts"], ev["kind"], ev["scale"])]) == \
+        pytest.approx(-1.0, abs=1e-3)
     assert ev["source"] == "user"
 
 
@@ -196,11 +204,11 @@ def test_exploration_reject_is_soft(conn):
     queue.set_status(conn, rid, "rejected")
 
     ev = conn.execute("SELECT * FROM events WHERE kind='reject'").fetchone()
-    assert ev["weight"] == pytest.approx(WEIGHTS["reject"] * 0.3)
-    assert ev["weight"] == pytest.approx(-0.3)
+    assert ev["scale"] == pytest.approx(0.3)
     assert json.loads(ev["meta"]) == {"rec_id": rid, "exploration": True}
-    # the stored weight is what training sees — no special-casing downstream
-    assert aggregate_label([(ev["ts"], ev["kind"], ev["weight"])]) == pytest.approx(-0.3, abs=1e-3)
+    # the stored scale is what training multiplies WEIGHTS['reject'] by —
+    # the soft reject needs no special-casing downstream
+    assert aggregate_label([(ev["ts"], ev["kind"], ev["scale"])]) == pytest.approx(-0.3, abs=1e-3)
 
 
 def test_reject_with_falsy_exploration_stays_full_weight(conn):
@@ -208,7 +216,7 @@ def test_reject_with_falsy_exploration_stays_full_weight(conn):
     queue.set_status(conn, rid, "rejected")
 
     ev = conn.execute("SELECT * FROM events WHERE kind='reject'").fetchone()
-    assert ev["weight"] == WEIGHTS["reject"] == -1.0
+    assert ev["scale"] == 1.0
     assert json.loads(ev["meta"]) == {"rec_id": rid}
 
 
@@ -217,7 +225,7 @@ def test_exploration_approve_keeps_full_weight(conn):
     queue.set_status(conn, rid, "approved")
 
     ev = conn.execute("SELECT * FROM events WHERE kind='approve'").fetchone()
-    assert ev["weight"] == WEIGHTS["approve"] == 1.0
+    assert ev["scale"] == 1.0 == WEIGHTS["approve"]
     assert json.loads(ev["meta"]) == {"rec_id": rid}
 
 
@@ -271,6 +279,49 @@ def test_set_status_guards(conn):
     with pytest.raises(ValueError):
         queue.set_status(conn, open_rec, "added")  # apply's business, not the queue's
     assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+
+
+def test_set_status_race_lost_writes_no_event_and_no_updated_lie(conn, monkeypatch):
+    """A verdict that loses the race to a concurrent one must refuse in
+    the guards' own voice — not write its taste event and claim
+    {'updated': 1} for a move that never landed."""
+    rid = add_rec(conn, "tmdb:50", title="Raced")
+    real = queue.transition
+
+    def racing(c, rec_id, to, ts=None, force=False):
+        # a concurrent approve lands between set_status's read and its move
+        real(c, rec_id, "approved", ts)
+        return real(c, rec_id, to, ts, force)
+
+    monkeypatch.setattr(queue, "transition", racing)
+    with pytest.raises(ValueError, match="already approved"):
+        queue.set_status(conn, rid, "approved")
+    # only the racing writer's state survives; OUR verdict wrote no event
+    assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+    assert conn.execute("SELECT status FROM recommendations WHERE id=?",
+                        (rid,)).fetchone()[0] == "approved"
+
+
+def test_forgive_race_lost_keeps_the_reject_event(conn, monkeypatch):
+    """forgive transitions FIRST and deletes the reject events only when
+    the move landed: a re-verdict racing in must not have its history
+    silently erased by a forgive that then failed."""
+    rid = add_rec(conn, "tmdb:51", title="Raced")
+    queue.set_status(conn, rid, "rejected")
+    real = queue.transition
+
+    def racing(c, rec_id, to, ts=None, force=False):
+        # the user re-approves mid-flight; rejected→approved is legal
+        real(c, rec_id, "approved", ts)
+        return real(c, rec_id, to, ts, force)
+
+    monkeypatch.setattr(queue, "transition", racing)
+    with pytest.raises(ValueError, match="only rejected"):
+        queue.forgive(conn, rid)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM events WHERE kind='reject'").fetchone()[0] == 1
+    assert conn.execute("SELECT status FROM recommendations WHERE id=?",
+                        (rid,)).fetchone()[0] == "approved"
 
 
 # ── queue: snooze ────────────────────────────────────────────────────
@@ -354,7 +405,7 @@ def test_forgive_spares_other_event_kinds(conn):
     rid = add_rec(conn, "tmdb:31", title="Watched Anyway")
     queue.set_status(conn, rid, "rejected")
     db.add_event(conn, "2026-01-01T00:00:00Z", item_of(conn, rid), "complete",
-                 WEIGHTS["complete"], "jellyfin")
+                 1.0, "jellyfin")
 
     assert queue.forgive(conn, rid) == {"deleted_events": 1}
     kinds = [r[0] for r in conn.execute("SELECT kind FROM events")]
@@ -370,6 +421,242 @@ def test_forgive_requires_rejected(conn):
     added = add_rec(conn, "tmdb:33", title="Done", status="added")
     with pytest.raises(ValueError, match="added"):
         queue.forgive(conn, added)
+
+
+# ── queue: retry ─────────────────────────────────────────────────────
+
+
+def test_retry_flips_failed_to_approved_without_event(conn):
+    rid = add_rec(conn, "mbid:rg1", domain="album", title="Lost Album", status="failed")
+    stats = queue.retry(conn, rid)
+    assert stats == {"updated": 1, "events": 0}
+
+    rec = conn.execute("SELECT status, acted_at FROM recommendations WHERE id=?",
+                       (rid,)).fetchone()
+    assert rec["status"] == "approved"
+    assert rec["acted_at"] is not None
+    # a retry is plumbing, not a verdict — the approve event was written
+    # when the user first said yes, and must not be written twice
+    assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+
+
+def test_retry_requires_failed(conn):
+    with pytest.raises(ValueError, match="no recommendation"):
+        queue.retry(conn, 999)
+    proposed = add_rec(conn, "tmdb:1", title="Open")
+    with pytest.raises(ValueError, match="proposed"):
+        queue.retry(conn, proposed)
+    added = add_rec(conn, "tmdb:2", title="Done", status="added")
+    with pytest.raises(ValueError, match="added"):
+        queue.retry(conn, added)
+    for rid, status in ((proposed, "proposed"), (added, "added")):
+        assert conn.execute("SELECT status FROM recommendations WHERE id=?",
+                            (rid,)).fetchone()[0] == status
+
+
+def test_retry_profile_guard(conn):
+    # same guard semantics as set_status: None trusts the id, anything
+    # else must match the rec's owner
+    rid = add_rec(conn, "tmdb:3", title="Hers", status="failed", profile="alice")
+    with pytest.raises(ValueError, match="belongs to profile 'alice'"):
+        queue.retry(conn, rid, profile="bob")
+    assert conn.execute("SELECT status FROM recommendations WHERE id=?",
+                        (rid,)).fetchone()[0] == "failed"
+    assert queue.retry(conn, rid, profile="alice") == {"updated": 1, "events": 0}
+
+
+def test_verdicts_on_failed_point_to_retry(conn):
+    # failed→approved is legal in the table, but it is retry's move:
+    # set_status approving here would fabricate a second approve event
+    # for a yes the user already gave
+    rid = add_rec(conn, "tmdb:4", title="Flaky", status="failed")
+    for verdict in ("approved", "rejected", "snoozed"):
+        with pytest.raises(ValueError, match="only retry"):
+            queue.set_status(conn, rid, verdict)
+    assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+    assert conn.execute("SELECT status FROM recommendations WHERE id=?",
+                        (rid,)).fetchone()[0] == "failed"
+
+
+def test_retried_rec_can_fail_and_be_retried_again(conn):
+    # transient Lidarr gaps can strike twice: the loop stays legal
+    rid = add_rec(conn, "mbid:rg2", domain="album", title="Cursed", status="failed")
+    queue.retry(conn, rid)
+    assert queue.transition(conn, rid, "failed") is True  # apply's move
+    queue.retry(conn, rid)
+    assert conn.execute("SELECT status FROM recommendations WHERE id=?",
+                        (rid,)).fetchone()[0] == "approved"
+
+
+def test_retry_refuses_when_item_already_reproposed(conn):
+    # rank re-proposed the item while the failed rec sat there (pre-fix
+    # stores hold such pairs): retrying would double-queue the item, so
+    # the refusal points the user at the open rec instead
+    rid = add_rec(conn, "tmdb:5", title="Flaky", status="failed")
+    open_rec = add_rec(conn, "tmdb:5", title="Flaky", score=0.4)
+    with pytest.raises(ValueError, match=rf"#{open_rec}.*act on that one instead"):
+        queue.retry(conn, rid)
+    assert conn.execute("SELECT status FROM recommendations WHERE id=?",
+                        (rid,)).fetchone()[0] == "failed"
+    assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+
+
+def test_retry_integrity_error_backstop_is_a_clean_refusal(conn, monkeypatch):
+    # an open rec racing in between the check and the move surfaces as
+    # the unique-index IntegrityError; the user sees the same ValueError
+    # (web 409 / CLI message), never a traceback
+    rid = add_rec(conn, "tmdb:6", title="Flaky", status="failed")
+
+    def racing_index(c, rec_id, to, ts=None, force=False):
+        raise sqlite3.IntegrityError("UNIQUE constraint failed: idx_recs_open_item")
+
+    monkeypatch.setattr(queue, "transition", racing_index)
+    with pytest.raises(ValueError, match="act on that one instead"):
+        queue.retry(conn, rid)
+    assert conn.execute("SELECT status FROM recommendations WHERE id=?",
+                        (rid,)).fetchone()[0] == "failed"
+
+
+def _cli_store(tmp_path):
+    cfg_path = tmp_path / "gustarr.toml"
+    cfg_path.write_text(f'[core]\ndata_dir = "{tmp_path}"\n')
+    return cfg_path, db.connect(tmp_path / "gustarr.db")
+
+
+def test_cli_retry_requeues_failed_rec(tmp_path):
+    from click.testing import CliRunner
+
+    from gustarr.cli import main as cli_main
+
+    cfg_path, store = _cli_store(tmp_path)
+    rid = add_rec(store, "mbid:rg1", domain="album", title="Lost Album", status="failed")
+    store.commit()
+    store.close()
+
+    result = CliRunner().invoke(cli_main, ["--config", str(cfg_path), "retry", str(rid)])
+
+    assert result.exit_code == 0, result.output
+    assert f"retried: {rid}" in result.output
+    store = db.connect(tmp_path / "gustarr.db")
+    try:
+        assert store.execute("SELECT status FROM recommendations WHERE id=?",
+                             (rid,)).fetchone()[0] == "approved"  # committed
+        assert store.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+    finally:
+        store.close()
+
+
+def test_cli_retry_errors_are_clean(tmp_path):
+    from click.testing import CliRunner
+
+    from gustarr.cli import main as cli_main
+
+    cfg_path, store = _cli_store(tmp_path)
+    rid = add_rec(store, "tmdb:1", title="Hers", status="failed", profile="alice")
+    store.commit()
+    store.close()
+
+    # the cross-profile guard and the not-failed refusal surface as
+    # messages, never tracebacks
+    denied = CliRunner().invoke(
+        cli_main, ["--config", str(cfg_path), "retry", str(rid), "--profile", "bob"])
+    assert denied.exit_code != 0
+    assert "belongs to profile 'alice'" in denied.output
+    assert "Traceback" not in denied.output
+
+    unknown = CliRunner().invoke(cli_main, ["--config", str(cfg_path), "retry", "999"])
+    assert unknown.exit_code != 0
+    assert "no recommendation #999" in unknown.output
+
+    store = db.connect(tmp_path / "gustarr.db")
+    try:
+        assert store.execute("SELECT status FROM recommendations WHERE id=?",
+                             (rid,)).fetchone()[0] == "failed"
+    finally:
+        store.close()
+
+
+# ── queue: status transitions (the single owner) ─────────────────────
+
+
+def test_legal_transitions_match_documented_flow():
+    # db.py's SCHEMA table / docs' "Recommendation status flow", plus the
+    # user's standing right to re-verdict anything not yet acted on
+    assert set(queue.LEGAL_TRANSITIONS) == {
+        "proposed", "approved", "rejected", "snoozed", "expired",
+        "added", "auto_added", "failed"}
+    # terminal statuses are exactly the empty rows — one derivation, so
+    # the table cannot drift from the "too late" refusals built on it
+    assert queue.TERMINAL_STATUSES == {"added", "auto_added"}
+    assert all(queue.LEGAL_TRANSITIONS[s] == set() for s in queue.TERMINAL_STATUSES)
+    assert queue.LEGAL_TRANSITIONS["proposed"] == {
+        "approved", "rejected", "snoozed", "auto_added", "expired"}
+    assert queue.LEGAL_TRANSITIONS["approved"] == {"rejected", "added", "failed"}
+    # failed's one way out is the human retry back to approved; it stays
+    # terminal for automation — candidates must keep barring re-entry
+    # (re-proposing would just re-fail in apply)
+    assert queue.LEGAL_TRANSITIONS["failed"] == {"approved"}
+    from gustarr.candidates import BLOCKED_REC_STATUSES
+    assert "failed" in BLOCKED_REC_STATUSES
+
+
+def test_transition_moves_and_stamps_acted_at(conn):
+    rid = add_rec(conn, "tmdb:90", title="M")
+    assert queue.transition(conn, rid, "approved", "2026-07-01T00:00:00Z") is True
+    rec = conn.execute(
+        "SELECT status, acted_at FROM recommendations WHERE id=?", (rid,)).fetchone()
+    assert rec["status"] == "approved"
+    assert rec["acted_at"] == "2026-07-01T00:00:00Z"
+    # transition() is the status owner, nothing more: taste events are
+    # set_status's business
+    assert conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+
+
+def test_transition_refuses_illegal_moves(conn):
+    assert queue.transition(conn, 999, "approved") is False  # unknown rec
+    done = add_rec(conn, "tmdb:91", title="Done", status="added")
+    assert queue.transition(conn, done, "approved") is False  # terminal
+    rejected = add_rec(conn, "tmdb:92", title="No", status="rejected")
+    assert queue.transition(conn, rejected, "snoozed") is False  # snooze needs proposed
+    for rid, status in ((done, "added"), (rejected, "rejected")):
+        row = conn.execute(
+            "SELECT status, acted_at FROM recommendations WHERE id=?", (rid,)).fetchone()
+        assert row["status"] == status  # a refusal writes nothing
+        assert row["acted_at"] is None
+
+
+def test_transition_where_bakes_from_status_into_where(conn):
+    prop = add_rec(conn, "tmdb:93", title="Open")
+    appr = add_rec(conn, "tmdb:94", title="Yes", status="approved")
+    n = queue.transition_where(conn, "expired", "proposed", ts="2026-07-01T00:00:00Z")
+    assert n == 1  # the approved row is not 'from' proposed and survives
+    row = conn.execute(
+        "SELECT status, acted_at FROM recommendations WHERE id=?", (prop,)).fetchone()
+    assert (row["status"], row["acted_at"]) == ("expired", "2026-07-01T00:00:00Z")
+    assert conn.execute(
+        "SELECT status FROM recommendations WHERE id=?", (appr,)).fetchone()[0] == "approved"
+
+
+def test_transition_where_extra_where_and_illegal_pair(conn):
+    a = add_rec(conn, "tmdb:95", title="A")
+    b = add_rec(conn, "tmdb:96", title="B")
+    assert queue.transition_where(conn, "expired", "proposed", "id=?", (a,)) == 1
+    assert conn.execute(
+        "SELECT status FROM recommendations WHERE id=?", (b,)).fetchone()[0] == "proposed"
+    # an illegal pair is a caller bug — loud, never a silent zero
+    with pytest.raises(ValueError, match="illegal"):
+        queue.transition_where(conn, "added", "proposed")
+
+
+def test_status_updates_have_one_owner():
+    """The single-owner invariant, enforced: every recommendations.status
+    write goes through queue.transition/transition_where — a raw UPDATE
+    anywhere else would dodge LEGAL_TRANSITIONS."""
+    src = Path(queue.__file__).resolve().parent
+    owners = sorted(
+        p.relative_to(src).as_posix() for p in src.rglob("*.py")
+        if "UPDATE recommendations SET status" in p.read_text(encoding="utf-8"))
+    assert owners == ["queue.py"]
 
 
 # ── queue: explain ───────────────────────────────────────────────────
@@ -440,12 +727,10 @@ def test_store_stats(conn):
     add_rec(conn, "tmdb:4", title="Z", score=0.4, status="snoozed")
     settings.set(conn, "paused", True)
     artist = db.resolve_item(conn, "artist", "mbid", "aa", title="Radiohead")
-    db.add_event(conn, "2024-01-01T00:00:00Z", artist, "scrobble",
-                 WEIGHTS["scrobble"], "lastfm")
-    db.add_event(conn, "2024-01-02T00:00:00Z", artist, "scrobble",
-                 WEIGHTS["scrobble"], "lastfm")
+    db.add_event(conn, "2024-01-01T00:00:00Z", artist, "scrobble", 1.0, "lastfm")
+    db.add_event(conn, "2024-01-02T00:00:00Z", artist, "scrobble", 1.0, "lastfm")
     db.add_event(conn, "2024-01-03T00:00:00Z", item_of(conn, m1), "complete",
-                 WEIGHTS["complete"], "jellyfin")
+                 1.0, "jellyfin")
     conn.execute(
         "INSERT INTO candidates (item_id, source, first_seen, last_seen)"
         " VALUES (?, 'tmdb_similar', ?, ?)", (item_of(conn, m2), db.now(), db.now()))

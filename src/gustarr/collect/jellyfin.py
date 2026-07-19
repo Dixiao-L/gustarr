@@ -19,7 +19,6 @@ import httpx
 
 from .. import db, http
 from ..config import Config
-from ..signals import WEIGHTS
 
 SOURCE = "jellyfin"
 PAGE_SIZE = 500
@@ -176,7 +175,7 @@ def _flag_event(conn: sqlite3.Connection, profile: str, item_id: int,
         (profile, item_id, kind, SOURCE)).fetchone()
     if row:
         return False
-    return db.add_event(conn, ts, item_id, kind, WEIGHTS[kind], SOURCE, meta, profile=profile)
+    return db.add_event(conn, ts, item_id, kind, 1.0, SOURCE, meta, profile=profile)
 
 
 def _has_history(conn: sqlite3.Connection, profile: str, item_id: int) -> bool:
@@ -243,7 +242,7 @@ def _sync_series(conn: sqlite3.Connection, profile: str, base: str, uid: str,
             # cursor silently instead of re-emitting the backlog as one play.
             quiet = prev is None and _has_history(conn, profile, item)
             if not quiet and (emit_plays or prev is None) and db.add_event(
-                    conn, db.now(), item, "play", WEIGHTS["play"],
+                    conn, db.now(), item, "play", 1.0,
                     SOURCE, {"episodes_played": count}, profile=profile):
                 stats["series_plays"] += 1
             db.pset_state(conn, profile, key, str(count))
@@ -306,12 +305,12 @@ def _sync_audio(conn: sqlite3.Connection, profile: str, base: str, uid: str,
         if not emit and prev is not None:
             db.pset_state(conn, profile, key, str(plays))
             continue
-        weight = WEIGHTS["scrobble"] * min(delta, SCROBBLE_DELTA_CAP)
+        scale = float(min(delta, SCROBBLE_DELTA_CAP))
         # dedup=jf track id: two tracks by one artist played the same second
         # are distinct listens, not one re-synced event. A False return is
         # then a genuine replay of an already-stored row, so the cursor must
         # hold — advancing it would silently discard the still-pending plays.
-        if db.add_event(conn, _norm_ts(ud.get("LastPlayedDate")), art_id, "scrobble", weight,
+        if db.add_event(conn, _norm_ts(ud.get("LastPlayedDate")), art_id, "scrobble", scale,
                         SOURCE, {"delta": delta, "track": t.get("Name"), "album": t.get("Album")},
                         dedup=str(t.get("Id") or ""), profile=profile):
             stats["scrobbles"] += 1
@@ -399,7 +398,7 @@ def _pbr_row(conn: sqlite3.Connection, profile: str, base: str, uid: str,
             if not name:
                 return
             art_id = db.resolve_item(conn, "artist", "name", name, title=name)
-        if db.add_event(conn, ts, art_id, "scrobble", WEIGHTS["scrobble"], SOURCE,
+        if db.add_event(conn, ts, art_id, "scrobble", 1.0, SOURCE,
                         {"track": item.get("Name"), "album": item.get("Album"),
                          "seconds": duration}, dedup=f"pbr{rowid}", profile=profile):
             stats["pbr_scrobbles"] += 1
@@ -423,7 +422,7 @@ def _pbr_row(conn: sqlite3.Connection, profile: str, base: str, uid: str,
             stats["pbr_completes"] += 1
     else:
         return
-    if db.add_event(conn, ts, target, "play", WEIGHTS["play"], SOURCE,
+    if db.add_event(conn, ts, target, "play", 1.0, SOURCE,
                     {"episode": item.get("Name")} if kind == "Episode"
                     else {"seconds": duration}, dedup=f"pbr{rowid}", profile=profile):
         stats["pbr_plays"] += 1

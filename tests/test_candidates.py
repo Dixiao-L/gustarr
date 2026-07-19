@@ -81,7 +81,7 @@ def item(conn, domain, ns, key):
 def seed_movie(conn, tmdb_id, title, genres=None, ts=None, year=None, profile="default"):
     item_id = db.resolve_item(conn, "movie", "tmdb", str(tmdb_id), title=title, year=year,
                               meta={"genres": genres} if genres else None)
-    db.add_event(conn, ts or iso(1), item_id, "complete", 0.8, "jellyfin", profile=profile)
+    db.add_event(conn, ts or iso(1), item_id, "complete", 1.0, "jellyfin", profile=profile)
     return item_id
 
 
@@ -104,7 +104,7 @@ def test_movie_similar_discover_and_exclusions(conn, cfg, router):
         if reason == "library":
             conn.execute("INSERT INTO library (item_id, arr) VALUES (?, 'radarr')", (iid,))
         elif reason == "reject":
-            db.add_event(conn, iso(2), iid, "reject", -1.0, "user")
+            db.add_event(conn, iso(2), iid, "reject", 1.0, "user")
         else:
             conn.execute(
                 "INSERT INTO recommendations (run_id, ts, domain, item_id, score)"
@@ -228,7 +228,7 @@ def test_artist_lastfm_similar(conn, cfg, router):
     seed_name = db.resolve_item(conn, "artist", "name", "Radiohead", title="Radiohead")
     db.add_event(conn, iso(2), seed_name, "loved", 1.0, "lastfm")
     rejected = db.resolve_item(conn, "artist", "name", "Nickelback", title="Nickelback")
-    db.add_event(conn, iso(3), rejected, "reject", -1.0, "user")
+    db.add_event(conn, iso(3), rejected, "reject", 1.0, "user")
 
     def similar(params):
         if params["limit"] == 20:  # hop-2 serendipity fan-out, covered elsewhere
@@ -279,10 +279,10 @@ def test_series_seeds_resolve_tmdb_id(conn, cfg, router):
     s1 = db.resolve_item(conn, "series", "tvdb", "81189", title="Breaking Bad",
                          meta={"genres": ["Drama"]})
     db.attach_identity(conn, s1, "tmdb", "1396")
-    db.add_event(conn, iso(1), s1, "complete", 0.8, "jellyfin")
+    db.add_event(conn, iso(1), s1, "complete", 1.0, "jellyfin")
     # positive but no tmdb identity anywhere: must be skipped, not fetched
     s2 = db.resolve_item(conn, "series", "tvdb", "999", title="No Tmdb")
-    db.add_event(conn, iso(1), s2, "complete", 0.8, "jellyfin")
+    db.add_event(conn, iso(1), s2, "complete", 1.0, "jellyfin")
 
     router.route("/tv/1396/recommendations", {"results": [
         {"id": 60059, "name": "Better Call Saul", "first_air_date": "2015-02-08",
@@ -328,7 +328,7 @@ def test_seed_threshold_and_top25_limit(conn, cfg, router):
     for i in range(5):
         seed_movie(conn, 2000 + i, f"O{i}", ts=iso(400))
     neg = db.resolve_item(conn, "movie", "tmdb", "3000", title="Skipped")
-    db.add_event(conn, iso(1), neg, "skip", -0.1, "jellyfin")
+    db.add_event(conn, iso(1), neg, "skip", 1.0, "jellyfin")
 
     empty = {"results": []}
     for i in range(25):
@@ -412,7 +412,7 @@ def test_excluded_ids_plain_ints_and_profile_scope(conn):
     db.attach_identity(conn, owned, "tmdb", "1396")
     conn.execute("INSERT INTO library (item_id, arr) VALUES (?, 'sonarr')", (owned,))
     rejected = db.resolve_item(conn, "movie", "tmdb", "603", title="The Matrix")
-    db.add_event(conn, iso(1), rejected, "reject", -1.0, "user")
+    db.add_event(conn, iso(1), rejected, "reject", 1.0, "user")
 
     excluded = _excluded_ids(conn, "default")
 
@@ -431,7 +431,7 @@ def test_owned_series_excluded_across_namespaces(conn, cfg, router):
     # not slip back into the pool under the other namespace.
     seed = db.resolve_item(conn, "series", "tvdb", "1", title="Seed")
     db.attach_identity(conn, seed, "tmdb", "500")
-    db.add_event(conn, iso(1), seed, "complete", 0.8, "jellyfin")
+    db.add_event(conn, iso(1), seed, "complete", 1.0, "jellyfin")
     owned = db.resolve_item(conn, "series", "tvdb", "81189", title="Breaking Bad")
     db.attach_identity(conn, owned, "tmdb", "1396")
     conn.execute("INSERT INTO library (item_id, arr) VALUES (?, 'sonarr')", (owned,))
@@ -458,7 +458,7 @@ def test_lastfm_mbid_merges_name_keyed_twin(conn, cfg, router):
     db.add_event(conn, iso(1), seed, "loved", 1.0, "lastfm")
     # scrobbles minted a name-keyed twin before any mbid was known
     twin = db.resolve_item(conn, "artist", "name", "Hole", title="Hole")
-    db.add_event(conn, iso(2), twin, "scrobble", 0.3, "lastfm")
+    db.add_event(conn, iso(2), twin, "scrobble", 2.0, "lastfm")
 
     router.route("lastfm:artist.getsimilar", {"similarartists": {"artist": [
         {"name": "Hole", "mbid": "abc-123", "match": "0.87"}]}})
@@ -503,7 +503,7 @@ def test_rejected_artist_stays_excluded_when_mbid_appears(conn, cfg, router):
     seed = db.resolve_item(conn, "artist", "mbid", mb, title="Nirvana")
     db.add_event(conn, iso(1), seed, "loved", 1.0, "lastfm")
     rejected = db.resolve_item(conn, "artist", "name", "Nickelback", title="Nickelback")
-    db.add_event(conn, iso(2), rejected, "reject", -1.0, "user")
+    db.add_event(conn, iso(2), rejected, "reject", 1.0, "user")
 
     # the reject lives on the name-keyed item; the freshly revealed mbid
     # must not smuggle the artist back into the pool post-merge
@@ -531,10 +531,10 @@ def test_refused_name_attach_does_not_inherit_rejection(conn, cfg, router):
     # rejected artist with its own mbid AND the contested spelling
     rejected = db.resolve_item(conn, "artist", "mbid", "m2", title="Bush")
     db.attach_identity(conn, rejected, "name", "Bush")
-    db.add_event(conn, iso(2), rejected, "reject", -1.0, "user")
+    db.add_event(conn, iso(2), rejected, "reject", 1.0, "user")
     # rejected name-only twin: no authoritative id of its own
     twin = db.resolve_item(conn, "artist", "name", "Lush", title="Lush")
-    db.add_event(conn, iso(3), twin, "reject", -1.0, "user")
+    db.add_event(conn, iso(3), twin, "reject", 1.0, "user")
 
     def similar(params):
         if params["limit"] == 20:  # hop-2 serendipity fan-out, covered elsewhere
@@ -808,7 +808,7 @@ def test_serendipity_decade_probe_targets_least_seen_decade(conn, cfg, router):
 def test_serendipity_skipped_without_positives(conn, cfg, router):
     # nothing positive yet: no taste baseline to diverge from
     neg = db.resolve_item(conn, "movie", "tmdb", "3000", title="Skipped")
-    db.add_event(conn, iso(1), neg, "skip", -0.1, "jellyfin")
+    db.add_event(conn, iso(1), neg, "skip", 1.0, "jellyfin")
 
     stats = run(conn, cfg, domain="movie")
 
@@ -935,7 +935,7 @@ def test_two_profiles_independent_seeds_and_exclusions(conn, tmp_path, router):
     seed_movie(conn, 700, "Heat", profile="bob")
     # bob rejected 200; alice holds no grudge, so it may still reach her pool
     rejected = db.resolve_item(conn, "movie", "tmdb", "200", title="M200")
-    db.add_event(conn, iso(2), rejected, "reject", -1.0, "user", profile="bob")
+    db.add_event(conn, iso(2), rejected, "reject", 1.0, "user", profile="bob")
 
     router.route("/movie/603/recommendations",
                  {"results": [movie_result(200), movie_result(201)]})

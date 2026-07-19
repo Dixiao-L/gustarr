@@ -291,6 +291,45 @@
     min-width: 2.8em; text-align: right;
   }
 
+  /* ── identities panel ───────────────────────────────────────── */
+  .idwrap { max-width: 720px; margin: 0 auto; display: flex; flex-direction: column; gap: 12px; }
+  .idhint { margin: 0 0 4px; font-size: 13px; color: var(--muted); }
+  .idrow {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 10px; box-shadow: var(--shadow); padding: 12px 14px;
+  }
+  .idrow.busy { opacity: .55; pointer-events: none; }
+  .idmain { flex: 1; min-width: 200px; display: flex; flex-direction: column; gap: 4px; }
+  .idmain .title { overflow-wrap: anywhere; }
+  .idrow > .chip { flex: none; }
+  .idrow .idfind { flex: none; }
+  .idsearch {
+    flex-basis: 100%; display: flex; flex-direction: column; gap: 8px;
+    border-top: 1px solid var(--line); padding-top: 10px;
+  }
+  .idsearch[hidden] { display: none; }
+  .idform { display: flex; gap: 8px; }
+  .idform input[type="search"] {
+    flex: 1; min-width: 0; font: inherit; font-size: 13px; color: var(--text);
+    background: var(--bg); border: 1px solid var(--line-strong);
+    border-radius: 8px; padding: 5px 10px;
+  }
+  .idform .btn { flex: none; }
+  .idresults { display: flex; flex-direction: column; gap: 6px; }
+  .idhit {
+    display: flex; align-items: center; gap: 10px; font-size: 13px;
+    background: var(--bg); border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px 10px;
+  }
+  .idhit .who { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+  .idhit .dis { color: var(--muted); font-size: 12px; }
+  .idhit .mbid {
+    color: var(--muted); font-size: 11px;
+    font-family: ui-monospace, monospace; overflow-wrap: anywhere;
+  }
+  .idhit .btn { flex: none; }
+
   /* ── skeletons / toasts ─────────────────────────────────────── */
   .skeleton .poster, .skeleton .line { animation: pulse 1.4s ease-in-out infinite; }
   .skeleton .line { height: 12px; border-radius: 4px; background: var(--line); }
@@ -361,6 +400,14 @@
     </symbol>
     <symbol id="i-user" viewBox="0 0 24 24">
       <circle cx="12" cy="8.5" r="3.25"/><path d="M5.5 19.5a6.5 6.5 0 0 1 13 0"/>
+    </symbol>
+    <symbol id="i-tag" viewBox="0 0 24 24">
+      <path d="M4.5 4.5h6.6a2 2 0 0 1 1.4.6l7 7a2 2 0 0 1 0 2.8l-4.6 4.6a2 2 0 0 1-2.8 0l-7-7a2 2 0 0 1-.6-1.4z"/>
+      <circle cx="9" cy="9" r="1.25"/>
+    </symbol>
+    <symbol id="i-retry" viewBox="0 0 24 24">
+      <path d="M18.9 8.5A7.25 7.25 0 1 0 19.25 12"/>
+      <path d="M19.25 4v4.5h-4.5"/>
     </symbol>
   </defs>
 </svg>
@@ -433,6 +480,7 @@
     { id: 'series', label: 'Series', icon: 'tv' },
     { id: 'music', label: 'Music', icon: 'music' },
     { id: 'history', label: 'History', icon: 'clock' },
+    { id: 'identify', label: 'Identities', icon: 'tag' },
   ];
   const STATUS_LABEL = {
     approved: 'Approved', rejected: 'Rejected', added: 'Added',
@@ -448,7 +496,7 @@
       hint: 'Share of each run reserved for outside-your-bubble picks' },
   ];
   const state = { rows: [], stats: null, tab: 'all', loaded: false, settings: null,
-                  profile: null };
+                  profile: null, identify: [] };
   const $ = id => document.getElementById(id);
 
   const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g,
@@ -527,6 +575,7 @@
       series: open.filter(r => r.domain === 'series').length,
       music: open.filter(r => MUSIC.has(r.domain)).length,
       history: acted.length,
+      identify: state.identify.length,
     };
     for (const t of TABS) {
       const pill = $('tab-' + t.id).querySelector('.count');
@@ -719,6 +768,11 @@
       foot.push(`<button class="btn quiet snooze">${icon('clock')}Not Now</button>`);
     if (history && r.status === 'rejected')
       foot.push(`<button class="btn forgive">${icon('check')}Forgive</button>`);
+    // Failures are often transient Lidarr metadata gaps: a human retry
+    // re-queues the item as approved for the next apply. No verdict, no
+    // taste event — automation alone never revives a failed rec.
+    if (history && r.status === 'failed')
+      foot.push(`<button class="btn retryrec">${icon('retry')}Retry</button>`);
     const sample = sampleHTML(r);
     if (sample) foot.push(sample);
     el.innerHTML = `
@@ -759,6 +813,8 @@
     }
     const fg = el.querySelector('.forgive');
     if (fg) fg.addEventListener('click', () => forgive(el, r));
+    const rt = el.querySelector('.retryrec');
+    if (rt) rt.addEventListener('click', () => retryRec(el, r));
     el.querySelector('.whybtn').addEventListener('click', () => toggleWhy(el, r));
     const pv = el.querySelector('.previewbtn');
     if (pv) pv.addEventListener('click', () => togglePreview(el, r));
@@ -826,6 +882,22 @@
     } catch (e) {
       el.classList.remove('busy');
       toast(`Could not forgive · ${e.message || e}`, 'error');
+    }
+  }
+
+  async function retryRec(el, r) {
+    el.classList.add('busy');
+    try {
+      const resp = await fetch(api(`/api/recs/${r.id}/retry`), { method: 'POST' });
+      if (!resp.ok) throw new Error(await errDetail(resp));
+      r.status = 'approved';
+      r.acted_at = new Date().toISOString().slice(0, 19) + 'Z';
+      toast(`Retrying on next apply · ${r.title || r.item_id}`);
+      el.replaceWith(cardEl(r, true));
+      updateCounts();
+    } catch (e) {
+      el.classList.remove('busy');
+      toast(`Could not retry · ${e.message || e}`, 'error');
     }
   }
 
@@ -999,6 +1071,117 @@
     });
   }
 
+  /* ── identities ────────────────────────────────────────────── */
+  // Human-asserted MusicBrainz ids for artists that exist only as a
+  // spelling — the one identity call Gustarr never guesses at. Global,
+  // like Settings: identity is store-wide, so no profile scoping.
+
+  function identifyRowEl(a) {
+    const el = document.createElement('article');
+    el.className = 'idrow';
+    const display = a.title || (a.spellings || [])[0] || `item #${a.item_id}`;
+    const spellings = (a.spellings || []).map(s => `<span class="tag">${esc(s)}</span>`);
+    el.innerHTML = `
+      <div class="idmain">
+        <h3 class="title">${esc(display)}</h3>
+        ${spellings.length ? `<div class="tags">${spellings.join('')}</div>` : ''}
+      </div>
+      <span class="chip">${icon('music')}<b>${esc(a.events)}</b>&nbsp;listens</span>
+      <button class="btn quiet idfind" aria-expanded="false">${icon('tag')}Identify</button>
+      <div class="idsearch" hidden>
+        <form class="idform">
+          <input type="search" value="${esc(display)}" aria-label="Search MusicBrainz">
+          <button class="btn" type="submit">Search</button>
+        </form>
+        <div class="idresults"></div>
+      </div>`;
+    el.querySelector('.idfind').addEventListener('click', () => {
+      const box = el.querySelector('.idsearch');
+      const btn = el.querySelector('.idfind');
+      const show = box.hidden;
+      box.hidden = !show;
+      btn.setAttribute('aria-expanded', String(show));
+      // first open searches immediately, seeded with the known spelling
+      if (show && !box.dataset.loaded) { box.dataset.loaded = '1'; searchMB(el, a); }
+    });
+    el.querySelector('.idform').addEventListener('submit', e => {
+      e.preventDefault();
+      searchMB(el, a);
+    });
+    return el;
+  }
+
+  async function searchMB(el, a) {
+    const q = el.querySelector('.idform input').value.trim();
+    const out = el.querySelector('.idresults');
+    if (!q) return;
+    out.innerHTML = '<div class="skeleton"><div class="line w60"></div></div>';
+    let hits = [];
+    try {
+      hits = await getJSON('/api/identify?q=' + encodeURIComponent(q));
+    } catch (e) {
+      out.innerHTML = '';
+      toast('Could not search MusicBrainz · ' + (e.message || e), 'error');
+      return;
+    }
+    if (!hits.length) {
+      out.innerHTML = '<p class="meta">No MusicBrainz matches — try another spelling.</p>';
+      return;
+    }
+    out.replaceChildren(...hits.map(h => idHitEl(el, a, h)));
+  }
+
+  function idHitEl(row, a, h) {
+    const el = document.createElement('div');
+    el.className = 'idhit';
+    const caption = [h.type, h.country, h.disambiguation].filter(Boolean).join(' · ');
+    el.innerHTML = `
+      <div class="who">
+        <span>${esc(h.name)}${caption ? ` <span class="dis">${esc(caption)}</span>` : ''}</span>
+        <span class="mbid">${esc(h.id)}</span>
+      </div>
+      <button class="btn approve" type="button">${icon('check')}Assert</button>`;
+    el.querySelector('button').addEventListener('click', () => assertMbid(row, a, h));
+    return el;
+  }
+
+  async function assertMbid(row, a, h) {
+    row.classList.add('busy');
+    try {
+      const resp = await fetch('/api/identify', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ item_id: a.item_id, mbid: h.id }),
+      });
+      if (!resp.ok) throw new Error(await errDetail(resp));
+      state.identify = state.identify.filter(x => x.item_id !== a.item_id);
+      toast(`Identified · ${a.title || h.name}`);
+      renderPanel();
+      updateCounts();
+    } catch (e) {
+      row.classList.remove('busy');
+      toast(`Could not assert identity · ${e.message || e}`, 'error');
+    }
+  }
+
+  function renderIdentify(panel) {
+    if (!state.identify.length) {
+      panel.innerHTML = `<div class="empty">${icon('tag')}
+        <p>Nothing to identify — every artist with history has a MusicBrainz identity.</p>
+      </div>`;
+      return;
+    }
+    const wrap = document.createElement('div');
+    wrap.className = 'idwrap';
+    const hint = document.createElement('p');
+    hint.className = 'idhint';
+    hint.textContent = 'These artists exist only as a spelling. Assert the matching '
+      + 'MusicBrainz id and their split listening history merges — the one identity '
+      + 'call Gustarr leaves to a person.';
+    wrap.appendChild(hint);
+    for (const a of state.identify) wrap.appendChild(identifyRowEl(a));
+    panel.replaceChildren(wrap);
+  }
+
   /* ── panel ─────────────────────────────────────────────────── */
 
   function rowsFor(tab) {
@@ -1013,6 +1196,7 @@
 
   function renderPanel() {
     const panel = $('panel');
+    if (state.tab === 'identify') { renderIdentify(panel); return; }
     const rows = rowsFor(state.tab);
     if (!rows.length) {
       const history = state.tab === 'history';
@@ -1042,15 +1226,17 @@
     $('banner').hidden = true;
     showSkeletons();
     try {
-      const [rows, stats, runtime, profile] = await Promise.all([
+      const [rows, stats, runtime, profile, pending] = await Promise.all([
         getJSON(api('/api/recs?status=all')),
         getJSON(api('/api/stats')).catch(() => null), // chips are decorative
         getJSON('/api/settings').catch(() => null), // paused banner is best-effort
         getJSON(api('/api/profile')).catch(() => null), // profile chip likewise
+        getJSON('/api/identify').catch(() => []), // identities tab is best-effort
       ]);
       state.rows = rows;
       state.stats = stats;
       state.profile = profile;
+      state.identify = pending || [];
       if (runtime) state.settings = runtime;
       state.loaded = true;
       updateCounts();

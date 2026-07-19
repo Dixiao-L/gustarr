@@ -9,7 +9,6 @@ import pytest
 from gustarr import config as C
 from gustarr import db, http
 from gustarr.collect import arr
-from gustarr.signals import WEIGHTS
 
 RADARR = "http://radarr:7878"
 SONARR = "http://sonarr:8989"
@@ -123,7 +122,8 @@ def test_first_sync_items_library_events(conn, cfg, fake_http):
     ev = conn.execute("SELECT * FROM events WHERE item_id=?", (matrix(conn),)).fetchone()
     assert ev["kind"] == "library_add" and ev["source"] == "arr"
     assert ev["ts"] == "2024-01-05T10:00:00Z"
-    assert ev["weight"] == WEIGHTS["library_add"]
+    # a plain occurrence stores scale 1; signals.WEIGHTS prices it at train
+    assert ev["scale"] == 1.0
     # legacy single-user config: the fan-out is exactly the default profile
     assert ev["profile"] == "default"
     # the gustarr-tagged add produced no event
@@ -159,7 +159,7 @@ def test_deleted_gustarr_item_becomes_reject(conn, cfg, fake_http, responses):
     rej = rejects[0]
     assert rej["item_id"] == heat_id
     # no recommendations row owns the add: damped household evidence
-    assert rej["weight"] == WEIGHTS["reject"] * 0.3
+    assert rej["scale"] == pytest.approx(0.3)
     assert rej["source"] == "arr"
     assert json.loads(rej["meta"]) == {"deleted": True, "shared": True}
 
@@ -255,8 +255,8 @@ def test_events_fan_out_to_every_profile(conn, tmp_path, fake_http, responses):
     rejects = {(r["profile"], r["item_id"]) for r in conn.execute(
         "SELECT profile, item_id FROM events WHERE kind='reject'")}
     assert rejects == {("alice", heat_id), ("bob", heat_id)}
-    for r in conn.execute("SELECT weight, meta FROM events WHERE kind='reject'"):
-        assert r["weight"] == WEIGHTS["reject"] * 0.3
+    for r in conn.execute("SELECT scale, meta FROM events WHERE kind='reject'"):
+        assert r["scale"] == pytest.approx(0.3)
         assert json.loads(r["meta"]) == {"deleted": True, "shared": True}
 
 
@@ -291,5 +291,5 @@ def test_deleted_gustarr_item_reject_hits_owning_profile_only(
     rej = rejects[0]
     assert rej["item_id"] == heat_id
     assert rej["profile"] == "alice"  # the newest owner, nobody else
-    assert rej["weight"] == WEIGHTS["reject"]  # her own add: full strength
+    assert rej["scale"] == 1.0  # her own add: full strength
     assert json.loads(rej["meta"]) == {"deleted": True}

@@ -3,6 +3,11 @@
 Approve/reject is itself a taste event (the strongest one we get, see
 signals.WEIGHTS) so the model learns from every verdict immediately —
 the status flip and the event are written together here.
+
+This module is also the sole owner of recommendation status moves:
+LEGAL_TRANSITIONS is the law, transition()/transition_where() the only
+writers, and apply/rank call in here rather than updating status rows
+themselves.
 """
 
 from __future__ import annotations
@@ -12,11 +17,90 @@ import math
 import sqlite3
 from typing import Any, Iterable
 
-from . import db, signals
+from . import db
 
-# Statuses set by `apply` (or auto mode) — the item already left the
-# queue's control, so a late approve/reject would be a lie.
-TERMINAL_STATUSES = {"added", "auto_added", "failed"}
+# The one authority on recommendation status moves (db.py's SCHEMA table
+# and docs/architecture.md "Recommendation status flow" document it):
+# the user may re-verdict anything not yet acted on — including reviving
+# a rejected/snoozed/expired rec — but may snooze only fresh proposals;
+# forgive turns rejected into expired (re-proposable); apply lands
+# approved rows as added/failed and auto-picks proposed ones into
+# auto_added; a human retry() flips failed back to approved (Lidarr
+# metadata gaps are often transient) while automation keeps treating it
+# as settled — candidates.BLOCKED_REC_STATUSES still bars re-entry; the
+# expiry passes retire proposed (TTL, overflow) and lapsed snoozes.
+# Nothing else writes recommendations.status — every writer goes through
+# transition()/transition_where() below, and a source-scan test enforces
+# it.
+LEGAL_TRANSITIONS: dict[str, set[str]] = {
+    "proposed": {"approved", "rejected", "snoozed", "auto_added", "expired"},
+    "approved": {"rejected", "added", "failed"},
+    "rejected": {"approved", "expired"},
+    "snoozed": {"approved", "rejected", "expired"},
+    "expired": {"approved", "rejected"},
+    "added": set(),
+    "auto_added": set(),
+    "failed": {"approved"},
+}
+
+# Statuses with no way out — the item landed in a library and a late
+# verdict would be a lie. Derived, so the transition table stays the
+# single place a status can become final. failed is deliberately absent:
+# terminal for automation (re-proposing would just re-fail), retryable
+# by a human.
+TERMINAL_STATUSES = {s for s, targets in LEGAL_TRANSITIONS.items() if not targets}
+
+
+def transition(
+    conn: sqlite3.Connection, rec_id: int, to: str, ts: str | None = None,
+    force: bool = False,
+) -> bool:
+    """Move one recommendation along LEGAL_TRANSITIONS; False (and no
+    write) for an unknown rec or an illegal move. The UPDATE re-checks
+    the status it read so a racing writer loses cleanly instead of
+    making the row skip a state.
+
+    force is for reconciling the store with an irreversible external
+    effect that already happened — the arr add is reality, the table
+    records it even over a racing verdict; never for ordinary moves. It
+    skips the legality check (and the racing-writer re-check) but still
+    goes through this owner, so the source-scan invariant holds."""
+    row = conn.execute(
+        "SELECT status FROM recommendations WHERE id=?", (rec_id,)).fetchone()
+    if row is None:
+        return False
+    if force:
+        cur = conn.execute(
+            "UPDATE recommendations SET status=?, acted_at=? WHERE id=?",
+            (to, ts or db.now(), rec_id))
+        return cur.rowcount > 0
+    if to not in LEGAL_TRANSITIONS.get(row["status"], set()):
+        return False
+    cur = conn.execute(
+        "UPDATE recommendations SET status=?, acted_at=? WHERE id=? AND status=?",
+        (to, ts or db.now(), rec_id, row["status"]))
+    return cur.rowcount > 0
+
+
+def transition_where(
+    conn: sqlite3.Connection,
+    to: str,
+    from_status: str,
+    where: str = "",
+    params: tuple = (),
+    ts: str | None = None,
+) -> int:
+    """Bulk transition() for the expiry paths; returns rows moved. The
+    from_status guard is baked into the WHERE, not merely pre-checked,
+    so rows a racing writer already moved on are skipped rather than
+    dragged through an illegal hop. An illegal (from, to) pair is a
+    caller bug, not data — it raises."""
+    if to not in LEGAL_TRANSITIONS.get(from_status, set()):
+        raise ValueError(f"illegal recommendation transition {from_status!r} -> {to!r}")
+    sql = "UPDATE recommendations SET status=?, acted_at=? WHERE status=?"
+    if where:
+        sql += f" AND ({where})"
+    return conn.execute(sql, (to, ts or db.now(), from_status, *params)).rowcount
 
 _TABLES = ("items", "identities", "events", "library", "candidates", "recommendations",
            "embeddings", "state")
@@ -95,36 +179,63 @@ def set_status(
     if row is None:
         raise ValueError(f"no recommendation #{rec_id}")
     _check_profile(row, rec_id, profile)
-    if row["status"] in TERMINAL_STATUSES:
-        raise ValueError(f"recommendation #{rec_id} is already {row['status']}; too late")
-    if row["status"] == status:
-        raise ValueError(f"recommendation #{rec_id} is already {status}")
-    if status == "snoozed" and row["status"] != "proposed":
-        raise ValueError(
-            f"recommendation #{rec_id} is {row['status']}; only proposed recs can be snoozed")
+    _check_verdict_legal(rec_id, row["status"], status)
 
     ts = db.now()
-    conn.execute(
-        "UPDATE recommendations SET status=?, acted_at=? WHERE id=?", (status, ts, rec_id))
+    # Transition FIRST; the taste event is written only for a move that
+    # actually landed. False here means a racing writer changed the
+    # status between our read and the guarded UPDATE — re-read and
+    # refuse in the same voice as the guards (no event, no claimed
+    # update).
+    if not transition(conn, rec_id, status, ts):
+        cur = conn.execute(
+            "SELECT status FROM recommendations WHERE id=?", (rec_id,)).fetchone()
+        if cur is None:
+            raise ValueError(f"no recommendation #{rec_id}")
+        _check_verdict_legal(rec_id, cur["status"], status)
+        # legal again after the race (the rec hopped through a state the
+        # verdict could still land on): refuse rather than guess — the
+        # caller re-issues the verdict against fresh state.
+        raise ValueError(
+            f"recommendation #{rec_id} changed to {cur['status']} while acting; retry")
     if status == "snoozed":
         # "Not now" is not a verdict — deliberately no taste event, so the
         # model learns nothing from a snooze. Rank's expiry pass flips
         # snoozed→expired after the TTL, making the item proposable again.
         return {"updated": 1, "events": 0}
     kind = "approve" if status == "approved" else "reject"
-    weight = signals.WEIGHTS[kind]
+    scale = 1.0
     meta: dict[str, Any] = {"rec_id": rec_id}
     if kind == "reject" and json.loads(row["why"] or "{}").get("exploration"):
         # Exploration picks are deliberate off-policy probes; a full-strength
         # reject would teach the model never to leave the bubble again.
-        # Approvals stay full weight — a hit is a hit however it was found.
-        weight *= 0.3
+        # Approvals stay full scale — a hit is a hit however it was found.
+        scale = 0.3
         meta["exploration"] = True
     # The verdict trains the rec owner's model, so the event carries the
     # rec's own profile — never the caller-supplied guard value.
-    added = db.add_event(conn, ts, row["item_id"], kind, weight, "user", meta=meta,
+    added = db.add_event(conn, ts, row["item_id"], kind, scale, "user", meta=meta,
                          profile=row["profile"])
     return {"updated": 1, "events": int(added)}
+
+
+def _check_verdict_legal(rec_id: int, current: str, status: str) -> None:
+    """The user-facing wording for a verdict that cannot land on the
+    rec's current status; legality comes from the table, only the
+    messages are decided here (same refusals as ever). Used both on the
+    pre-read status and on the re-read after transition() lost a race."""
+    if current == "failed":
+        # failed→approved is legal, but it is retry()'s move, not a
+        # verdict: approving here would record a second approve event for
+        # a yes the user already gave once.
+        raise ValueError(f"recommendation #{rec_id} is failed; only retry can revive it")
+    if status not in LEGAL_TRANSITIONS.get(current, set()):
+        if current in TERMINAL_STATUSES:
+            raise ValueError(f"recommendation #{rec_id} is already {current}; too late")
+        if current == status:
+            raise ValueError(f"recommendation #{rec_id} is already {status}")
+        raise ValueError(
+            f"recommendation #{rec_id} is {current}; only proposed recs can be snoozed")
 
 
 def _check_profile(row: sqlite3.Row, rec_id: int, profile: str | None) -> None:
@@ -152,13 +263,59 @@ def forgive(
         raise ValueError(f"recommendation #{rec_id} is {row['status']}; only rejected"
                          " recs can be forgiven")
 
+    # Transition FIRST; the reject events are deleted only for a move
+    # that actually landed. False means a racing writer moved the rec
+    # off 'rejected' between our read and the guarded UPDATE — whatever
+    # verdict won that race, its events must survive.
+    if not transition(conn, rec_id, "expired"):
+        cur = conn.execute(
+            "SELECT status FROM recommendations WHERE id=?", (rec_id,)).fetchone()
+        current = cur["status"] if cur is not None else "gone"
+        raise ValueError(f"recommendation #{rec_id} is {current}; only rejected"
+                         " recs can be forgiven")
     cur = conn.execute(
         "DELETE FROM events WHERE kind='reject' AND json_extract(meta, '$.rec_id') = ?",
         (rec_id,))
-    conn.execute(
-        "UPDATE recommendations SET status='expired', acted_at=? WHERE id=?",
-        (db.now(), rec_id))
     return {"deleted_events": cur.rowcount}
+
+
+def retry(
+    conn: sqlite3.Connection, rec_id: int, profile: str | None = None,
+) -> dict[str, int]:
+    """Flip a failed recommendation back to approved so the next apply
+    takes another swing — Lidarr metadata gaps are often transient.
+    Automation never does this (re-proposing would just re-fail, and
+    candidates keeps failed items out of the pool); it is a human's
+    call. Deliberately no taste event: the approve was recorded when the
+    user first said yes, and a retry is plumbing, not a verdict."""
+    row = conn.execute(
+        "SELECT status, profile, item_id FROM recommendations WHERE id=?",
+        (rec_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"no recommendation #{rec_id}")
+    _check_profile(row, rec_id, profile)
+    if row["status"] != "failed":
+        raise ValueError(f"recommendation #{rec_id} is {row['status']}; only failed"
+                         " recs can be retried")
+    # An open rec for the same (profile, item) means the item is already
+    # back in the queue: reviving the failed row too would double-queue
+    # it (the partial unique index would refuse anyway — see backstop).
+    open_rec = conn.execute(
+        "SELECT id, status FROM recommendations WHERE profile=? AND item_id=?"
+        " AND status IN ('proposed','approved') AND id != ?",
+        (row["profile"], row["item_id"], rec_id)).fetchone()
+    if open_rec is not None:
+        raise ValueError(
+            f"recommendation #{rec_id} was already re-proposed as"
+            f" #{open_rec['id']} ({open_rec['status']}) — act on that one instead")
+    try:
+        transition(conn, rec_id, "approved")
+    except sqlite3.IntegrityError as exc:
+        # backstop for a rec racing in between the check and the move
+        raise ValueError(
+            f"recommendation #{rec_id} was already re-proposed — act on that"
+            " one instead") from exc
+    return {"updated": 1, "events": 0}
 
 
 # ── explanations ─────────────────────────────────────────────────────

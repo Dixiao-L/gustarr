@@ -13,6 +13,12 @@ from gustarr import config as C
 from gustarr import db, scheduler
 from gustarr.web.app import create_app
 
+# assert_mbid validates the UUID shape now, so the fixture mbids the
+# identify tests post must be real MusicBrainz-shaped ids.
+RADIOHEAD_MBID = "a74b1b7f-71a5-4011-9441-d0b5e4122711"
+NEW_MBID = "53f7a13b-0f75-4b31-9c30-2ed40de6dc35"
+OTHER_MBID = "b0b2c1ff-1111-4222-8333-444455556666"
+
 
 @pytest.fixture
 def web(tmp_path):
@@ -27,7 +33,7 @@ def web(tmp_path):
                              meta={"genres": ["Action", "Science Fiction"]})
     blade = db.resolve_item(conn, "movie", "tmdb", "78", title="Blade Runner", year=1982,
                             meta={"genres": ["Science Fiction"]})
-    radiohead = db.resolve_item(conn, "artist", "mbid", "a74b1b7f", title="Radiohead",
+    radiohead = db.resolve_item(conn, "artist", "mbid", RADIOHEAD_MBID, title="Radiohead",
                                 meta={"genres": ["rock"]})
     ts = db.now()
     # why JSON references neighbours by surrogate int id; /why joins the
@@ -126,10 +132,10 @@ def test_approve_flips_status_and_records_event(web):
     (row,) = _fetch(cfg, "SELECT status, acted_at FROM recommendations WHERE id=?", movie_rec)
     assert row["status"] == "approved"
     assert row["acted_at"]
-    events = _fetch(cfg, "SELECT weight, source FROM events WHERE item_id=? AND kind='approve'",
+    events = _fetch(cfg, "SELECT scale, source FROM events WHERE item_id=? AND kind='approve'",
                     items["matrix"])
     assert len(events) == 1
-    assert events[0]["weight"] == 1.0
+    assert events[0]["scale"] == 1.0
     assert events[0]["source"] == "user"
 
 
@@ -138,10 +144,12 @@ def test_reject_flips_status_and_records_event(web):
     assert client.post(f"/api/recs/{artist_rec}/reject").status_code == 200
     (row,) = _fetch(cfg, "SELECT status FROM recommendations WHERE id=?", artist_rec)
     assert row["status"] == "rejected"
-    events = _fetch(cfg, "SELECT weight FROM events WHERE item_id=? AND kind='reject'",
+    events = _fetch(cfg, "SELECT scale FROM events WHERE item_id=? AND kind='reject'",
                     items["radiohead"])
     assert len(events) == 1
-    assert events[0]["weight"] == -1.0
+    # scale multiplies signals.WEIGHTS["reject"] at train time — the
+    # verdict's sign lives in the table now, so the stored scale is +1
+    assert events[0]["scale"] == 1.0
 
 
 def test_double_act_conflicts(web):
@@ -182,9 +190,9 @@ def test_index_served(web):
     assert "/api/recs" in resp.text
     for symbol in ("i-check", "i-x", "i-info", "i-compass", "i-sparkle",
                    "i-film", "i-tv", "i-music", "i-clock", "i-chart",
-                   "i-play", "i-external", "i-gear", "i-user"):
+                   "i-play", "i-external", "i-gear", "i-user", "i-tag", "i-retry"):
         assert f'id="{symbol}"' in resp.text
-    for label in ("All", "Movies", "Series", "Music", "History"):
+    for label in ("All", "Movies", "Series", "Music", "History", "Identities"):
         assert label in resp.text
     assert "aria-selected" in resp.text
     # Trailer/preview affordances ship as static strings in the page script.
@@ -241,6 +249,25 @@ def test_index_album_and_music_markup(web):
     # the album weekly cap is editable next to the artist one
     assert "music_max_albums_per_week" in text
     assert "Weekly Album Cap" in text
+
+
+def test_index_identity_panel_and_retry_markup(web):
+    client, *_ = web
+    text = client.get("/").text
+    # the Identities tab fetches the pending list and proxies MB search
+    assert "'identify'" in text
+    assert "/api/identify" in text
+    assert "/api/identify?q=" in text
+    # rows show spellings + listen counts; hits show name/disambiguation/id
+    assert "spellings" in text
+    assert "listens" in text
+    assert "disambiguation" in text
+    assert "Assert" in text
+    assert "Search MusicBrainz" in text
+    # failed history items carry the human retry back to approved
+    assert "'failed'" in text
+    assert "Retry" in text
+    assert "/retry" in text
 
 
 def test_settings_get_defaults(web):
@@ -340,6 +367,184 @@ def test_forgive_requires_rejected(web):
     assert client.post(f"/api/recs/{movie_rec}/approve").status_code == 200
     assert client.post(f"/api/recs/{movie_rec}/forgive").status_code == 409
     assert client.post("/api/recs/99999/forgive").status_code == 409
+
+
+# ── retry ────────────────────────────────────────────────────────────
+
+
+def _add_failed_rec(cfg, profile="default"):
+    conn = db.connect(cfg.db_path)
+    try:
+        album = db.resolve_item(conn, "album", "mbid", "rg-lost", title="Lost Album")
+        rec = conn.execute(
+            "INSERT INTO recommendations (profile, run_id, ts, domain, item_id, score,"
+            " why, status) VALUES (?, 'r1', ?, 'album', ?, 0.5, '{}', 'failed')",
+            (profile, db.now(), album)).lastrowid
+        conn.commit()
+        return rec
+    finally:
+        conn.close()
+
+
+def test_retry_requeues_failed_without_event(web):
+    client, cfg, *_ = web
+    failed = _add_failed_rec(cfg)
+
+    resp = client.post(f"/api/recs/{failed}/retry")
+    assert resp.status_code == 200
+    assert resp.json() == {"id": failed, "status": "approved", "updated": 1, "events": 0}
+
+    (row,) = _fetch(cfg, "SELECT status, acted_at FROM recommendations WHERE id=?", failed)
+    assert row["status"] == "approved"
+    assert row["acted_at"]
+    # a retry is plumbing, not a verdict: the model must learn nothing
+    assert _fetch(cfg, "SELECT 1 FROM events") == []
+
+
+def test_retry_requires_failed(web):
+    client, cfg, movie_rec, *_ = web
+    assert client.post(f"/api/recs/{movie_rec}/retry").status_code == 409
+    assert client.post("/api/recs/99999/retry").status_code == 409
+    # retrying an already-retried rec is a state answer too, not a mutation
+    failed = _add_failed_rec(cfg)
+    assert client.post(f"/api/recs/{failed}/retry").status_code == 200
+    assert client.post(f"/api/recs/{failed}/retry").status_code == 409
+
+
+def test_cross_profile_retry_denied_with_403(multi):
+    client, cfg, *_ = multi
+    failed = _add_failed_rec(cfg, profile="alice")
+
+    resp = client.post(f"/api/recs/{failed}/retry", headers={"Remote-User": "bob"})
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "recommendation belongs to another profile"
+    # the header-less 'default' identity is a stranger to alice's rec too
+    assert client.post(f"/api/recs/{failed}/retry").status_code == 403
+    (row,) = _fetch(cfg, "SELECT status FROM recommendations WHERE id=?", failed)
+    assert row["status"] == "failed"
+    # the guard never locks the owner out of her own retry
+    assert client.post(f"/api/recs/{failed}/retry",
+                       headers={"Remote-User": "alice"}).status_code == 200
+
+
+# ── identities ───────────────────────────────────────────────────────
+
+
+def _add_nameonly_artist(cfg, name="KinokoTeikoku", listens=2):
+    conn = db.connect(cfg.db_path)
+    try:
+        artist = db.resolve_item(conn, "artist", "name", name, title=name)
+        for i in range(listens):
+            db.add_event(conn, f"2026-01-0{i + 1}T00:00:00Z", artist, "scrobble",
+                         1.0, "lastfm")
+        conn.commit()
+        return artist
+    finally:
+        conn.close()
+
+
+def test_identify_lists_pending_artists(web):
+    client, cfg, *_ = web
+    artist = _add_nameonly_artist(cfg)
+
+    resp = client.get("/api/identify")
+    assert resp.status_code == 200
+    rows = resp.json()
+    # radiohead holds an mbid and never shows; the name-only artist does
+    assert [r["item_id"] for r in rows] == [artist]
+    assert rows[0] == {"item_id": artist, "title": "KinokoTeikoku",
+                       "spellings": ["kinokoteikoku"], "events": 2}
+
+
+def test_identify_q_proxies_musicbrainz_search(web, monkeypatch):
+    from gustarr import http
+
+    client, *_ = web
+    calls = []
+
+    def fake(method, url, *, params=None, **kw):
+        calls.append((url, dict(params or {})))
+        return {"artists": [{"id": "mb-1", "name": "Kinoko Teikoku", "score": 100,
+                             "type": "Group", "country": "JP"}]}
+
+    monkeypatch.setattr(http, "request_json", fake)
+
+    resp = client.get("/api/identify", params={"q": "Kinoko Teikoku"})
+    assert resp.status_code == 200
+    (hit,) = resp.json()
+    assert (hit["id"], hit["name"]) == ("mb-1", "Kinoko Teikoku")
+    assert hit["disambiguation"] == ""
+    url, params = calls[0]
+    assert "musicbrainz.org" in url
+    assert params["query"] == 'artist:"Kinoko Teikoku"'
+
+
+def test_identify_assert_attaches_and_reopens_enrichment(web):
+    client, cfg, *_ = web
+    artist = _add_nameonly_artist(cfg)
+
+    resp = client.post("/api/identify", json={"item_id": artist, "mbid": NEW_MBID})
+    assert resp.status_code == 200
+    assert resp.json() == {"item_id": artist, "mbid": NEW_MBID}
+
+    (row,) = _fetch(cfg, "SELECT item_id FROM identities WHERE ns='mbid' AND key=?", NEW_MBID)
+    assert row["item_id"] == artist  # committed
+    (row,) = _fetch(cfg, "SELECT enriched_at FROM items WHERE id=?", artist)
+    assert row["enriched_at"] is None
+    assert client.get("/api/identify").json() == []  # off the pending list
+
+
+def test_identify_assert_merge_reports_survivor(web):
+    client, cfg, _, _, items = web
+    twin = _add_nameonly_artist(cfg, name="radiohead uk")
+
+    # asserting radiohead's mbid merges the spelling twin into it; the
+    # response carries the survivor the UI must key off from now on
+    resp = client.post("/api/identify", json={"item_id": twin, "mbid": RADIOHEAD_MBID})
+    assert resp.status_code == 200
+    assert resp.json()["item_id"] == items["radiohead"]
+    assert _fetch(cfg, "SELECT 1 FROM items WHERE id=?", twin) == []
+
+
+def test_identify_assert_refuses_identified_artist(web):
+    client, cfg, _, _, items = web
+    # radiohead already holds its mbid: the cross-entity refusal rule
+    # holds on the human path, as a clear 409, and nothing is written
+    resp = client.post("/api/identify",
+                       json={"item_id": items["radiohead"], "mbid": OTHER_MBID})
+    assert resp.status_code == 409
+    assert "already has MusicBrainz id" in resp.json()["detail"]
+    assert _fetch(cfg, "SELECT 1 FROM identities WHERE ns='mbid' AND key=?", OTHER_MBID) == []
+
+
+def test_identify_assert_validates_body(web):
+    client, *_ = web
+    for bad in ({}, {"item_id": 1}, {"mbid": "x"}, {"item_id": "1", "mbid": "x"},
+                {"item_id": 1, "mbid": ""}):
+        assert client.post("/api/identify", json=bad).status_code == 400
+    assert client.post("/api/identify",
+                       json={"item_id": 999, "mbid": NEW_MBID}).status_code == 409
+
+
+def test_identify_assert_malformed_mbid_is_400(web):
+    client, cfg, *_ = web
+    artist = _add_nameonly_artist(cfg)
+    # 'banana', a pasted artist name, and a truncated uuid: bad requests,
+    # never store-state conflicts — and nothing is written
+    for bad in ("banana", "Kinoko Teikoku", NEW_MBID[:-4]):
+        resp = client.post("/api/identify", json={"item_id": artist, "mbid": bad})
+        assert resp.status_code == 400
+        assert "not a MusicBrainz id" in resp.json()["detail"]
+    assert _fetch(cfg, "SELECT 1 FROM identities WHERE ns='mbid' AND item_id=?", artist) == []
+
+
+def test_identify_assert_guarded_like_every_post(web):
+    client, cfg, *_ = web
+    artist = _add_nameonly_artist(cfg)
+    resp = client.post("/api/identify", json={"item_id": artist, "mbid": NEW_MBID},
+                       headers={"Origin": "https://evil.example.com"})
+    assert resp.status_code == 403
+    assert _fetch(cfg, "SELECT 1 FROM identities WHERE ns='mbid' AND key=?", NEW_MBID) == []
 
 
 def test_run_now_touches_sentinel(web):

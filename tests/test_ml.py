@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 
 from gustarr import config as C
-from gustarr import db, settings
+from gustarr import db, settings, signals
 from gustarr.ml import embed as embed_mod
 from gustarr.ml import rank as rank_mod
 from gustarr.ml import train as train_mod
@@ -146,7 +146,7 @@ def test_embed_run_selects_and_stores(tmp_path, monkeypatch):
 
     # a: enriched + event → embedded
     a = enriched_movie("a", "A", year=2000)
-    db.add_event(conn, ts, a, "play", 0.3, "jellyfin")
+    db.add_event(conn, ts, a, "play", 1.0, "jellyfin")
     # b: enriched + candidate → embedded
     b = enriched_movie("b", "B")
     add_candidate(conn, b)
@@ -154,7 +154,7 @@ def test_embed_run_selects_and_stores(tmp_path, monkeypatch):
     enriched_movie("c", "C")
     # d: relevant but not enriched → ignored
     d = db.resolve_item(conn, "movie", "tmdb", "d", title="D")
-    db.add_event(conn, ts, d, "play", 0.3, "jellyfin")
+    db.add_event(conn, ts, d, "play", 1.0, "jellyfin")
     # e: relevant + enriched but already embedded → not re-embedded
     e = enriched_movie("e", "E")
     add_candidate(conn, e)
@@ -178,7 +178,7 @@ def test_embed_requires_ml_extra(tmp_path, monkeypatch):
     cfg = make_cfg(tmp_path)
     iid = db.resolve_item(conn, "movie", "tmdb", "a", title="A", meta={"overview": "x"})
     db.upsert_item_fields(conn, iid, enriched=True)
-    db.add_event(conn, db.now(), iid, "play", 0.3, "jellyfin")
+    db.add_event(conn, db.now(), iid, "play", 1.0, "jellyfin")
     monkeypatch.setitem(sys.modules, "sentence_transformers", None)
     with pytest.raises(RuntimeError, match="uv sync --extra ml"):
         embed_mod.run(conn, cfg)
@@ -203,7 +203,7 @@ def test_train_head_separates_and_persists(tmp_path):
     for i in range(3):  # explicit negatives cluster on -e0
         iid = movie(conn, f"n{i}", f"N{i}")
         put_vec(conn, iid, unit(-axis(0) + 0.1 * rng.normal(size=DIM)), model)
-        db.add_event(conn, ts, iid, "reject", -1.0, "user")
+        db.add_event(conn, ts, iid, "reject", 1.0, "user")
     for i in range(25):  # event-less candidates → weak negative pool
         iid = movie(conn, f"w{i}", f"W{i}")
         put_vec(conn, iid, unit(rng.normal(size=DIM)), model)
@@ -243,6 +243,22 @@ def test_train_head_separates_and_persists(tmp_path):
     assert db.get_state(conn, "model:movie") is None
 
 
+def test_retuned_weights_reprice_old_events(tmp_path, monkeypatch):
+    """Debt item 2's whole point: events store a scale multiplier, so
+    retuning signals.WEIGHTS moves the labels of history already on disk
+    at the next train — no re-collection, nothing frozen at write time."""
+    conn = db.connect(tmp_path / "t.db")
+    iid = movie(conn, "old", "Old")
+    db.add_event(conn, db.now(), iid, "play", 1.0, "jellyfin")
+    before = train_mod._item_labels(conn, "default", "movie")[iid]
+    assert before == pytest.approx(signals.WEIGHTS["play"], rel=1e-3)
+
+    monkeypatch.setitem(signals.WEIGHTS, "play", 3 * signals.WEIGHTS["play"])
+    after = train_mod._item_labels(conn, "default", "movie")[iid]
+    # same stored event, same recency — only the table's price changed
+    assert after == pytest.approx(3 * before)
+
+
 def test_train_few_positives_centroid_only(tmp_path):
     conn = db.connect(tmp_path / "t.db")
     cfg = make_cfg(tmp_path)
@@ -251,7 +267,7 @@ def test_train_few_positives_centroid_only(tmp_path):
     for i in range(3):  # below the 8-positive head guard
         iid = db.resolve_item(conn, "series", "tvdb", str(i), title=f"S{i}")
         put_vec(conn, iid, unit(axis(1) + 0.05 * axis(i + 2)), model)
-        db.add_event(conn, ts, iid, "library_add", 0.6, "arr")
+        db.add_event(conn, ts, iid, "library_add", 1.0, "arr")
 
     stats = train_mod.run(conn, cfg)
     assert stats["default"]["series"] == {"pos": 3, "neg": 0, "weak": 0, "head": 0}
@@ -333,7 +349,7 @@ def test_rank_end_to_end(tmp_path):
         add_candidate(conn, iid)
     conn.execute("INSERT INTO library (item_id, arr) VALUES (?, 'radarr')",
                  (blocked["lib1"],))
-    db.add_event(conn, db.now(), blocked["rej1"], "reject", -1.0, "user")
+    db.add_event(conn, db.now(), blocked["rej1"], "reject", 1.0, "user")
     conn.execute(
         "INSERT INTO recommendations (run_id, ts, domain, item_id, score, status)"
         " VALUES ('old', ?, 'movie', ?, 0.9, 'proposed')", (db.now(), blocked["open1"]))
@@ -738,6 +754,27 @@ def test_rank_active_snooze_blocks_reproposal(tmp_path):
     assert snoozed["status"] == "snoozed"
 
 
+def test_rank_never_reproposes_failed_items(tmp_path):
+    """failed is terminal for automation — the architecture doc promises
+    "rank never re-proposes it" (re-proposing would just re-fail in
+    apply); only a human retry revives the rec."""
+    conn, cfg, iids = _artist_centroid_store(tmp_path, {"a1": axis(0), "a2": axis(1)})
+    conn.execute(
+        "INSERT INTO recommendations (run_id, ts, domain, item_id, score, status, acted_at)"
+        " VALUES ('r0', ?, 'artist', ?, 0.9, 'failed', ?)",
+        (iso_days_ago(5), iids["a1"], iso_days_ago(5)))
+
+    stats = rank_mod.run(conn, cfg)
+
+    assert stats["proposed"] == 1
+    proposed = {r["item_id"] for r in conn.execute(
+        "SELECT item_id FROM recommendations WHERE status='proposed'")}
+    assert proposed == {iids["a2"]}  # a1 would top the score if it leaked
+    failed = conn.execute(
+        "SELECT status FROM recommendations WHERE item_id=?", (iids["a1"],)).fetchone()
+    assert failed["status"] == "failed"
+
+
 def test_rank_lapsed_snooze_expires_and_reproposes(tmp_path):
     conn, cfg, iids = _artist_centroid_store(tmp_path, {"a1": axis(0)})
     conn.execute(
@@ -888,7 +925,7 @@ def test_rank_proposes_same_item_to_both_profiles(tmp_path):
 
 def test_rank_one_profiles_reject_does_not_block_the_other(tmp_path):
     conn, cfg, x = _two_profile_artist_store(tmp_path)
-    db.add_event(conn, db.now(), x, "reject", -1.0, "user", profile="alice")
+    db.add_event(conn, db.now(), x, "reject", 1.0, "user", profile="alice")
 
     stats = rank_mod.run(conn, cfg)
 

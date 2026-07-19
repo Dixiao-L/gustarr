@@ -85,7 +85,7 @@ One SQLite database, WAL mode, created on first connect (`db.py`):
 |---|---|
 | `items` | canonical catalogue: surrogate integer `id`, `domain`, `title`, `year`, `meta` (genres, overview, trailer, …), `enriched_at` — global |
 | `identities` | every external id or name an item is known by: `(domain, ns, key) → item_id` — global |
-| `events` | append-only taste signals owned by a profile: `profile`, `ts`, `item_id`, `kind`, `weight`, `source`, `dedup`, `meta`; unique on `(profile, ts, item_id, kind, source, dedup)` so re-syncs are idempotent |
+| `events` | append-only taste signals owned by a profile: `profile`, `ts`, `item_id`, `kind`, `scale`, `source`, `dedup`, `meta`; unique on `(profile, ts, item_id, kind, source, dedup)` so re-syncs are idempotent. `scale` is a multiplier, not a label — the label is `WEIGHTS[kind] × scale`, computed at train time, so tuning `signals.WEIGHTS` re-labels all history |
 | `library` | what the *arrs already manage — never recommended; global |
 | `candidates` | the pool rank scores; PK `(profile, item_id, source)` so one item found by several sources keeps all its provenance per profile, with `seed_item_id` for "why" |
 | `recommendations` | the per-profile queue: `profile`, `run_id`, `score`, `why` JSON, `status`, `acted_at` |
@@ -108,11 +108,18 @@ proposed ──▶ approved ──▶ added        (apply pushed it to the *arr)
         ──▶ snoozed  ──▶ expired       (after 30 days; re-proposable)
         ──▶ auto_added                 (music auto mode; zero training weight)
         ──▶ expired                    (proposal TTL / queue overflow)
-        ──▶ failed                     (terminal actuation failure)
+        ──▶ failed   ──▶ approved      (human retry only — see below)
 ```
 
-`added`, `auto_added` and `failed` are terminal — the item has left the
-queue's control, so a late approve/reject would be a lie and is refused.
+`added` and `auto_added` are terminal — the item has left the queue's
+control, so a late approve/reject would be a lie and is refused. `failed`
+is terminal *for automation*: rank never re-proposes it (re-proposing
+would just re-fail), but a human `gustarr retry` flips it back to
+`approved` for the next apply, because Lidarr metadata gaps are often
+transient. Every transition, including the bulk expiries `apply` and
+`rank` trigger, goes through one owner in `queue.py` that enforces this
+table; nothing else writes `recommendations.status`, and a source-scan
+test keeps it that way.
 
 ## Identity
 
@@ -129,7 +136,14 @@ spelling — Last.fm artist names, MusicBrainz aliases, width/case/script
 variants — normalized once (`ids.normalize_key`: NFKC, casefold, whitespace
 collapse) so ＹＯＡＳＯＢＩ and YOASOBI are the same key. Kana vs. romaji is
 a different *script*, not a width variant; those spellings are bridged by
-MusicBrainz aliases arriving as additional `name` identities.
+MusicBrainz aliases arriving as additional `name` identities. Alias
+registration also hunts *spaceless* twins — the scrobble spelling that
+dropped an alias's spaces ("KinokoTeikoku" for "Kinoko Teikoku"), matched
+by `ids.spaceless`, a deterministic whitespace fold, never fuzzy. The
+fold's honest cost: two genuinely distinct name-only artists whose
+spellings differ only by whitespace lose that distinction to it —
+`gustarr identify` is the recovery path for the mbid side, and a wrongly
+absorbed name-only twin has no automated undo.
 
 Two functions are the whole API:
 
@@ -153,7 +167,12 @@ alias lists legitimately carry *other* entities' names — The Kinks list
 mbid holders sharing a spelling are proof of difference, and the attach is
 refused (the spelling stays with its current owner; enrich and dedupe count
 it as `alias_conflicts`). Name merges therefore only absorb name-only
-twins — the CJK-healing case they exist for.
+twins — the CJK-healing case they exist for. When automation rightly
+refuses to guess — a name-only artist MusicBrainz's search can't place, or
+a split the conflict rule keeps apart — `gustarr identify` hands the
+decision to the person who actually knows: a human-asserted MBID goes
+through the same `attach_identity` rules, so even the manual path cannot
+steal a spelling from an artist that owns its own id.
 
 A `jellyfin` key is a *pointer* to a library entry, not an immutable
 identity. When it collides between two items that both hold authoritative
@@ -184,7 +203,10 @@ item — merged items never come back to life.
 ## Signal weighting
 
 `signals.py` is the single place where events become labels (see the table in
-the [README](../README.md#signals--weights)). Aggregation per item:
+the [README](../README.md#signals--weights)). Collectors record what happened
+(`kind`) and how much of it (`scale`); the label `WEIGHTS[kind] × scale` is
+computed at aggregation time, never stored — edit a weight and the next
+`train` re-labels every event ever collected. Aggregation per item:
 
 - **recency decay**: every contribution is scaled by `0.5^(age/365d)` — taste
   drifts, a listen last week outweighs one from 2020.
@@ -228,27 +250,12 @@ unless that's engineered against. The guards, per profile, end to end:
 
 ## Design debt
 
-Known structural shortcuts, documented so nobody has to discover them the
-hard way. None is load-bearing for correctness today; all have a planned
-fix.
-
-- **Recommendation status transitions are written from several call
-  sites**: `queue.set_status`/`forgive` (approve/reject/snooze/un-reject),
-  `apply` (added/auto_added/failed, TTL and overflow expiry) and `rank`
-  (TTL and snooze-lapse expiry) each update `recommendations.status`
-  directly. The legal-transition rules live in `queue.py` but are only
-  enforced there. Planned: a single transition owner every writer goes
-  through.
-- **Event weights are frozen at write time**: collectors store each
-  event's label contribution in `events.weight`, and
-  `signals.aggregate_label` treats the stored value as authoritative — so
-  tuning `signals.WEIGHTS` only affects events written afterwards.
-  Planned: weight recomputation from `kind` at training time.
-- **Cross-profile budget ordering favors profiles with saturated heads**:
-  the shared weekly music budgets are spent in one score-ordered pass
-  across every profile's queue, and a profile with a well-trained
-  (confident, higher-scoring) head systematically outbids a cold-start
-  one. Planned: round-robin allocation across profiles.
+Known structural shortcuts get documented here so nobody has to discover
+them the hard way. Currently none are open: the items previously listed
+(item identity spread across three mechanisms; recommendation status
+written from several call sites; event weights frozen at write time;
+score-ordered cross-profile budgets starving cold-start profiles) were
+paid off in 0.3.0–0.5.0 — see the CHANGELOG for what each became.
 
 ## HTTP discipline
 

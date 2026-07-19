@@ -89,8 +89,9 @@ sync arr ─────────┘                                       �
 
 Taste labels come from `signals.py` — one reviewable table: completion +0.8,
 loved +1.0, library-add +0.6, your reject −1.0, … with 1-year half-life
-recency decay and log-scaled listen counts. Details in
-[docs/architecture.md](docs/architecture.md).
+recency decay and log-scaled listen counts. Labels are computed at training
+time, never stored — edit a weight and the next run re-labels your entire
+history. Details in [docs/architecture.md](docs/architecture.md).
 
 ## Quickstart
 
@@ -149,8 +150,8 @@ $ uv run gustarr web             # or approve in the browser at 127.0.0.1:8790
 `gustarr run nightly` with cron/systemd, or set `[scheduler] nightly` and run
 `gustarr schedule` alongside.
 
-One more command worth knowing: `gustarr dedupe` merges items that are the
-same thing under different spellings — the same CJK artist arriving
+Two more commands worth knowing. `gustarr dedupe` merges items that are
+the same thing under different spellings — the same CJK artist arriving
 romanized from one source and in kana/kanji from another otherwise splits
 one person's history across duplicate items. It re-normalizes name
 identities and folds MusicBrainz alias spellings into the artist that owns
@@ -159,6 +160,14 @@ the MBID; add
 capped by `--limit`). Not a pipeline stage — run it once after upgrading
 Gustarr or after importing history from a new source; every pass is
 idempotent.
+
+`gustarr identify` handles what no automation should guess: artists that
+exist only as a spelling (no MusicBrainz id), because their romanization
+matches nothing MB lists. Run it bare to see them ranked by how much
+listening history they hold, `gustarr identify NAME` to search
+MusicBrainz, and `gustarr identify NAME --mbid …` to assert the match —
+the split history merges under the usual identity rules, and the next
+nightly enriches the healed artist. The web UI has the same panel.
 
 ### 3. NixOS flake module
 
