@@ -26,7 +26,7 @@ from urllib.parse import urlsplit
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from .. import db, queue, settings
+from .. import db, identify, queue, settings
 from ..config import Config
 
 _INDEX = Path(__file__).parent / "static" / "index.html"
@@ -184,6 +184,21 @@ def create_app(cfg: Config) -> FastAPI:
         conn.commit()
         return {"id": rec_id, "status": "expired", **stats}
 
+    @app.post("/api/recs/{rec_id}/retry")
+    def api_retry(
+        rec_id: int,
+        profile: str = Depends(get_profile),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> dict[str, Any]:
+        # Not a verdict, but still an act on someone's queue: the same
+        # ownership 403 as approve/reject applies.
+        try:
+            stats = queue.retry(conn, rec_id, profile=profile)
+        except ValueError as exc:  # unknown rec / not failed / other profile's rec
+            raise _queue_error(exc) from exc
+        conn.commit()
+        return {"id": rec_id, "status": "approved", **stats}
+
     @app.get("/api/recs/{rec_id}/why")
     def api_why(
         rec_id: int,
@@ -205,6 +220,42 @@ def create_app(cfg: Config) -> FastAPI:
         # Cursors, models and the diversity block are per-profile now;
         # table counts and budgets in the payload stay store-global.
         return queue.store_stats(conn, profile=profile)
+
+    # Identity is store-global (one items table, every profile), so the
+    # identify endpoints take no profile — like settings, they are an
+    # operator surface. The Host/Origin guard covers them as always.
+
+    @app.get("/api/identify")
+    def api_identify(
+        q: str | None = None,
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> list[dict[str, Any]]:
+        # ?q= proxies the MusicBrainz search server-side: the browser
+        # can't call MB directly (CORS), and the proxy keeps the per-host
+        # politeness delay in one process.
+        if q:
+            return identify.search(q)
+        return identify.pending(conn)
+
+    @app.post("/api/identify")
+    def api_identify_assert(
+        payload: dict[str, Any], conn: sqlite3.Connection = Depends(get_conn)
+    ) -> dict[str, Any]:
+        item_id, mbid = payload.get("item_id"), payload.get("mbid")
+        if not isinstance(item_id, int) or not isinstance(mbid, str) or not mbid:
+            raise HTTPException(
+                status_code=400, detail='body must be {"item_id": int, "mbid": "..."}')
+        try:
+            survivor = identify.assert_mbid(conn, item_id, mbid)
+        except ValueError as exc:
+            # a malformed mbid is a bad request; the rest (unknown item /
+            # not an artist / already identified) are store-state conflicts
+            status = 400 if "not a MusicBrainz id" in str(exc) else 409
+            raise HTTPException(status_code=status, detail=str(exc)) from exc
+        conn.commit()
+        # the survivor may differ from item_id when the assert merged the
+        # spelling into an existing mbid holder — the UI keys off it
+        return {"item_id": survivor, "mbid": mbid}
 
     @app.get("/api/settings")
     def api_settings(conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:

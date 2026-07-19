@@ -4,10 +4,14 @@ Single place of truth so collectors stay dumb (they record *what
 happened*) and the model stays honest (label policy is reviewable here,
 not scattered).
 
-Weights are per-event contributions; train.py aggregates per item with
-recency decay and clips to [-1, 1]. Positive isn't just "played" — the
-act of adding something to the library is itself a taste declaration,
-which matters here because the movie/TV play history is thin.
+Events store only a scale multiplier (schema v4); the contribution
+WEIGHTS[kind] * scale is computed here at aggregation time, so tuning
+WEIGHTS retroactively reprices all history at the next train — nothing
+is frozen into the store at collection time. train.py aggregates per
+item with recency decay and clips to [-1, 1]. Positive isn't just
+"played" — the act of adding something to the library is itself a taste
+declaration, which matters here because the movie/TV play history is
+thin.
 """
 
 from __future__ import annotations
@@ -50,18 +54,21 @@ def recency_factor(ts_iso: str, ref: datetime | None = None) -> float:
 
 
 def aggregate_label(rows: list[tuple[str, str, float]]) -> float:
-    """rows: (ts, kind, weight) for one item → label in [-1, 1].
+    """rows: (ts, kind, scale) for one item → label in [-1, 1].
 
-    The stored per-event weight is authoritative (db.py documents it as
-    "the label contribution"): collectors may batch intensity into it,
-    e.g. jellyfin writes one scrobble event with weight = base * delta.
-    Log-scaled kinds recover the listen count as weight/base (so a 5x
-    event counts as 5 recency-weighted listens); others take the
-    recency-weighted stored weight so one strong old signal survives.
+    Each event contributes WEIGHTS[kind] * scale, priced HERE with the
+    current table — collectors batch only intensity into scale (e.g.
+    jellyfin writes one scrobble event with scale = capped listen count),
+    never policy. Log-scaled kinds treat scale as that many
+    recency-weighted listens; others take the strongest recency-weighted
+    contribution in the base's own direction so one strong old signal
+    survives. Kinds absent from WEIGHTS contribute 0: with the base gone
+    from the table, whatever policy they once carried is no longer
+    expressible as a multiplier of it.
     """
     by_kind: dict[str, list[tuple[str, float]]] = {}
-    for ts, kind, weight in rows:
-        by_kind.setdefault(kind, []).append((ts, weight))
+    for ts, kind, scale in rows:
+        by_kind.setdefault(kind, []).append((ts, scale))
 
     total = 0.0
     for kind, entries in by_kind.items():
@@ -72,13 +79,11 @@ def aggregate_label(rows: list[tuple[str, str, float]]) -> float:
             if base <= 0:  # log scaling assumes accumulating positives
                 continue
             effective_count = sum(
-                recency_factor(ts) * max(0.0, w / base) for ts, w in entries
+                recency_factor(ts) * max(0.0, scale) for ts, scale in entries
             )
             total += base * math.log1p(effective_count) / math.log(2)
         else:
-            strongest = max(w * recency_factor(ts) for ts, w in entries)
-            # negative kinds: max() of negatives → use min for them
-            if base < 0:
-                strongest = min(w * recency_factor(ts) for ts, w in entries)
-            total += strongest
+            contribs = [base * scale * recency_factor(ts) for ts, scale in entries]
+            # negative kinds accumulate downward: min() is their strongest
+            total += min(contribs) if base < 0 else max(contribs)
     return max(-1.0, min(1.0, total))

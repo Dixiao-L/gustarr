@@ -11,7 +11,7 @@ import httpx
 import pytest
 
 from gustarr import config as C
-from gustarr import db, http, settings, signals
+from gustarr import db, http, queue, settings, signals
 from gustarr.actuate import apply as apply_mod
 from gustarr.actuate import arr_client, jellyfin_collections, jellyfin_playlist
 from gustarr.config import ArrConfig
@@ -323,7 +323,7 @@ def item_of(conn, rec_id):
 
 def events_of(conn, item_id):
     return conn.execute(
-        "SELECT ts, kind, weight, source, profile FROM events WHERE item_id=?",
+        "SELECT ts, kind, scale, source, profile FROM events WHERE item_id=?",
         (item_id,)).fetchall()
 
 
@@ -438,11 +438,12 @@ def test_music_weekly_cap_respected(conn, tmp_path, net):
     assert rec_row(conn, r2)["status"] == "proposed"
     assert rec_row(conn, r3)["status"] == "proposed"
     events = events_of(conn, item_of(conn, r1))
-    # audit trail only: gustarr's own add must not read as user praise
-    assert [(e["kind"], e["weight"], e["source"]) for e in events] == \
+    # audit trail only: gustarr's own add must not read as user praise —
+    # the kind has no weight AND the scale is zero, belt and braces
+    assert [(e["kind"], e["scale"], e["source"]) for e in events] == \
         [("auto_add", 0.0, "gustarr")]
     assert "auto_add" not in signals.WEIGHTS
-    assert signals.aggregate_label([(e["ts"], e["kind"], e["weight"]) for e in events]) == 0.0
+    assert signals.aggregate_label([(e["ts"], e["kind"], e["scale"]) for e in events]) == 0.0
 
 
 def test_music_budget_shared_across_profiles(conn, tmp_path, net):
@@ -468,6 +469,118 @@ def test_music_budget_shared_across_profiles(conn, tmp_path, net):
         "SELECT profile, kind FROM events WHERE item_id=?",
         (item_of(conn, b1),)).fetchone()
     assert (ev["profile"], ev["kind"]) == ("bob", "auto_add")
+
+
+def test_music_budget_round_robin_across_profiles(conn, tmp_path, net):
+    """A profile with a confident (higher-scoring) model must not outbid
+    a cold-start one: the shared budget is spent one add per profile per
+    turn, in config order — never in one score-ordered pass."""
+    cfg = make_cfg(tmp_path, profiles=["alice", "bob"], music_max_artists_per_week=2)
+    a1 = add_rec(conn, "artist", "A1", {"mbid": "a1"}, score=0.9, profile="alice")
+    a2 = add_rec(conn, "artist", "A2", {"mbid": "a2"}, score=0.8, profile="alice")
+    b1 = add_rec(conn, "artist", "B1", {"mbid": "b1"}, score=0.2, profile="bob")
+    b2 = add_rec(conn, "artist", "B2", {"mbid": "b2"}, score=0.1, profile="bob")
+
+    stats = apply_mod.run(conn, cfg)
+
+    assert stats["music_budget"] == 2
+    assert stats["music_added"] == 2
+    # one add EACH: alice's a2 outscores bob's entire queue and still
+    # doesn't get the second slot
+    assert [b["foreignArtistId"] for b in net.lidarr.posted] == ["a1", "b1"]
+    assert rec_row(conn, a1)["status"] == "auto_added"
+    assert rec_row(conn, b1)["status"] == "auto_added"
+    assert rec_row(conn, a2)["status"] == "proposed"
+    assert rec_row(conn, b2)["status"] == "proposed"
+
+
+def test_music_round_robin_skips_exhausted_queues(conn, tmp_path, net):
+    # carol has nothing this week: her turn is skipped, the other two
+    # keep alternating instead of one of them inheriting her slots
+    cfg = make_cfg(tmp_path, profiles=["alice", "carol", "bob"],
+                   music_max_artists_per_week=4)
+    add_rec(conn, "artist", "A1", {"mbid": "a1"}, score=0.9, profile="alice")
+    add_rec(conn, "artist", "A2", {"mbid": "a2"}, score=0.8, profile="alice")
+    a3 = add_rec(conn, "artist", "A3", {"mbid": "a3"}, score=0.7, profile="alice")
+    add_rec(conn, "artist", "B1", {"mbid": "b1"}, score=0.6, profile="bob")
+    add_rec(conn, "artist", "B2", {"mbid": "b2"}, score=0.5, profile="bob")
+
+    stats = apply_mod.run(conn, cfg)
+
+    assert stats["music_added"] == 4
+    assert [b["foreignArtistId"] for b in net.lidarr.posted] == ["a1", "b1", "a2", "b2"]
+    assert rec_row(conn, a3)["status"] == "proposed"  # budget gone before turn 3
+
+
+def test_music_single_profile_spend_order_unchanged(conn, tmp_path, net):
+    # one profile: round-robin degenerates to the old single ordered
+    # pass — approved first (budget-exempt), then proposed by score
+    cfg = make_cfg(tmp_path, music_max_artists_per_week=2)
+    appr = add_rec(conn, "artist", "Approved Low", {"mbid": "ap1"}, score=0.1,
+                   status="approved")
+    add_rec(conn, "artist", "P1", {"mbid": "p1"}, score=0.9)
+    add_rec(conn, "artist", "P2", {"mbid": "p2"}, score=0.8)
+    p3 = add_rec(conn, "artist", "P3", {"mbid": "p3"}, score=0.7)
+
+    stats = apply_mod.run(conn, cfg)
+
+    assert stats["music_added"] == 3  # the approval plus two budget picks
+    assert [b["foreignArtistId"] for b in net.lidarr.posted] == ["ap1", "p1", "p2"]
+    assert rec_row(conn, appr)["status"] == "added"
+    assert rec_row(conn, p3)["status"] == "proposed"
+
+
+def test_music_approved_rows_do_not_burn_round_robin_turns(conn, tmp_path, net):
+    """Approved rows are consented and budget-exempt: they all actuate in
+    phase 1 and must not spend their profile's round-robin turns —
+    alice's two approvals must not hand bob both budget slots."""
+    cfg = make_cfg(tmp_path, profiles=["alice", "bob"], music_max_artists_per_week=2)
+    ap1 = add_rec(conn, "artist", "AP1", {"mbid": "ap1"}, score=0.5,
+                  status="approved", profile="alice")
+    ap2 = add_rec(conn, "artist", "AP2", {"mbid": "ap2"}, score=0.4,
+                  status="approved", profile="alice")
+    a1 = add_rec(conn, "artist", "A1", {"mbid": "a1"}, score=0.9, profile="alice")
+    a2 = add_rec(conn, "artist", "A2", {"mbid": "a2"}, score=0.8, profile="alice")
+    b1 = add_rec(conn, "artist", "B1", {"mbid": "b1"}, score=0.2, profile="bob")
+    b2 = add_rec(conn, "artist", "B2", {"mbid": "b2"}, score=0.1, profile="bob")
+
+    stats = apply_mod.run(conn, cfg)
+
+    assert stats["music_budget"] == 2
+    assert stats["music_added"] == 4  # both approvals plus the two budget picks
+    # approvals first (profile then score), then the budget alternates:
+    # one slot each — never both to bob because alice's turns were burnt
+    assert [b["foreignArtistId"] for b in net.lidarr.posted] == ["ap1", "ap2", "a1", "b1"]
+    assert rec_row(conn, ap1)["status"] == "added"
+    assert rec_row(conn, ap2)["status"] == "added"
+    assert rec_row(conn, a1)["status"] == "auto_added"
+    assert rec_row(conn, b1)["status"] == "auto_added"
+    assert rec_row(conn, a2)["status"] == "proposed"
+    assert rec_row(conn, b2)["status"] == "proposed"
+
+
+def test_album_budget_round_robin_across_profiles(conn, tmp_path, net):
+    # the album budget is a separate pot but spends by the same turns
+    cfg = make_cfg(tmp_path, profiles=["alice", "bob"], music_max_albums_per_week=2)
+    seed_album(net, "al-a1", "ar-a1", "Alice Album 1", "Artist AA1")
+    seed_album(net, "al-a2", "ar-a2", "Alice Album 2", "Artist AA2")
+    seed_album(net, "al-b1", "ar-b1", "Bob Album 1", "Artist AB1")
+    a1 = add_rec(conn, "album", "Alice Album 1", {"mbid": "al-a1"}, score=0.9,
+                 profile="alice")
+    a2 = add_rec(conn, "album", "Alice Album 2", {"mbid": "al-a2"}, score=0.8,
+                 profile="alice")
+    b1 = add_rec(conn, "album", "Bob Album 1", {"mbid": "al-b1"}, score=0.1,
+                 profile="bob")
+
+    stats = apply_mod.run(conn, cfg)
+
+    assert stats["albums_budget"] == 2
+    assert stats["albums_added"] == 2
+    monitored = {a["foreignAlbumId"] for a in net.lidarr.albums if a["monitored"]}
+    assert monitored == {"al-a1", "al-b1"}  # one each, not alice's two
+    assert rec_row(conn, a1)["status"] == "auto_added"
+    assert rec_row(conn, b1)["status"] == "auto_added"
+    assert rec_row(conn, a2)["status"] == "proposed"
 
 
 def test_music_queue_mode_leaves_proposed(conn, tmp_path, net):
@@ -620,7 +733,7 @@ def test_album_weekly_cap_respected(conn, tmp_path, net):
     assert rec_row(conn, r2)["status"] == "proposed"
     # audit trail only: gustarr's own add must not read as user praise
     events = events_of(conn, item_of(conn, r1))
-    assert [(e["kind"], e["weight"], e["source"]) for e in events] == \
+    assert [(e["kind"], e["scale"], e["source"]) for e in events] == \
         [("auto_add", 0.0, "gustarr")]
 
 
@@ -949,7 +1062,7 @@ def test_video_auto_mode_adds_proposed_within_cap(conn, tmp_path, net):
     assert rec_row(conn, low)["status"] == "proposed"  # over the per-run cap
     # audit event only, invisible to training
     events = events_of(conn, item_of(conn, top))
-    assert [(e["kind"], e["weight"], e["source"]) for e in events] == \
+    assert [(e["kind"], e["scale"], e["source"]) for e in events] == \
         [("auto_add", 0.0, "gustarr")]
 
 
@@ -995,6 +1108,22 @@ def test_successful_adds_committed_immediately(conn, tmp_path, net):
         assert row["status"] == "added"
     finally:
         other.close()
+
+
+def test_record_add_survives_racing_reject_and_keeps_its_event(conn, tmp_path, net):
+    """The arr add is irreversible reality: a reject racing in mid-HTTP
+    must not leave the store denying it — _record_add forces the row to
+    'added'. The reject's taste event SURVIVES: taste and state are
+    separate ledgers, and the verdict still trains the model."""
+    rid = add_rec(conn, "artist", "Artist 1", {"mbid": "mb1"}, status="approved")
+    row = rec_row(conn, rid)  # apply's snapshot, taken before the race
+    queue.set_status(conn, rid, "rejected")  # the verdict lands mid-HTTP
+
+    apply_mod._record_add(conn, row, db.now())
+
+    assert rec_row(conn, rid)["status"] == "added"
+    kinds = [e["kind"] for e in events_of(conn, item_of(conn, rid))]
+    assert kinds == ["reject"]  # the racing verdict's ledger entry stands
 
 
 def test_video_queue_overflow_expires_lowest_scores(conn, tmp_path, net):

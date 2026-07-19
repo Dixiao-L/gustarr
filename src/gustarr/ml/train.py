@@ -39,11 +39,11 @@ def _item_labels(conn: sqlite3.Connection, profile: str, domain: str) -> dict[in
     # a housemate's rejects would poison everyone's heads.
     per_item: dict[int, list[tuple[str, str, float]]] = {}
     for r in conn.execute(
-        "SELECT e.item_id, e.ts, e.kind, e.weight FROM events e"
+        "SELECT e.item_id, e.ts, e.kind, e.scale FROM events e"
         " JOIN items i ON i.id = e.item_id WHERE i.domain = ? AND e.profile = ?",
         (domain, profile),
     ):
-        per_item.setdefault(r["item_id"], []).append((r["ts"], r["kind"], r["weight"]))
+        per_item.setdefault(r["item_id"], []).append((r["ts"], r["kind"], r["scale"]))
     return {item: signals.aggregate_label(evts) for item, evts in per_item.items()}
 
 

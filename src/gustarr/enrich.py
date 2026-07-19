@@ -331,8 +331,12 @@ def _bridge_artist_aliases(conn, item_id: int, names: list[str],
     artist with its OWN mbid is refused and counted as a conflict — MB
     alias lists carry other entities' names (The Kinks list "The Ravens"),
     and a shared spelling between two authoritative entities is proof of
-    difference, not sameness. dedupe.py runs the same registration offline
-    for pre-existing stores."""
+    difference, not sameness. Each spelling is also hunted for spaceless
+    twins — the scrobble spelling that dropped the alias's spaces — whose
+    stored keys go through the very same attach, so the merge/refuse rule
+    is untouched. dedupe.py runs the same registration offline for
+    pre-existing stores."""
+    fold = _fold_index(conn)
     for raw in names:
         # aliases are stored raw; attach_identity normalizes on write, so
         # this is exactly the identity a collector would mint for that
@@ -340,7 +344,47 @@ def _bridge_artist_aliases(conn, item_id: int, names: list[str],
         if not raw or not isinstance(raw, str) or not ids.normalize_key(raw):
             continue
         item_id = _attach(conn, "artist", item_id, "name", raw, eff, stats)
+        _fold_add(fold, raw)  # newly attached spellings join the huntable set
+        for twin in _spaceless_twins(fold, raw):
+            item_id = _attach(conn, "artist", item_id, "name", twin, eff, stats)
     return item_id
+
+
+def _fold_index(conn) -> dict[str, list[str]]:
+    """The whitespace-fold lookup index behind alias twin-hunting:
+    {ids.spaceless(key): [stored keys]} over every artist 'name'
+    identity, built ONCE at the top of the bridging scope so each hunt
+    is an O(1) lookup instead of a fresh table scan per alias. Keys only
+    — item ownership is resolved live at attach time, so an earlier
+    merge can never stale a hunt. SQL's REPLACE(key, ' ', '') cannot
+    reproduce ids.spaceless (a store predating a normalize_key
+    tightening holds full-width and ideographic spaces REPLACE can't
+    see), so the fold runs in python."""
+    fold: dict[str, list[str]] = {}
+    for r in conn.execute(
+            "SELECT key FROM identities WHERE domain='artist' AND ns='name' ORDER BY rowid"):
+        fold.setdefault(ids.spaceless(r["key"]), []).append(r["key"])
+    return fold
+
+
+def _fold_add(fold: dict[str, list[str]], name: str) -> None:
+    """Register a just-attached spelling in the fold index (stored form:
+    attach_identity writes normalize_key'd keys) so later aliases in the
+    same scope can hunt it too."""
+    norm = ids.normalize_key(name)
+    keys = fold.setdefault(ids.spaceless(norm), [])
+    if norm not in keys:
+        keys.append(norm)
+
+
+def _spaceless_twins(fold: dict[str, list[str]], alias: str) -> list[str]:
+    """Existing artist 'name' spellings that equal this alias once spaces
+    are folded out but differ as stored keys — the scrobble-spelling twins
+    ("KinokoTeikoku" for MB's "Kinoko Teikoku"). Still an exact match
+    after a deterministic fold, never fuzzy: one dict lookup in the
+    scope-wide fold index."""
+    norm = ids.normalize_key(alias)
+    return [k for k in fold.get(ids.spaceless(alias), []) if k != norm]
 
 
 def _lastfm_artist_meta(cfg: Config, mbid: str | None, name: str | None) -> dict[str, Any]:

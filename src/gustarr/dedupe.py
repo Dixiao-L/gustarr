@@ -16,7 +16,13 @@ table. Three idempotent passes:
      spellings collectors resolve name identities from; attaching each
      via db.attach_identity folds existing twins into the mbid item and
      makes all future encounters land on it on arrival. Cross-script
-     variants (kana/kanji vs romaji) collapse here.
+     variants (kana/kanji vs romaji) collapse here, and so do spaceless
+     spelling twins ("KinokoTeikoku" for the alias "Kinoko Teikoku"),
+     hunted by a deterministic whitespace fold — never fuzzy. The fold's
+     honest cost: two genuinely distinct name-only artists whose
+     spellings differ only by whitespace lose that distinction to it —
+     gustarr identify is the recovery path for the mbid side, and a
+     wrongly absorbed name-only twin has no automated undo.
   3. fetch (opt-in) — pull alias lists from MusicBrainz for played
      artists that lack them, then alias-register those artists.
 
@@ -122,6 +128,7 @@ def _alias_pass(conn: sqlite3.Connection, stats: dict[str, int]) -> None:
     rows = conn.execute(
         "SELECT id, title, meta FROM items WHERE domain='artist' AND EXISTS("
         " SELECT 1 FROM identities x WHERE x.item_id = items.id AND x.ns='mbid')").fetchall()
+    fold = _fold_index(conn)
     for row in rows:
         if conn.execute("SELECT 1 FROM items WHERE id=?", (row["id"],)).fetchone() is None:
             continue  # merged away by an earlier row's registration
@@ -130,34 +137,82 @@ def _alias_pass(conn: sqlite3.Connection, stats: dict[str, int]) -> None:
         # MB knows no aliases) still registers the primary title and is
         # never re-fetched.
         if "aliases" in meta:
-            _register(conn, row["id"], row["title"], meta["aliases"], stats)
+            _register(conn, row["id"], row["title"], meta["aliases"], stats, fold)
 
 
 def _register(conn: sqlite3.Connection, item_id: int, title: str | None,
-              aliases: list, stats: dict[str, int]) -> int:
+              aliases: list, stats: dict[str, int], fold: dict[str, list[str]]) -> int:
     """attach_identity per spelling, with the dedupe bookkeeping: a
     spelling held by a name-only twin merges the two (the authoritative
     holder survives and registration continues on it); one held by
     another artist with its own mbid is refused and counted — MB alias
     lists carry other entities' names, so that collision proves the two
-    are different."""
+    are different. Each spelling is also hunted for spaceless twins —
+    the scrobble spelling that dropped the alias's spaces — whose stored
+    keys go through the very same attach, so the merge/refuse rule is
+    untouched."""
     for name in [title, *aliases]:
         # aliases are stored raw; attach_identity normalizes on write, so
         # this is exactly the identity a collector would resolve for that
         # spelling. Names folding to nothing can never be looked up.
         if not name or not isinstance(name, str) or not ids.normalize_key(name):
             continue
-        holder = db.lookup_item(conn, "artist", "name", name)
-        if holder == item_id:
-            continue  # already registered: reruns stay silent
-        item_id = db.attach_identity(conn, item_id, "name", name)
-        if holder is None:
-            stats["alias_attached"] += 1
-        elif item_id != holder and db.lookup_item(conn, "artist", "name", name) == holder:
-            stats["alias_conflicts"] += 1
-        else:
-            stats["merged"] += 1
+        item_id = _register_one(conn, item_id, name, stats, fold)
+        for twin in _spaceless_twins(fold, name):
+            item_id = _register_one(conn, item_id, twin, stats, fold)
     return item_id
+
+
+def _register_one(conn: sqlite3.Connection, item_id: int, name: str,
+                  stats: dict[str, int], fold: dict[str, list[str]]) -> int:
+    holder = db.lookup_item(conn, "artist", "name", name)
+    if holder == item_id:
+        return item_id  # already registered: reruns stay silent
+    item_id = db.attach_identity(conn, item_id, "name", name)
+    _fold_add(fold, name)  # newly attached spellings join the huntable set
+    if holder is None:
+        stats["alias_attached"] += 1
+    elif item_id != holder and db.lookup_item(conn, "artist", "name", name) == holder:
+        stats["alias_conflicts"] += 1
+    else:
+        stats["merged"] += 1
+    return item_id
+
+
+def _fold_index(conn: sqlite3.Connection) -> dict[str, list[str]]:
+    """The whitespace-fold lookup index behind alias twin-hunting:
+    {ids.spaceless(key): [stored keys]} over every artist 'name'
+    identity, built ONCE per pass so each hunt is an O(1) lookup instead
+    of a fresh table scan per alias. Keys only — item ownership is
+    resolved live at attach time, so an earlier merge can never stale a
+    hunt. SQL's REPLACE(key, ' ', '') cannot reproduce ids.spaceless (a
+    store predating a normalize_key tightening holds full-width and
+    ideographic spaces REPLACE can't see), so the fold runs in python."""
+    fold: dict[str, list[str]] = {}
+    for r in conn.execute(
+            "SELECT key FROM identities WHERE domain='artist' AND ns='name' ORDER BY rowid"):
+        fold.setdefault(ids.spaceless(r["key"]), []).append(r["key"])
+    return fold
+
+
+def _fold_add(fold: dict[str, list[str]], name: str) -> None:
+    """Register a just-attached spelling in the fold index (stored form:
+    attach_identity writes normalize_key'd keys) so later aliases in the
+    same pass can hunt it too."""
+    norm = ids.normalize_key(name)
+    keys = fold.setdefault(ids.spaceless(norm), [])
+    if norm not in keys:
+        keys.append(norm)
+
+
+def _spaceless_twins(fold: dict[str, list[str]], alias: str) -> list[str]:
+    """Existing artist 'name' spellings that equal this alias once spaces
+    are folded out but differ as stored keys — the scrobble-spelling twins
+    ("KinokoTeikoku" for MB's "Kinoko Teikoku"). Still an exact match
+    after a deterministic fold, never fuzzy: one dict lookup in the
+    pass-wide fold index."""
+    norm = ids.normalize_key(alias)
+    return [k for k in fold.get(ids.spaceless(alias), []) if k != norm]
 
 
 def _fetch_pass(conn: sqlite3.Connection, stats: dict[str, int], limit: int | None) -> None:
@@ -170,6 +225,7 @@ def _fetch_pass(conn: sqlite3.Connection, stats: dict[str, int], limit: int | No
         # played artists only: each lookup costs 1.1s of MB politeness,
         # and only items with history have split history worth healing
         " AND EXISTS(SELECT 1 FROM events e WHERE e.item_id = items.id)").fetchall()
+    fold = _fold_index(conn)
     attempts = 0
     for row in rows:
         if row["mbid"] is None:
@@ -194,7 +250,7 @@ def _fetch_pass(conn: sqlite3.Connection, stats: dict[str, int], limit: int | No
                    if isinstance(a, dict) and a.get("name")]
         db.upsert_item_fields(conn, row["id"], meta={"aliases": aliases})
         stats["fetched"] += 1
-        _register(conn, row["id"], row["title"], aliases, stats)
+        _register(conn, row["id"], row["title"], aliases, stats, fold)
         # MB politeness makes big runs span minutes; commit as we go so
         # an abort keeps the aliases already paid for.
         conn.commit()

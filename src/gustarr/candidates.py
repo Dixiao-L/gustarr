@@ -205,14 +205,14 @@ def _positive_items(conn: sqlite3.Connection, profile: str,
     """One profile's items with aggregate label >= SEED_LABEL_MIN, best
     first (ties broken by most recent event)."""
     rows = conn.execute(
-        "SELECT e.item_id, e.ts, e.kind, e.weight FROM events e"
+        "SELECT e.item_id, e.ts, e.kind, e.scale FROM events e"
         " JOIN items i ON i.id = e.item_id WHERE e.profile=? AND i.domain=?",
         (profile, domain),
     ).fetchall()
     events: dict[int, list[tuple[str, str, float]]] = {}
     latest: dict[int, str] = {}
     for r in rows:
-        events.setdefault(r["item_id"], []).append((r["ts"], r["kind"], r["weight"]))
+        events.setdefault(r["item_id"], []).append((r["ts"], r["kind"], r["scale"]))
         if r["ts"] > latest.get(r["item_id"], ""):
             latest[r["item_id"]] = r["ts"]
     positives = [(iid, label) for iid, evs in events.items()

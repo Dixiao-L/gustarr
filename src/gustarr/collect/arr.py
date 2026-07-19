@@ -17,7 +17,6 @@ from typing import Any
 
 from .. import db, http, ids
 from ..config import ArrConfig, Config
-from ..signals import WEIGHTS
 
 # Per-arr API shape: version prefix, list endpoint, canonical domain and
 # namespace, plus which response fields map to which id namespaces.
@@ -116,7 +115,7 @@ def _sync_one(
         # library_add weight keeps the shared attribution harmless.
         if not is_gustarr and added:
             for profile in profiles:
-                if db.add_event(conn, added, item, "library_add", WEIGHTS["library_add"],
+                if db.add_event(conn, added, item, "library_add", 1.0,
                                 "arr", {"arr": name}, profile=profile):
                     stats["events"] += 1
         current[ids.normalize_key(str(key))] = entry.get("id")
@@ -150,10 +149,10 @@ def _sync_one(
                 " AND status IN ('added','auto_added')"
                 " ORDER BY acted_at DESC, id DESC LIMIT 1", (item,)).fetchone()
             targets = [owner["profile"]] if owner else profiles
-            weight = WEIGHTS["reject"] if owner else WEIGHTS["reject"] * 0.3
+            scale = 1.0 if owner else 0.3
             meta = {"deleted": True} if owner else {"deleted": True, "shared": True}
             for profile in targets:
-                if db.add_event(conn, db.now(), item, "reject", weight, "arr",
+                if db.add_event(conn, db.now(), item, "reject", scale, "arr",
                                 meta, profile=profile):
                     stats["rejects"] += 1
         conn.execute("DELETE FROM library WHERE item_id=? AND arr=?", (item, name))

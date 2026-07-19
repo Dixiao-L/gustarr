@@ -114,6 +114,20 @@ MB_YORUSHIKA = {
     "aliases": [{"name": "Yorushika"}, {"name": "yorusika"}],
 }
 
+KINOKO_MBID = "e5a1c2d3-4b6f-4a8e-9c0d-1f2a3b4c5d6e"
+
+# kana-primary artist whose MB alias carries the space scrobblers drop
+MB_KINOKO = {
+    "id": KINOKO_MBID,
+    "name": "きのこ帝国",
+    "type": "Group",
+    "country": "JP",
+    "life-span": {"begin": "2007"},
+    "tags": [{"count": 3, "name": "shoegaze"}],
+    "genres": [],
+    "aliases": [{"name": "Kinoko Teikoku"}],
+}
+
 
 def item(conn, item_id):
     return conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
@@ -610,6 +624,72 @@ def test_artist_shared_alias_with_other_mbid_artist_is_refused(conn, tmp_path, m
     assert name_target(conn, "Yorushika") == other
     assert name_target(conn, "ヨルシカ") == cid
     assert name_target(conn, "yorusika") == cid
+
+
+def test_artist_alias_spaceless_twin_merges_with_events(conn, tmp_path, monkeypatch):
+    """The 0.5.0 whitespace fold: MB's alias "Kinoko Teikoku" arrives
+    while months of scrobbles sit on a spelling twin that dropped the
+    space. The twin is the same exact string after a deterministic fold —
+    never fuzzy — so its history unites under the mbid item."""
+    cfg = make_cfg(tmp_path)
+    fid = db.resolve_item(conn, "artist", "name", "KinokoTeikoku", title="KinokoTeikoku")
+    db.upsert_item_fields(conn, fid, enriched=True)
+    db.add_event(conn, "2026-01-01T00:00:00Z", fid, "scrobble", 0.15, "lastfm")
+    db.add_event(conn, "2026-02-01T00:00:00Z", fid, "loved", 1.0, "lastfm")
+    cid = db.resolve_item(conn, "artist", "mbid", KINOKO_MBID)
+    mock_api(monkeypatch, [
+        (f"/artist/{KINOKO_MBID}", MB_KINOKO),
+        ("deezer", {"data": []}),
+    ])
+
+    stats = run(conn, cfg)
+
+    assert stats == {**BASE, "enriched": 1, "merged": 1}
+    assert item(conn, fid) is None
+    assert event_items(conn) == [cid, cid]
+    # both spellings land here on arrival, each under its own stored
+    # normalize_key'd row: spaceless is a lookup fold, never a storage key
+    assert name_target(conn, "Kinoko Teikoku") == cid
+    assert name_target(conn, "KinokoTeikoku") == cid
+    assert name_target(conn, "きのこ帝国") == cid
+    keys = {r["key"] for r in conn.execute(
+        "SELECT key FROM identities WHERE item_id=? AND ns='name'", (cid,))}
+    assert keys == {"きのこ帝国", "kinoko teikoku", "kinokoteikoku"}
+
+    # idempotent: re-enriching the survivor re-registers every spelling
+    # silently — nothing merges twice, no event moves
+    conn.execute("UPDATE items SET enriched_at=NULL WHERE id=?", (cid,))
+    assert run(conn, cfg) == {**BASE, "enriched": 1}
+    assert event_items(conn) == [cid, cid]
+
+
+def test_artist_spaceless_twin_with_own_mbid_is_refused(conn, tmp_path, monkeypatch):
+    """The cross-entity refusal rule is untouched by the whitespace fold:
+    a spaceless twin holding its OWN mbid is a different entity, so the
+    hunt counts a conflict and merges nothing."""
+    cfg = make_cfg(tmp_path)
+    other = db.resolve_item(conn, "artist", "mbid", OTHER_MBID, title="KinokoTeikoku")
+    db.attach_identity(conn, other, "name", "KinokoTeikoku")
+    db.upsert_item_fields(conn, other, enriched=True)
+    db.add_event(conn, "2026-01-01T00:00:00Z", other, "scrobble", 0.15, "lastfm")
+    cid = db.resolve_item(conn, "artist", "mbid", KINOKO_MBID)
+    mock_api(monkeypatch, [
+        (f"/artist/{KINOKO_MBID}", MB_KINOKO),
+        ("deezer", {"data": []}),
+    ])
+
+    stats = run(conn, cfg)
+
+    assert stats == {**BASE, "enriched": 1, "alias_conflicts": 1}
+    # both artists survive; the twin keeps its spelling and its history
+    assert item(conn, cid) is not None and item(conn, other) is not None
+    assert event_items(conn) == [other]
+    assert mbid_keys(conn, cid) == {KINOKO_MBID}
+    assert mbid_keys(conn, other) == {OTHER_MBID}
+    assert name_target(conn, "KinokoTeikoku") == other
+    # the spaced alias itself still lands on the mbid item
+    assert name_target(conn, "Kinoko Teikoku") == cid
+    assert name_target(conn, "きのこ帝国") == cid
 
 
 def test_track_name_keyed_just_marked(conn, tmp_path, monkeypatch):

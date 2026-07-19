@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import threading
+import time
+
 import httpx
 import pytest
 
@@ -96,6 +99,36 @@ def test_api_error_detail_populated_on_400():
 def test_api_error_detail_defaults_empty():
     err = ghttp.ApiError("https://x.test", 401)
     assert err.detail == ""
+
+
+def test_polite_wait_serializes_concurrent_threads(monkeypatch):
+    """Two web threads hitting a politeness-delayed host must space their
+    requests by the per-host delay: without the lock both read the same
+    last-call time and fire 0s apart (MusicBrainz bans for that)."""
+    delay = 0.1
+    monkeypatch.setattr(ghttp, "HOST_DELAYS", {"example.test": delay})
+    times: list[float] = []
+
+    def handler(request):
+        times.append(time.monotonic())
+        return httpx.Response(200, json={"ok": True})
+
+    transport = _transport(handler)
+
+    def call():
+        ghttp.request_json("GET", URL, retries=0, transport=transport)
+
+    threads = [threading.Thread(target=call) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(times) == 2
+    first, second = sorted(times)
+    # the small slack absorbs the handler overhead between the spacing
+    # write and the recorded call time
+    assert second - first >= delay - 0.02
 
 
 def test_success_after_retry(sleeps):

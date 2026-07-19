@@ -18,7 +18,6 @@ import httpx
 
 from .. import db, ids
 from ..http import get_json
-from ..signals import WEIGHTS
 
 API_ROOT = "https://ws.audioscrobbler.com/2.0/"
 CURSOR_KEY = "lastfm:last_uts"
@@ -155,12 +154,12 @@ def _sync_profile(
         except ValueError:
             continue
         ts = _iso(uts)
-        if db.add_event(conn, ts, track_id, "scrobble", WEIGHTS["scrobble"], "lastfm",
+        if db.add_event(conn, ts, track_id, "scrobble", 1.0, "lastfm",
                         profile=profile):
             stats["scrobbles"] += 1
         # dedup=track id: two different tracks scrobbled the same second
         # must both count on the artist item; re-syncs still collide.
-        db.add_event(conn, ts, artist_id, "scrobble", WEIGHTS["scrobble"], "lastfm",
+        db.add_event(conn, ts, artist_id, "scrobble", 1.0, "lastfm",
                      dedup=str(track_id), profile=profile)
         seen_items.update((track_id, artist_id))
         max_uts = max(max_uts, uts)
@@ -174,10 +173,10 @@ def _sync_profile(
         except ValueError:
             continue
         ts = _iso(uts)
-        if db.add_event(conn, ts, track_id, "loved", WEIGHTS["loved"], "lastfm",
+        if db.add_event(conn, ts, track_id, "loved", 1.0, "lastfm",
                         profile=profile):
             stats["loved"] += 1
-        db.add_event(conn, ts, artist_id, "loved", WEIGHTS["loved"], "lastfm",
+        db.add_event(conn, ts, artist_id, "loved", 1.0, "lastfm",
                      dedup=str(track_id), profile=profile)
         seen_items.update((track_id, artist_id))
 

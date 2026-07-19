@@ -100,11 +100,11 @@ def gone(conn, item_id):
 
 def test_normalize_merges_prenorm_twin_with_events_intact(conn, tmp_path):
     raw = mint_raw(conn, "artist", "name", RAW_KEY, title="YOASOBI")
-    db.add_event(conn, "2026-01-01T00:00:00Z", raw, "scrobble", 0.15, "lastfm", dedup="t1")
-    db.add_event(conn, "2026-01-02T00:00:00Z", raw, "scrobble", 0.15, "lastfm", dedup="t2")
+    db.add_event(conn, "2026-01-01T00:00:00Z", raw, "scrobble", 1.0, "lastfm", dedup="t1")
+    db.add_event(conn, "2026-01-02T00:00:00Z", raw, "scrobble", 1.0, "lastfm", dedup="t2")
     # a normalized twin already exists with one identical synced scrobble
     norm = db.resolve_item(conn, "artist", "name", "YOASOBI", title="YOASOBI")
-    db.add_event(conn, "2026-01-01T00:00:00Z", norm, "scrobble", 0.15, "lastfm", dedup="t1")
+    db.add_event(conn, "2026-01-01T00:00:00Z", norm, "scrobble", 1.0, "lastfm", dedup="t1")
 
     stats = run(conn, make_cfg(tmp_path))
 
@@ -136,7 +136,7 @@ def test_normalize_collision_merges_into_authoritative_item(conn, tmp_path):
     mb_item = db.resolve_item(conn, "artist", "mbid", MBID, title="YOASOBI")
     db.attach_identity(conn, mb_item, "name", "YOASOBI")
     raw = mint_raw(conn, "artist", "name", RAW_KEY, title="YOASOBI")
-    db.add_event(conn, "2026-01-01T00:00:00Z", raw, "scrobble", 0.15, "lastfm")
+    db.add_event(conn, "2026-01-01T00:00:00Z", raw, "scrobble", 1.0, "lastfm")
 
     stats = run(conn, make_cfg(tmp_path))
 
@@ -164,8 +164,8 @@ def test_alias_pass_merges_romaji_twin_into_kana_mbid_artist(conn, tmp_path):
     kana_item = db.resolve_item(conn, "artist", "mbid", MBID, title=KANA,
                                 meta={"aliases": [ROMAJI]})
     romaji_item = db.resolve_item(conn, "artist", "name", ROMAJI, title=ROMAJI)
-    db.add_event(conn, "2026-01-01T00:00:00Z", romaji_item, "scrobble", 0.15, "lastfm", dedup="a")
-    db.add_event(conn, "2026-01-02T00:00:00Z", romaji_item, "scrobble", 0.15, "lastfm", dedup="b")
+    db.add_event(conn, "2026-01-01T00:00:00Z", romaji_item, "scrobble", 1.0, "lastfm", dedup="a")
+    db.add_event(conn, "2026-01-02T00:00:00Z", romaji_item, "scrobble", 1.0, "lastfm", dedup="b")
 
     stats = run(conn, make_cfg(tmp_path))
 
@@ -178,7 +178,7 @@ def test_alias_pass_merges_romaji_twin_into_kana_mbid_artist(conn, tmp_path):
 
     # the next sync resolving the romaji spelling lands on the mbid item
     assert db.resolve_item(conn, "artist", "name", ROMAJI) == kana_item
-    db.add_event(conn, "2026-02-01T00:00:00Z", kana_item, "scrobble", 0.15, "lastfm")
+    db.add_event(conn, "2026-02-01T00:00:00Z", kana_item, "scrobble", 1.0, "lastfm")
     assert event_items(conn) == [kana_item] * 3
 
     assert run(conn, make_cfg(tmp_path)) == ZERO_STATS
@@ -207,6 +207,92 @@ def test_alias_shared_spelling_between_mbid_artists_is_refused(conn, tmp_path):
     assert run(conn, make_cfg(tmp_path)) == {**ZERO_STATS, "alias_conflicts": 1}
 
 
+def test_alias_pass_absorbs_spaceless_scrobble_twin(conn, tmp_path):
+    """The 0.5.0 whitespace fold, offline: MB's alias "Kinoko Teikoku"
+    absorbs the pre-existing scrobble spelling that dropped the space —
+    the same exact string after a deterministic fold, never fuzzy."""
+    mb_item = db.resolve_item(conn, "artist", "mbid", MBID, title="きのこ帝国",
+                              meta={"aliases": ["Kinoko Teikoku"]})
+    twin = db.resolve_item(conn, "artist", "name", "KinokoTeikoku", title="KinokoTeikoku")
+    db.add_event(conn, "2026-01-01T00:00:00Z", twin, "scrobble", 1.0, "lastfm", dedup="a")
+    db.add_event(conn, "2026-01-02T00:00:00Z", twin, "scrobble", 1.0, "lastfm", dedup="b")
+
+    stats = run(conn, make_cfg(tmp_path))
+
+    # kana title + spaced alias attach; the spaceless twin merges in
+    assert stats == {**ZERO_STATS, "alias_attached": 2, "merged": 1}
+    assert gone(conn, twin)
+    assert event_items(conn) == [mb_item, mb_item]
+    # each spelling keeps its own normalize_key'd row — spaceless is a
+    # lookup fold, never a storage key
+    assert identity_keys(conn, "artist", "name") == \
+        ["kinoko teikoku", "kinokoteikoku", "きのこ帝国"]
+    assert db.lookup_item(conn, "artist", "name", "KinokoTeikoku") == mb_item
+    assert db.lookup_item(conn, "artist", "name", "Kinoko Teikoku") == mb_item
+    assert run(conn, make_cfg(tmp_path)) == ZERO_STATS
+
+
+def test_alias_pass_spaceless_twin_with_own_mbid_is_refused(conn, tmp_path):
+    """The cross-entity refusal rule is untouched by the whitespace fold:
+    a spaceless twin holding its OWN mbid is a different entity, so the
+    hunt counts a conflict and merges nothing."""
+    other = db.resolve_item(conn, "artist", "mbid", OTHER_MBID, title="KinokoTeikoku")
+    db.attach_identity(conn, other, "name", "KinokoTeikoku")
+    db.add_event(conn, "2026-01-01T00:00:00Z", other, "scrobble", 1.0, "lastfm")
+    mb_item = db.resolve_item(conn, "artist", "mbid", MBID, title="きのこ帝国",
+                              meta={"aliases": ["Kinoko Teikoku"]})
+
+    stats = run(conn, make_cfg(tmp_path))
+
+    assert stats == {**ZERO_STATS, "alias_attached": 2, "alias_conflicts": 1}
+    # both artists survive; the twin keeps its spelling and its history
+    assert not gone(conn, mb_item) and not gone(conn, other)
+    assert event_items(conn) == [other]
+    assert db.lookup_item(conn, "artist", "name", "KinokoTeikoku") == other
+    assert db.lookup_item(conn, "artist", "name", "Kinoko Teikoku") == mb_item
+    # a standing conflict is still standing on the rerun — counted, not merged
+    assert run(conn, make_cfg(tmp_path)) == {**ZERO_STATS, "alias_conflicts": 1}
+
+
+class QueryLog:
+    """conn wrapper recording every SQL statement (whitespace-collapsed)."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self.queries = []
+
+    def execute(self, sql, *args, **kw):
+        self.queries.append(" ".join(sql.split()))
+        return self._conn.execute(sql, *args, **kw)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+FOLD_SCAN = "SELECT key FROM identities WHERE domain='artist' AND ns='name' ORDER BY rowid"
+
+
+def test_alias_pass_scans_identities_once_not_per_alias(conn, tmp_path):
+    """The whitespace-fold twin hunt runs off ONE fold index built at the
+    top of the pass — an O(1) dict lookup per alias, never a fresh
+    identities scan each (that was quadratic in store size)."""
+    for i in range(3):
+        db.resolve_item(
+            conn, "artist", "mbid", f"{i}{MBID[1:]}", title=f"Artist {i}",
+            meta={"aliases": [f"Artist {i} Alias {j}" for j in range(4)]})
+    first_log = QueryLog(conn)
+    first = run(first_log, make_cfg(tmp_path))
+    assert first == {**ZERO_STATS, "alias_attached": 15}  # 3 titles + 12 aliases
+
+    rerun_log = QueryLog(conn)
+    stats = run(rerun_log, make_cfg(tmp_path))
+
+    assert stats == ZERO_STATS  # rerun on the settled store: same stats, no work
+    for log in (first_log, rerun_log):
+        scans = [q for q in log.queries if q == FOLD_SCAN]
+        assert len(scans) == 1  # once per pass, not once per alias hunted
+
+
 def test_alias_pass_ignores_junk_alias_entries(conn, tmp_path):
     db.resolve_item(conn, "artist", "mbid", MBID, title=KANA,
                     meta={"aliases": ["", None, 7, ROMAJI]})
@@ -227,9 +313,9 @@ def _mb_artist(mbid, name, aliases):
 
 def test_fetch_stores_aliases_then_merges_and_never_refetches(conn, tmp_path, monkeypatch):
     kana_item = db.resolve_item(conn, "artist", "mbid", MBID, title=KANA)
-    db.add_event(conn, "2026-01-01T00:00:00Z", kana_item, "scrobble", 0.15, "lastfm")
+    db.add_event(conn, "2026-01-01T00:00:00Z", kana_item, "scrobble", 1.0, "lastfm")
     romaji_item = db.resolve_item(conn, "artist", "name", ROMAJI, title=ROMAJI)
-    db.add_event(conn, "2026-01-02T00:00:00Z", romaji_item, "scrobble", 0.15, "lastfm")
+    db.add_event(conn, "2026-01-02T00:00:00Z", romaji_item, "scrobble", 1.0, "lastfm")
     api = mock_api(monkeypatch, [(f"/artist/{MBID}", _mb_artist(MBID, KANA, [ROMAJI]))])
 
     stats = run(conn, make_cfg(tmp_path), fetch=True)
@@ -248,7 +334,7 @@ def test_fetch_stores_aliases_then_merges_and_never_refetches(conn, tmp_path, mo
 
 def test_fetch_empty_alias_list_still_marks_fetched(conn, tmp_path, monkeypatch):
     kana_item = db.resolve_item(conn, "artist", "mbid", MBID, title=KANA)
-    db.add_event(conn, "2026-01-01T00:00:00Z", kana_item, "scrobble", 0.15, "lastfm")
+    db.add_event(conn, "2026-01-01T00:00:00Z", kana_item, "scrobble", 1.0, "lastfm")
     api = mock_api(monkeypatch, [(f"/artist/{MBID}", {"id": MBID, "name": KANA})])
 
     stats = run(conn, make_cfg(tmp_path), fetch=True)
@@ -276,7 +362,7 @@ def test_fetch_skips_name_only_artists(conn, tmp_path, monkeypatch):
     """Played but mbid-less artists wait for enrich — there is no MB url
     to fetch aliases from yet."""
     iid = db.resolve_item(conn, "artist", "name", ROMAJI, title=ROMAJI)
-    db.add_event(conn, "2026-01-01T00:00:00Z", iid, "scrobble", 0.15, "lastfm")
+    db.add_event(conn, "2026-01-01T00:00:00Z", iid, "scrobble", 1.0, "lastfm")
     api = mock_api(monkeypatch, [])
 
     stats = run(conn, make_cfg(tmp_path), fetch=True)
@@ -289,7 +375,7 @@ def test_fetch_error_is_per_item_and_limit_caps_attempts(conn, tmp_path, monkeyp
     good = db.resolve_item(conn, "artist", "mbid", MBID, title=KANA)
     dead = db.resolve_item(conn, "artist", "mbid", OTHER_MBID, title="gone")
     for iid in (good, dead):
-        db.add_event(conn, "2026-01-01T00:00:00Z", iid, "scrobble", 0.15, "lastfm")
+        db.add_event(conn, "2026-01-01T00:00:00Z", iid, "scrobble", 1.0, "lastfm")
     api = mock_api(monkeypatch, [
         (f"/artist/{MBID}", _mb_artist(MBID, KANA, [ROMAJI])),
         (f"/artist/{OTHER_MBID}", http.ApiError(f"x/{OTHER_MBID}", 404, "gone")),
@@ -353,7 +439,7 @@ def test_attach_name_absorbs_name_only_twin(conn):
     """The healing case stays: a name-only twin (no authoritative id) is
     the same entity by construction and merges into the mbid holder."""
     twin = db.resolve_item(conn, "artist", "name", ROMAJI, title=ROMAJI)
-    db.add_event(conn, "2026-01-01T00:00:00Z", twin, "scrobble", 0.15, "lastfm")
+    db.add_event(conn, "2026-01-01T00:00:00Z", twin, "scrobble", 1.0, "lastfm")
     a = db.resolve_item(conn, "artist", "mbid", MBID, title=KANA)
 
     assert db.attach_identity(conn, a, "name", ROMAJI) == a

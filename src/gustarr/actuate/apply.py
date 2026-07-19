@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
-from .. import db, http, settings
+from .. import db, http, queue, settings
 from ..config import Config
 from . import jellyfin_collections, jellyfin_playlist
 from .arr_client import ArrConfigError, ArrError, LidarrClient, RadarrClient, SonarrClient
@@ -48,11 +49,6 @@ def _week_start() -> str:
     return _iso(start)
 
 
-def _mark(conn: sqlite3.Connection, rec_id: int, status: str, ts: str) -> None:
-    conn.execute(
-        "UPDATE recommendations SET status=?, acted_at=? WHERE id=?", (status, ts, rec_id))
-
-
 def _transient(exc: Exception) -> bool:
     """Transport failures (status None), 5xx/429 and 401/403 are outages
     of the arr, not verdicts on the item — credentials are service-level
@@ -75,18 +71,22 @@ def _bump_attempts(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
 def _record_add(conn: sqlite3.Connection, row: sqlite3.Row, ts: str) -> None:
     """Store writes for one successful arr add, committed immediately:
     the add is irreversible, so the record of it must survive a crash
-    later in the run."""
+    later in the run. force=True: the add already happened, so the table
+    records it even over a verdict that raced in mid-HTTP — the taste
+    event that verdict wrote survives untouched (taste and state are
+    separate ledgers)."""
     if row["status"] == "approved":
         # approve event was already written when the user approved.
-        _mark(conn, row["id"], "added", ts)
+        queue.transition(conn, row["id"], "added", ts, force=True)
     else:
-        # audit trail only: 'auto_add' is not in signals.WEIGHTS, so
-        # gustarr's own adds never feed back into training as praise.
+        # audit trail only: 'auto_add' is not in signals.WEIGHTS, and the
+        # scale is 0 on top, so gustarr's own adds never feed back into
+        # training as praise — not even if the kind ever gains a weight.
         # Attributed to the rec's own profile: budgets are shared, but
         # the record of whose queue an add came from must not be.
         db.add_event(conn, ts, row["item_id"], "auto_add", 0.0, "gustarr",
                      {"rec_id": row["id"]}, profile=row["profile"])
-        _mark(conn, row["id"], "auto_added", ts)
+        queue.transition(conn, row["id"], "auto_added", ts, force=True)
     conn.commit()
 
 
@@ -106,9 +106,8 @@ def run(conn: sqlite3.Connection, cfg: Config, dry_run: bool = False) -> dict[st
             "SELECT COUNT(*) FROM recommendations WHERE status='proposed' AND ts<?",
             (cutoff,)).fetchone()[0]
     else:
-        stats["expired"] = conn.execute(
-            "UPDATE recommendations SET status='expired', acted_at=?"
-            " WHERE status='proposed' AND ts<?", (ts, cutoff)).rowcount
+        stats["expired"] = queue.transition_where(
+            conn, "expired", "proposed", "ts<?", (cutoff,), ts=ts)
 
     _apply_music(conn, cfg, ts, dry_run, stats)
     _apply_video(conn, cfg, ts, dry_run, stats)
@@ -161,31 +160,59 @@ def _apply_music_domain(
     stats[budget_key] = budget
     # Approved rows are actuated in every mode (an explicit approve is
     # consent) and don't consume the weekly budget; proposed rows are
-    # auto-picked only in auto mode, inside the budget. Every profile's
-    # queue competes in one score-ordered pass — the budget is household
-    # property, not a per-person allowance.
+    # auto-picked only in auto mode, inside the budget. The budget is
+    # household property, but it is spent by strict round-robin across
+    # the profiles' own proposed queues so a profile with a confident,
+    # higher-scoring model cannot outbid a cold-start one week after
+    # week.
     auto = settings.get(conn, cfg, "music_mode") == "auto"
     rows = conn.execute(
         "SELECT r.id, r.item_id, r.profile, r.status, r.why, i.title, i.meta"
         " FROM recommendations r JOIN items i ON i.id = r.item_id"
         " WHERE r.domain=? AND r.status IN ('approved','proposed')"
         " ORDER BY r.status='approved' DESC, r.score DESC", (domain,)).fetchall()
+    queues: dict[str, deque[sqlite3.Row]] = {}
+    for row in rows:
+        queues.setdefault(row["profile"], deque()).append(row)
+    # Turn order is config order; profiles no longer configured keep the
+    # rights they always had (approved rows actuate, proposed compete) —
+    # they take their turns after the configured ones, best score first.
+    order = [p for p in cfg.profiles if p in queues] \
+        + [p for p in queues if p not in cfg.profiles]
     picks: list[tuple[sqlite3.Row, str]] = []
     unaddressable: list[sqlite3.Row] = []
-    auto_picked = 0
-    for row in rows:
-        approved = row["status"] == "approved"
-        if not approved and (not auto or auto_picked >= budget):
-            continue
-        mbid = _music_mbid(conn, row)
-        if mbid is None:
-            # an approved rec we cannot address fails loudly instead
-            # of being stranded forever; a proposed one is just skipped.
-            if approved:
+    # PHASE 1: every approved row actuates, all profiles, every mode —
+    # consented and budget-exempt, so an approval must never burn its
+    # profile's round-robin turn. Profile order then score (each queue
+    # is already approved-first, score-sorted).
+    for p in order:
+        q = queues[p]
+        while q and q[0]["status"] == "approved":
+            row = q.popleft()
+            mbid = _music_mbid(conn, row)
+            if mbid is None:
+                # an approved rec we cannot address fails loudly instead
+                # of being stranded forever.
                 unaddressable.append(row)
-            continue
-        picks.append((row, mbid))
-        auto_picked += 0 if approved else 1
+            else:
+                picks.append((row, mbid))
+    # PHASE 2: only proposed rows compete for the weekly budget, one add
+    # per profile per turn; rows yielding no add (no mbid) don't burn
+    # the turn.
+    auto_picked = 0
+    while auto and auto_picked < budget and any(queues[p] for p in order):
+        for p in order:
+            if auto_picked >= budget:
+                break
+            q = queues[p]
+            while q:
+                row = q.popleft()
+                mbid = _music_mbid(conn, row)
+                if mbid is None:
+                    continue  # a proposed rec without an mbid is just skipped
+                picks.append((row, mbid))
+                auto_picked += 1
+                break
     if not picks and not unaddressable:
         return
     if dry_run:
@@ -199,14 +226,14 @@ def _apply_music_domain(
     for row in unaddressable:
         stats["errors"].append(f"{row['title'] or row['item_id']}: no mbid,"
                                " cannot add to lidarr")
-        _mark(conn, row["id"], "failed", ts)
+        queue.transition(conn, row["id"], "failed", ts)
     for row, mbid in picks:
         try:
             add(client, mbid)
         except (http.ApiError, ArrError) as exc:
             stats["errors"].append(f"lidarr add {row['title'] or mbid}: {exc}")
             if row["status"] == "approved" and not _transient(exc):
-                _mark(conn, row["id"], "failed", ts)
+                queue.transition(conn, row["id"], "failed", ts)
             else:
                 _bump_attempts(conn, row)
             continue
@@ -259,7 +286,7 @@ def _apply_video(
         ext = _ext_id(conn, row["item_id"], ns_key)
         if ext is None:
             stats["errors"].append(f"{title}: no {ns_key} id, cannot add to {arr_name}")
-            _mark(conn, row["id"], "failed", ts)
+            queue.transition(conn, row["id"], "failed", ts)
             stats["video_failed"] += 1
             continue
         if arr_name not in clients:
@@ -270,7 +297,7 @@ def _apply_video(
         except (http.ApiError, ArrError) as exc:
             stats["errors"].append(f"{arr_name} add {title}: {exc}")
             if approved and not _transient(exc):
-                _mark(conn, row["id"], "failed", ts)
+                queue.transition(conn, row["id"], "failed", ts)
                 stats["video_failed"] += 1
             else:
                 # arr outage or unactuated proposal: keep the current
@@ -297,9 +324,9 @@ def _expire_overflow(
         if dry_run or surplus == 0:
             expired += surplus
             continue
-        expired += conn.execute(
-            "UPDATE recommendations SET status='expired', acted_at=? WHERE id IN ("
-            " SELECT id FROM recommendations WHERE profile=? AND status='proposed'"
+        expired += queue.transition_where(
+            conn, "expired", "proposed",
+            "id IN (SELECT id FROM recommendations WHERE profile=? AND status='proposed'"
             " AND domain IN ('movie','series') ORDER BY score ASC, id ASC LIMIT ?)",
-            (ts, profile, surplus)).rowcount
+            (profile, surplus), ts=ts)
     stats["would_expire_overflow" if dry_run else "overflow_expired"] = expired

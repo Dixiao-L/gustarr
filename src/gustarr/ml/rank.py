@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 
 import numpy as np
 
-from .. import db, settings
+from .. import db, queue, settings
 from ..candidates import snooze_cutoff
 from ..config import Config
 
@@ -65,13 +65,15 @@ def _unit_rows(x: np.ndarray) -> np.ndarray:
 
 def _pool(conn: sqlite3.Connection, profile: str, domain: str) -> dict[int, dict]:
     """Candidates still worth proposing to this profile: not owned, not
-    already queued for them, not actively snoozed by them, never
-    explicitly rejected by them. The library block stays global (one
-    disk); the verdict blocks are personal — another profile's reject or
-    open rec must not veto this one's proposal."""
+    already queued for them, not failed for them, not actively snoozed
+    by them, never explicitly rejected by them. The library block stays
+    global (one disk); the verdict blocks are personal — another
+    profile's reject or open rec must not veto this one's proposal."""
     # The partial unique index only guards (profile,item_id) over
     # proposed/approved, so the active-snooze block must live in this
-    # query, not in the schema.
+    # query, not in the schema. 'failed' is terminal for automation
+    # (docs: "rank never re-proposes it" — re-proposing would just
+    # re-fail); only a human retry() revives it.
     rows = conn.execute(
         "SELECT c.item_id, c.source, c.external_score, c.seed_item_id"
         " FROM candidates c JOIN items i ON i.id = c.item_id"
@@ -79,7 +81,7 @@ def _pool(conn: sqlite3.Connection, profile: str, domain: str) -> dict[int, dict
         "   AND c.item_id NOT IN (SELECT item_id FROM library)"
         "   AND c.item_id NOT IN (SELECT item_id FROM recommendations"
         "                         WHERE profile = ?"
-        "                           AND (status IN ('proposed','approved')"
+        "                           AND (status IN ('proposed','approved','failed')"
         "                                OR (status='snoozed' AND acted_at >= ?)))"
         "   AND c.item_id NOT IN (SELECT item_id FROM events"
         "                         WHERE profile = ? AND kind='reject')",
@@ -240,16 +242,14 @@ def run(conn: sqlite3.Connection, cfg: Config, top: int = 20) -> dict:
         _rank_profile(conn, cfg, profile, run_id, ts, top, stats)
         # Expiry/unsnooze run inside the profile loop so a profile removed
         # from config keeps its rows frozen instead of silently expiring.
-        stats["expired"] += conn.execute(
-            "UPDATE recommendations SET status='expired', acted_at=?"
-            " WHERE profile=? AND status='proposed' AND ts < ?",
-            (ts, profile, ttl_cutoff)).rowcount
+        stats["expired"] += queue.transition_where(
+            conn, "expired", "proposed", "profile=? AND ts < ?",
+            (profile, ttl_cutoff), ts=ts)
         # A snooze is a timer, not a verdict: once it lapses the rec becomes
         # 'expired', which candidates/rank treat as re-proposable.
-        stats["unsnoozed"] += conn.execute(
-            "UPDATE recommendations SET status='expired', acted_at=?"
-            " WHERE profile=? AND status='snoozed' AND acted_at < ?",
-            (ts, profile, snooze_cutoff())).rowcount
+        stats["unsnoozed"] += queue.transition_where(
+            conn, "expired", "snoozed", "profile=? AND acted_at < ?",
+            (profile, snooze_cutoff()), ts=ts)
     return stats
 
 

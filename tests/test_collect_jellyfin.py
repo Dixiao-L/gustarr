@@ -12,7 +12,6 @@ from gustarr import config as C
 from gustarr import db
 from gustarr import http as ghttp
 from gustarr.collect import jellyfin
-from gustarr.signals import WEIGHTS
 
 BASE = "http://jelly.test"
 MBID = "a74b1b7f-71a5-4011-9441-d0b5e4122711"
@@ -157,17 +156,19 @@ def test_sync_maps_items_identities_and_events(tmp_path):
     assert db.lookup_item(conn, "series", "jellyfin", "s1") == series(conn)
     assert db.lookup_item(conn, "artist", "jellyfin", "a2") == boc(conn)
 
+    # events carry a scale multiplier, never a frozen weight: flags and
+    # single plays store 1, the capped batched listen count is the scale
     ev = {(r["item_id"], r["kind"]): r for r in conn.execute("SELECT * FROM events")}
-    assert ev[(matrix, "favorite")]["weight"] == WEIGHTS["favorite"]
-    assert ev[(matrix, "complete")]["weight"] == WEIGHTS["complete"]
+    assert ev[(matrix, "favorite")]["scale"] == 1.0
+    assert ev[(matrix, "complete")]["scale"] == 1.0
     assert ev[(matrix, "complete")]["ts"] == "2024-05-01T20:00:00Z"
     assert all(r["source"] == "jellyfin" for r in ev.values())
     # a Played series must not yield complete from the library pass (3/5 < 80%)
     assert (series(conn), "complete") not in ev
-    assert ev[(series(conn), "play")]["weight"] == WEIGHTS["play"]
-    assert ev[(radiohead(conn), "scrobble")]["weight"] == pytest.approx(5 * WEIGHTS["scrobble"])
+    assert ev[(series(conn), "play")]["scale"] == 1.0
+    assert ev[(radiohead(conn), "scrobble")]["scale"] == pytest.approx(5)  # capped at 5 of 7
     assert json.loads(ev[(radiohead(conn), "scrobble")]["meta"])["delta"] == 7
-    assert ev[(boc(conn), "scrobble")]["weight"] == pytest.approx(WEIGHTS["scrobble"])
+    assert ev[(boc(conn), "scrobble")]["scale"] == pytest.approx(1)
 
     assert stats["items"] == 5 and stats["skipped"] == 1
     assert stats["favorites"] == 1 and stats["completes"] == 1
@@ -218,9 +219,9 @@ def test_progress_deltas_emit_incrementally(tmp_path, monkeypatch):
     assert stats["series_plays"] == 1 and stats["series_completes"] == 1
     assert stats["scrobbles"] == 1
     row = conn.execute(
-        "SELECT weight, meta FROM events WHERE kind='scrobble' AND ts='2024-06-15T10:00:00Z'"
+        "SELECT scale, meta FROM events WHERE kind='scrobble' AND ts='2024-06-15T10:00:00Z'"
     ).fetchone()
-    assert row["weight"] == pytest.approx(2 * WEIGHTS["scrobble"])
+    assert row["scale"] == pytest.approx(2)
     assert json.loads(row["meta"])["delta"] == 2
     complete = conn.execute(
         "SELECT meta FROM events WHERE kind='complete' AND item_id=?",
@@ -250,10 +251,10 @@ def test_same_second_tracks_by_one_artist_both_scrobble(tmp_path):
     stats = jellyfin.sync(conn, make_cfg(tmp_path), transport=make_transport(state))
     assert stats["scrobbles"] == 2
     rows = conn.execute(
-        "SELECT dedup, weight FROM events WHERE item_id=? AND kind='scrobble'",
+        "SELECT dedup, scale FROM events WHERE item_id=? AND kind='scrobble'",
         (radiohead(conn),)).fetchall()
     assert {r["dedup"] for r in rows} == {"t1", "t3"}
-    assert sum(r["weight"] for r in rows) == pytest.approx(2 * WEIGHTS["scrobble"])
+    assert sum(r["scale"] for r in rows) == pytest.approx(2)
     # both cursors advanced, so the re-sync stays a noop
     stats2 = jellyfin.sync(conn, make_cfg(tmp_path), transport=make_transport(state))
     assert stats2["scrobbles"] == 0
@@ -278,8 +279,8 @@ def test_cursor_holds_when_duplicate_key_blocks_scrobble(tmp_path):
     stats = jellyfin.sync(conn, cfg, transport=make_transport(state))
     assert stats["scrobbles"] == 1
     row = conn.execute(
-        "SELECT weight, meta FROM events WHERE ts='2024-06-20T10:00:00Z'").fetchone()
-    assert row["weight"] == pytest.approx(2 * WEIGHTS["scrobble"])
+        "SELECT scale, meta FROM events WHERE ts='2024-06-20T10:00:00Z'").fetchone()
+    assert row["scale"] == pytest.approx(2)
     assert json.loads(row["meta"])["delta"] == 2
     assert db.pget_state(conn, "default", "jellyfin:track_plays:t1") == "9"
 
@@ -575,10 +576,8 @@ def test_two_profiles_plays_land_in_own_profiles(tmp_path):
     assert ("tab", matrix, "favorite") in ev
     assert ("guest", matrix, "favorite") not in ev
     # each profile's listens stay its own
-    assert ev[("tab", radiohead(conn), "scrobble")]["weight"] \
-        == pytest.approx(2 * WEIGHTS["scrobble"])
-    assert ev[("guest", boc(conn), "scrobble")]["weight"] \
-        == pytest.approx(3 * WEIGHTS["scrobble"])
+    assert ev[("tab", radiohead(conn), "scrobble")]["scale"] == pytest.approx(2)
+    assert ev[("guest", boc(conn), "scrobble")]["scale"] == pytest.approx(3)
     assert ("guest", radiohead(conn), "scrobble") not in ev
     assert ("tab", boc(conn), "scrobble") not in ev
 

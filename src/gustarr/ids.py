@@ -49,3 +49,18 @@ def normalize_key(s: str) -> str:
     parts = [" ".join(unicodedata.normalize("NFKC", part).casefold().split())
              for part in s.split(SEP)]
     return SEP.join(parts) if any(parts) else ""
+
+
+def spaceless(s: str) -> str:
+    """normalize_key with every space removed: the LOOKUP fold behind
+    alias twin-hunting. Scrobblers hand over spellings that drop the
+    spaces MusicBrainz's alias carries ("KinokoTeikoku" for "Kinoko
+    Teikoku"); once whitespace is folded out the two are the same exact
+    string — a deterministic fold, never a fuzzy match. Never a storage
+    key: identity rows stay normalize_key'd (spaced spellings keep their
+    own rows), so this fold only decides where a hunt LOOKS, never what
+    is written. After normalize_key the only whitespace left is single
+    ASCII spaces, so the replace covers every variant the fold saw; the
+    \\x1f part boundary survives untouched, keeping multipart track keys
+    unfusable even though the hunt itself is artist-only."""
+    return normalize_key(s).replace(" ", "")

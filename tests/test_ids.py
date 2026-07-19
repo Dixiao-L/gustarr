@@ -104,6 +104,49 @@ def test_all_empty_parts_normalize_to_empty():
     assert ids.normalize_key(f"  {ids.SEP} ") == ""
 
 
+# ── spaceless ────────────────────────────────────────────────────────
+
+
+def test_spaceless_folds_the_scrobble_spelling_onto_the_alias():
+    # the lookup fold behind alias twin-hunting: a scrobbler that drops
+    # the spaces MB's alias carries lands on the same exact string
+    assert ids.spaceless("Kinoko Teikoku") == "kinokoteikoku"
+    assert ids.spaceless("KinokoTeikoku") == "kinokoteikoku"
+
+
+def test_spaceless_composes_with_normalize_key():
+    # spaceless is normalize_key-then-drop-spaces, so width/case variants
+    # fold before the spaces go — never a second normalization policy
+    assert ids.spaceless("ＫｉｎｏｋｏＴｅｉｋｏｋｕ") == "kinokoteikoku"
+    for s in ("Kinoko Teikoku", "ＹＯＡＳＯＢＩ　×\tずとまよ", "King  Gnu"):
+        assert ids.spaceless(s) == ids.normalize_key(s).replace(" ", "")
+
+
+def test_spaceless_ideographic_space_collides_with_unspaced_cjk():
+    # CJK sources pad with the ideographic space; the padded and
+    # unpadded spellings must meet under the fold
+    assert ids.spaceless("きのこ　帝国") == ids.spaceless("きのこ帝国")
+    assert ids.spaceless("きのこ　帝国") == "きのこ帝国"
+
+
+def test_spaceless_multi_space_runs_fold_out():
+    assert ids.spaceless("King \t Gnu") == "kinggnu"
+    assert ids.spaceless("King  Gnu") == ids.spaceless("KingGnu")
+
+
+def test_spaceless_stays_exact_never_fuzzy():
+    # a whitespace fold, nothing more: different scripts (and genuinely
+    # different names) stay distinct
+    assert ids.spaceless("ヨルシカ") != ids.spaceless("Yorushika")
+    assert ids.spaceless("Kinoko Teikoku") != ids.spaceless("Kinoko Teikou")
+
+
+def test_spaceless_blank_input_folds_to_empty():
+    # like normalize_key, emptiness is reported, not raised — callers
+    # gate on normalize_key before hunting
+    assert ids.spaceless("  \t　") == ""
+
+
 # ── NS_PRIORITY / DOMAINS vocabulary ─────────────────────────────────
 
 

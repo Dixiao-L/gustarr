@@ -1,9 +1,9 @@
 """Regression tests for the store migrations (gustarr.db).
 
-v1/v2 stores are built by hand with raw SQL in their historical shapes —
-the current write path can no longer produce them, which is the point —
-then opened through db.connect(), the only migration entry. Everything
-runs offline against tmp_path databases.
+v1/v2/v3 stores are built by hand with raw SQL in their historical
+shapes — the current write path can no longer produce them, which is the
+point — then opened through db.connect(), the only migration entry.
+Everything runs offline against tmp_path databases.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import sqlite3
 import pytest
 
 from gustarr import db
+from gustarr.signals import WEIGHTS
 
 MBID = "53f7a13b-0f75-4b31-9c30-2ed40de6dc35"
 OTHER_MBID = "b0b2c1ff-1111-4222-8333-444455556666"
@@ -202,6 +203,48 @@ def v2_event(conn, item_id, ts, kind="scrobble", weight=1.0, source="lastfm", de
         (ts, item_id, kind, weight, source, dedup))
 
 
+# The v3 events shape: an absolute weight frozen at write time, where v4
+# stores a scale multiplier priced against signals.WEIGHTS at training.
+V3_EVENTS_SQL = """
+DROP TABLE events;
+CREATE TABLE events (
+  id      INTEGER PRIMARY KEY,
+  profile TEXT NOT NULL DEFAULT 'default',
+  ts      TEXT NOT NULL,
+  item_id INTEGER NOT NULL REFERENCES items(id),
+  kind    TEXT NOT NULL,
+  weight  REAL NOT NULL,
+  source  TEXT NOT NULL,
+  dedup   TEXT NOT NULL DEFAULT '',
+  meta    TEXT NOT NULL DEFAULT '{}',
+  UNIQUE(profile, ts, item_id, kind, source, dedup)
+);
+CREATE INDEX idx_events_item ON events(profile, item_id);
+"""
+
+
+def v3_store(db_path, events):
+    """A genuine v3 store holding one artist with the given (ts, kind,
+    weight) events. Every table around events is identical in v3, so the
+    items are minted through the live write path and only the events
+    table is devolved by hand — the v4 write path can no longer produce
+    it, which is the point. Returns the item id."""
+    conn = db.connect(db_path)
+    item = db.resolve_item(conn, "artist", "mbid", MBID, title="Yorushika")
+    conn.commit()
+    conn.close()
+    raw = sqlite3.connect(db_path)
+    raw.executescript(V3_EVENTS_SQL)
+    for ts, kind, weight in events:
+        raw.execute(
+            "INSERT INTO events (profile, ts, item_id, kind, weight, source)"
+            " VALUES ('default',?,?,?,?,'jellyfin')", (ts, item, kind, weight))
+    raw.execute("UPDATE state SET value='3' WHERE key='schema_version'")
+    raw.commit()
+    raw.close()
+    return item
+
+
 def _tables(conn):
     return {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
 
@@ -255,7 +298,7 @@ def test_failed_migration_rolls_back_to_v2_and_retries(db_path, monkeypatch):
     assert item is not None
     rows = conn.execute("SELECT item_id, kind FROM events ORDER BY ts").fetchall()
     assert [(r["item_id"], r["kind"]) for r in rows] == [(item, "scrobble"), (item, "loved")]
-    assert db.get_state(conn, "schema_version") == "3"
+    assert db.get_state(conn, "schema_version") == "4"
     assert not any(t.endswith("_v2") for t in _tables(conn))
     conn.close()
 
@@ -638,9 +681,9 @@ def test_cursor_reachable_only_through_alias_carries_onto_jf_key(db_path):
 
 def test_v1_store_migrates_along_the_full_chain(db_path):
     """A pre-profile store (no profile columns, no events.dedup, unprefixed
-    state keys) upgrades v1→v2→v3 in one connect(): events gain
-    profile/dedup and integer item ids, cursors get the profile prefix and
-    then the v3 rewrites, models drop."""
+    state keys) upgrades v1→v2→v3→v4 in one connect(): events gain
+    profile/dedup, integer item ids and the weight→scale conversion,
+    cursors get the profile prefix and then the v3 rewrites, models drop."""
     artist, series = f"artist:mbid:{MBID}", "series:tvdb:99"
     raw = _open_raw(db_path, V1_SCHEMA)
     raw.execute(
@@ -663,11 +706,14 @@ def test_v1_store_migrates_along_the_full_chain(db_path):
     raw.close()
 
     conn = db.connect(db_path)
-    assert db.get_state(conn, "schema_version") == "3"
+    assert db.get_state(conn, "schema_version") == "4"
     a = db.lookup_item(conn, "artist", "mbid", MBID)
     assert db.lookup_item(conn, "artist", "name", "Yorushika") == a
-    ev = conn.execute("SELECT profile, item_id, dedup FROM events").fetchall()
+    ev = conn.execute("SELECT profile, item_id, dedup, scale FROM events").fetchall()
     assert [(r["profile"], r["item_id"], r["dedup"]) for r in ev] == [("default", a, "")]
+    # the v1 weight of 1.0 froze WEIGHTS.scrobble * m; the chain recovers m
+    assert ev[0]["scale"] == pytest.approx(1.0 / WEIGHTS["scrobble"])
+    assert "weight" not in {r["name"] for r in conn.execute("PRAGMA table_info(events)")}
     assert db.get_state(conn, "p:default:lastfm:cursor") == "123"
     assert db.get_state(conn, "lastfm:cursor") is None
     assert conn.execute(
@@ -675,3 +721,91 @@ def test_v1_store_migrates_along_the_full_chain(db_path):
     assert db.get_state(conn, "p:default:jellyfin:series_played:jf99") == "7"
     assert db.get_state(conn, "arr:known:radarr") == "{}"
     conn.close()
+
+
+# ── v3 → v4: frozen weights become training-time scales ──────────────
+
+
+def test_v4_backfills_scales_and_drops_weight(db_path):
+    """v3 froze WEIGHTS[kind] * m into events.weight; v4 recovers m: a 3x
+    batched jellyfin scrobble becomes scale 3, a full-strength reject
+    becomes scale 1 (the negative base divides out — scales stay
+    positive), and a kind the current WEIGHTS no longer prices falls back
+    to the neutral 1. The weight column itself is gone."""
+    item = v3_store(db_path, [
+        (T0, "scrobble", WEIGHTS["scrobble"] * 3),
+        (T1, "reject", -1.0),
+        (T2, "banana", 2.5),  # a kind no WEIGHTS entry can reprice
+    ])
+
+    conn = db.connect(db_path)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(events)")}
+    assert "scale" in cols and "weight" not in cols
+    scales = {r["kind"]: r["scale"] for r in conn.execute(
+        "SELECT kind, scale FROM events WHERE item_id=?", (item,))}
+    assert scales["scrobble"] == pytest.approx(3)
+    assert scales["reject"] == pytest.approx(1)
+    assert scales["banana"] == 1
+    assert db.get_state(conn, "schema_version") == "4"
+    conn.close()
+
+
+def test_reopening_a_v4_migrated_store_changes_nothing(db_path):
+    """The v4 migration must fire exactly once: a second connect() sees no
+    weight column and leaves every table untouched."""
+    v3_store(db_path, [(T0, "scrobble", WEIGHTS["scrobble"] * 3), (T1, "reject", -1.0)])
+
+    conn = db.connect(db_path)
+    before = _dump(conn)
+    conn.close()
+
+    conn = db.connect(db_path)
+    assert _dump(conn) == before
+    conn.close()
+
+
+def test_failed_v4_migration_rolls_back_to_v3_and_retries(db_path, monkeypatch):
+    """A crash inside the v3→v4 migration (after scale was added, before
+    weight was dropped) must leave the v3 store exactly as it was —
+    transactional DDL, no leftover scale column the detection could
+    misread — and the next open must complete the conversion."""
+    v3_store(db_path, [(T0, "scrobble", WEIGHTS["scrobble"] * 3)])
+
+    class Boom(Exception):
+        pass
+
+    def explode(kind_col, weight_col):
+        raise Boom("crash between the ALTERs")
+
+    with monkeypatch.context() as m:
+        m.setattr(db, "_weight_to_scale_sql", explode)
+        with pytest.raises(Boom):
+            db.connect(db_path)
+
+    raw = sqlite3.connect(db_path)
+    raw.row_factory = sqlite3.Row
+    cols = {r["name"] for r in raw.execute("PRAGMA table_info(events)")}
+    assert "weight" in cols and "scale" not in cols  # still v3, not half-done
+    assert raw.execute("SELECT weight FROM events").fetchone()["weight"] \
+        == pytest.approx(WEIGHTS["scrobble"] * 3)
+    raw.close()
+
+    conn = db.connect(db_path)  # unpatched retry completes the migration
+    row = conn.execute("SELECT kind, scale FROM events").fetchone()
+    assert row["kind"] == "scrobble" and row["scale"] == pytest.approx(3)
+    assert db.get_state(conn, "schema_version") == "4"
+    conn.close()
+
+
+def test_half_migrated_v4_store_refuses_with_backup_hint(db_path):
+    """events carrying BOTH weight and scale can only mean an engine
+    without transactional DDL crashed between the v4 ALTERs — undetectable
+    as either version, so connect must refuse loudly, not guess."""
+    v3_store(db_path, [(T0, "scrobble", WEIGHTS["scrobble"])])
+    raw = sqlite3.connect(db_path)
+    raw.execute("ALTER TABLE events ADD COLUMN scale REAL NOT NULL DEFAULT 1")
+    raw.commit()
+    raw.close()
+
+    with pytest.raises(RuntimeError, match="backup"):
+        db.connect(db_path)

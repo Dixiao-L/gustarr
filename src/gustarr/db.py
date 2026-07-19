@@ -53,8 +53,10 @@ CREATE TABLE IF NOT EXISTS identities (
 );
 CREATE INDEX IF NOT EXISTS idx_identities_item ON identities(item_id);
 
--- Every taste signal, append-only, owned by a profile. weight is the
--- label contribution (see signals.py) — one row per
+-- Every taste signal, append-only, owned by a profile. scale multiplies
+-- signals.WEIGHTS[kind] at training time (schema v4) — the label
+-- contribution is computed at aggregation, so retuning WEIGHTS reprices
+-- all history on the next train. One row per
 -- (profile,ts,item,kind,source,dedup) so re-syncs are idempotent.
 -- dedup disambiguates genuinely distinct same-second events — collectors
 -- pass a stable discriminator like the originating track id.
@@ -64,7 +66,7 @@ CREATE TABLE IF NOT EXISTS events (
   ts      TEXT NOT NULL,                 -- ISO8601 UTC
   item_id INTEGER NOT NULL REFERENCES items(id),
   kind    TEXT NOT NULL,                 -- play|complete|scrobble|loved|favorite|library_add|approve|reject|abandon
-  weight  REAL NOT NULL,
+  scale   REAL NOT NULL DEFAULT 1,
   source  TEXT NOT NULL,                 -- jellyfin|lastfm|listenbrainz|arr|user
   dedup   TEXT NOT NULL DEFAULT '',
   meta    TEXT NOT NULL DEFAULT '{}',
@@ -131,7 +133,7 @@ CREATE TABLE IF NOT EXISTS state (
 );
 """
 
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "4"
 
 # state keys that belong to a profile (cursors, taste models); everything
 # else in state — settings, arr inventory, API caches — is operator/global.
@@ -149,6 +151,7 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     _migrate_v2(conn)
     _migrate_v3(conn)
+    _migrate_v4(conn)
     conn.execute("PRAGMA foreign_keys=ON")
     _exec_schema(conn)
     conn.execute(
@@ -425,10 +428,13 @@ def _migrate_v3(conn: sqlite3.Connection) -> None:
         # the originating track id) follow the items to their new ints —
         # otherwise the first post-upgrade sync re-emits that history
         # under the new dedup format and every loved row doubles.
+        # v2 froze absolute weights; the copy lands straight on the v4
+        # scale shape so the chain never materializes a weight column.
         conn.execute(
-            "INSERT OR IGNORE INTO events (id, profile, ts, item_id, kind, weight,"
+            "INSERT OR IGNORE INTO events (id, profile, ts, item_id, kind, scale,"
             " source, dedup, meta)"
-            " SELECT e.id, e.profile, e.ts, m.new, e.kind, e.weight, e.source,"
+            " SELECT e.id, e.profile, e.ts, m.new, e.kind, "
+            + _weight_to_scale_sql("e.kind", "e.weight") + ", e.source,"
             "        COALESCE(CAST(d.new AS TEXT), e.dedup), e.meta"
             " FROM events_v2 e JOIN idmap m ON m.old = e.item_id"
             " LEFT JOIN idmap d ON d.old = e.dedup")
@@ -502,6 +508,63 @@ def _migrate_v3(conn: sqlite3.Connection) -> None:
             conn.execute(f"DROP TABLE {t}")
 
     _atomic_migration(conn, lambda: _needs_v3(conn), work)
+
+
+def _weight_to_scale_sql(kind_col: str, weight_col: str) -> str:
+    """CASE expression converting a stored absolute weight into the v4
+    scale multiplier: weight / WEIGHTS[kind] for kinds the table prices
+    with a nonzero base (reject's negative base divides out to a positive
+    scale). A stored weight of exactly 0 means "deliberately inert"
+    (auto_add's audit rows) and 0 is its exact scale under ANY base, so
+    it converts to 0 — the never-train-as-praise promise must survive
+    the kind gaining a WEIGHTS entry later. Only nonzero weights on
+    kinds the table no longer prices fall back to the neutral 1. Shared
+    by the v2→v3 event copy (which lands straight on the v4 shape) and
+    the v3→v4 in-place backfill."""
+    # imported at call time, not module load: db sits at the bottom of the
+    # import graph and must never gain a load-time dependency on label
+    # policy (which would cycle the moment signals needs the store)
+    from .signals import WEIGHTS
+    cases = " ".join(f"WHEN '{kind}' THEN {weight_col} / {float(base)!r}"
+                     for kind, base in WEIGHTS.items() if base)
+    return (f"CASE WHEN {weight_col} = 0 THEN 0"
+            f" ELSE CASE {kind_col} {cases} ELSE 1 END END")
+
+
+def _needs_v4(conn: sqlite3.Connection) -> bool:
+    tables = {r["name"] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    if "events" not in tables:
+        return False  # fresh database: SCHEMA creates v4 directly
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(events)")}
+    if "weight" in cols and "scale" in cols:
+        # both columns can only coexist mid-migration: an engine without
+        # transactional DDL crashed between the ALTERs. Undetectable as
+        # either version — refuse loudly rather than fail cryptically later.
+        raise RuntimeError(
+            "half-migrated v3→v4 store (events carries both weight and scale);"
+            " restore the store from a backup before upgrading")
+    return "weight" in cols
+
+
+def _migrate_v4(conn: sqlite3.Connection) -> None:
+    """v3 → v4: events.weight (a frozen absolute label contribution)
+    becomes events.scale (a multiplier on signals.WEIGHTS[kind]).
+    Training recomputes contribution = WEIGHTS[kind] * scale at
+    aggregation time, so retuning WEIGHTS reprices all history at the
+    next train instead of only affecting events written afterwards."""
+    if not _needs_v4(conn):
+        return
+
+    def work() -> None:
+        conn.execute("ALTER TABLE events ADD COLUMN scale REAL NOT NULL DEFAULT 1")
+        conn.execute(
+            f"UPDATE events SET scale = {_weight_to_scale_sql('kind', 'weight')}")
+        # weight sits in no index, so DROP COLUMN (SQLite >= 3.35, bundled
+        # with every supported Python) needs no table rebuild.
+        conn.execute("ALTER TABLE events DROP COLUMN weight")
+
+    _atomic_migration(conn, lambda: _needs_v4(conn), work)
 
 
 # ── identity resolution: THE write path ─────────────────────────────
@@ -684,17 +747,21 @@ def add_event(
     ts: str,
     item_id: int,
     kind: str,
-    weight: float,
+    scale: float,
     source: str,
     meta: dict[str, Any] | None = None,
     dedup: str = "",
     profile: str = "default",
 ) -> bool:
-    """Returns False when the event already existed (idempotent re-sync)."""
+    """Record what happened; how much it counts is training-time policy.
+    scale multiplies signals.WEIGHTS[kind] at aggregation (1 for a plain
+    occurrence; collectors batch intensity into it, e.g. a capped listen
+    count). Returns False when the event already existed (idempotent
+    re-sync)."""
     cur = conn.execute(
-        "INSERT OR IGNORE INTO events (profile, ts, item_id, kind, weight, source, dedup, meta)"
+        "INSERT OR IGNORE INTO events (profile, ts, item_id, kind, scale, source, dedup, meta)"
         " VALUES (?,?,?,?,?,?,?,?)",
-        (profile, ts, item_id, kind, weight, source, dedup, json.dumps(meta or {})),
+        (profile, ts, item_id, kind, scale, source, dedup, json.dumps(meta or {})),
     )
     return cur.rowcount > 0
 

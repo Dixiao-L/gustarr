@@ -8,6 +8,7 @@ uniform and testable — tests inject an httpx.MockTransport via the
 
 from __future__ import annotations
 
+import threading
 import time
 from typing import Any
 
@@ -28,6 +29,10 @@ HOST_DELAYS = {
 RETRY_AFTER_CAP = 60.0
 
 _last_call: dict[str, float] = {}
+# Serializes the read-sleep-write below: without it two web threads (the
+# identify proxy runs per-request) read the same last-call time and hit
+# MusicBrainz 0s apart.
+_polite_lock = threading.Lock()
 
 
 class ApiError(Exception):
@@ -40,10 +45,14 @@ def _polite_wait(host: str) -> None:
     delay = HOST_DELAYS.get(host)
     if delay is None:
         return
-    elapsed = time.monotonic() - _last_call.get(host, 0.0)
-    if elapsed < delay:
-        time.sleep(delay - elapsed)
-    _last_call[host] = time.monotonic()
+    # Sleeping INSIDE the lock is deliberate and correct: the wait IS the
+    # per-host spacing, so a concurrent caller must queue behind it — a
+    # sleep outside the lock would let both fire the moment it ends.
+    with _polite_lock:
+        elapsed = time.monotonic() - _last_call.get(host, 0.0)
+        if elapsed < delay:
+            time.sleep(delay - elapsed)
+        _last_call[host] = time.monotonic()
 
 
 def request_json(

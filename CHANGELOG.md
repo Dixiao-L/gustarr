@@ -4,6 +4,48 @@ All notable changes to Gustarr are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/).
 
+## [0.5.0] - 2026-07-20
+
+The release that empties the design-debt list.
+
+### Added
+- **`gustarr identify`** (CLI + web "Identities" panel): human-asserted
+  MusicBrainz ids for artists that exist only as a spelling. Bare, it
+  lists name-only artists ranked by the listening history they hold;
+  with a name it searches MusicBrainz; with `--mbid` it asserts the
+  match — the split history merges under the existing identity rules
+  and the artist re-enriches on the next run. This is the one identity
+  operation Gustarr deliberately refuses to guess at, made ergonomic
+  for the person who actually knows.
+- **Retry for failed recommendations** (CLI `gustarr retry`, web button
+  on failed history items): `failed` stays terminal for automation —
+  re-proposing would just re-fail — but Lidarr metadata gaps are often
+  transient, so a human retry flips the item back to `approved` for the
+  next apply.
+
+### Changed
+- **Recommendation status has one owner**: every transition — user
+  verdicts, actuation results, human retries, and the bulk
+  TTL/overflow/snooze-lapse expiries — goes through a single
+  legal-transition table in `queue.py`. Nothing else writes
+  `recommendations.status`, and a source-scan test keeps it that way.
+- **Taste weights are policy, not data** (store schema v4, migrates
+  automatically): events now record *what happened and how much*
+  (`kind` + `scale`); the label `WEIGHTS[kind] × scale` is computed at
+  training time. Editing a weight in `signals.py` re-labels your entire
+  history at the next `train`, instead of only affecting events written
+  afterwards.
+- **Weekly budgets are spent round-robin across profiles**: each
+  profile's queue keeps its own approved-first/score order, but the
+  shared artist and album budgets alternate between profiles instead of
+  one score-ordered pass — a household member with a confident,
+  well-trained model can no longer outbid someone whose model is still
+  cold-starting. Single-profile setups are unaffected.
+- Alias matching folds whitespace before comparing: MB's alias
+  "Kinoko Teikoku" now absorbs a scrobble-spelling "KinokoTeikoku"
+  twin. Still an exact match after a deterministic fold — never fuzzy —
+  and the cross-entity refusal rule is untouched.
+
 ## [0.4.1] - 2026-07-19
 
 ### Added
