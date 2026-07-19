@@ -809,3 +809,30 @@ def test_half_migrated_v4_store_refuses_with_backup_hint(db_path):
 
     with pytest.raises(RuntimeError, match="backup"):
         db.connect(db_path)
+
+
+def test_reconnect_to_current_store_writes_nothing(tmp_path):
+    """connect() runs on every web request; against an already-current
+    store it must be a pure reader — an unconditional schema stamp made
+    every read endpoint queue behind the nightly's stage transactions
+    ('database is locked' 500s in production)."""
+    path = tmp_path / "t.db"
+    db.connect(path).close()  # create + stamp once
+
+    class TraceConn(sqlite3.Connection):
+        writes: list[str] = []
+
+        def execute(self, sql, *a, **kw):
+            if sql.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE", "REPLACE")):
+                TraceConn.writes.append(sql)
+            return super().execute(sql, *a, **kw)
+
+    orig_connect = sqlite3.connect
+    try:
+        sqlite3.connect = lambda *a, **kw: orig_connect(
+            *a, **{**kw, "factory": TraceConn})
+        conn = db.connect(path)
+        conn.close()
+    finally:
+        sqlite3.connect = orig_connect
+    assert TraceConn.writes == []
