@@ -4,6 +4,16 @@ All notable changes to Gustarr are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/).
 
+## [0.5.1] - 2026-07-20
+
+### Fixed
+- Read endpoints no longer queue behind the pipeline's write
+  transactions: `connect()` stamped the schema version on every call,
+  which made every web request a writer — during a long enrich stage
+  that surfaced as intermittent "database is locked" 500s on
+  `/api/stats` (and telegraf gaps). The stamp now only writes when the
+  version actually moved; request connects are pure readers.
+
 ## [0.5.0] - 2026-07-20
 
 The release that empties the design-debt list.

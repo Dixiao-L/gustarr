@@ -154,10 +154,18 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     _migrate_v4(conn)
     conn.execute("PRAGMA foreign_keys=ON")
     _exec_schema(conn)
-    conn.execute(
-        "INSERT INTO state (key, value) VALUES ('schema_version', ?)"
-        " ON CONFLICT(key) DO UPDATE SET value=excluded.value", (SCHEMA_VERSION,))
-    conn.commit()
+    # Stamp only when the version actually moved: connect() runs on every
+    # web request, and an unconditional upsert made every read endpoint a
+    # WRITER — queued behind whatever stage transaction the nightly held,
+    # surfacing as 'database is locked' 500s during long enrich runs. A
+    # read-first check keeps request connects out of the writer queue.
+    row = conn.execute(
+        "SELECT value FROM state WHERE key='schema_version'").fetchone()
+    if row is None or row["value"] != SCHEMA_VERSION:
+        conn.execute(
+            "INSERT INTO state (key, value) VALUES ('schema_version', ?)"
+            " ON CONFLICT(key) DO UPDATE SET value=excluded.value", (SCHEMA_VERSION,))
+        conn.commit()
     return conn
 
 
