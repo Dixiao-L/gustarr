@@ -39,5 +39,11 @@ packages = ["src/gustarr"]
 line-length = 100
 target-version = "py312"
 
+[tool.ruff.lint]
+# Pinned to ruff's classic defaults: 0.16 broadened the default rule set
+# (DTZ, TRY, ...) and a linter bump must not silently move the CI gate.
+# Adopting more rules is a deliberate decision, not a dependency side effect.
+select = ["E4", "E7", "E9", "F"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -838,12 +838,14 @@ def test_rank_respects_video_queue_cap(tmp_path):
         iid = movie(conn, f"c{i}", f"C{i}")
         put_vec(conn, iid, axis(i), model)
         add_candidate(conn, iid)
-    # one open movie proposal occupies the whole video budget
+    # one open movie proposal occupies the whole video budget; ts must be
+    # recent — a hardcoded date ages past proposal_ttl_days and rank's
+    # expiry pass frees the cap, silently gutting this test (it did)
     open1 = movie(conn, "open1", "Open")
     conn.execute(
         "INSERT INTO recommendations (run_id, ts, domain, item_id, score, why, status)"
-        " VALUES ('r0', '2026-07-10T00:00:00Z', 'movie', ?, 0.5, '{}', 'proposed')",
-        (open1,))
+        " VALUES ('r0', ?, 'movie', ?, 0.5, '{}', 'proposed')",
+        (db.now(), open1))
     db.pset_state(conn, "default", "centroid:movie", json.dumps({
         "pos": b64(axis(0)), "neg": None, "dim": DIM, "embed_model": model,
         "exemplars": []}))
