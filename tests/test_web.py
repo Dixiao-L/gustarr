@@ -276,8 +276,8 @@ def test_settings_get_defaults(web):
     assert resp.status_code == 200
     body = resp.json()
     assert set(body) == {"paused", "music_mode", "music_max_artists_per_week",
-                         "music_max_albums_per_week", "video_queue_max_pending",
-                         "exploration_frac"}
+                         "music_max_albums_per_week", "weekly_exploration_albums",
+                         "video_queue_max_pending", "exploration_frac"}
     for entry in body.values():
         assert set(entry) == {"value", "overridden", "default"}
         assert entry["overridden"] is False
@@ -286,6 +286,7 @@ def test_settings_get_defaults(web):
     assert body["music_mode"]["value"] == "auto"
     assert body["music_max_artists_per_week"]["value"] == 3
     assert body["music_max_albums_per_week"]["value"] == 10
+    assert body["weekly_exploration_albums"]["value"] == 2
     assert body["video_queue_max_pending"]["value"] == 20
     assert body["exploration_frac"]["value"] == pytest.approx(0.15)
 

@@ -19,7 +19,7 @@ from typing import Any, Callable
 
 from .. import db, http, queue, settings
 from ..config import Config
-from . import jellyfin_collections, jellyfin_playlist
+from . import exploration, jellyfin_collections, jellyfin_playlist
 from .arr_client import ArrConfigError, ArrError, LidarrClient, RadarrClient, SonarrClient
 
 
@@ -122,6 +122,12 @@ def run(conn: sqlite3.Connection, cfg: Config, dry_run: bool = False) -> dict[st
         stats["jellyfin"] = jellyfin_collections.sync_collections(conn, cfg, dry_run=dry_run)
     except Exception as exc:  # collections are cosmetic — never fail the run
         stats["jellyfin_error"] = str(exc)
+    try:
+        # before the playlist sync so a week's first buys are already on
+        # their way to Lidarr when the playlist mirrors the same week
+        stats["weekly_exploration"] = exploration.run(conn, cfg, dry_run=dry_run)
+    except Exception as exc:  # bonus acquisition — never fails the run
+        stats["weekly_exploration_error"] = str(exc)
     try:
         stats["jellyfin_playlist"] = jellyfin_playlist.sync_playlists(
             conn, cfg, dry_run=dry_run)

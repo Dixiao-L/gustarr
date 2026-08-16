@@ -256,6 +256,7 @@ resolved from the environment at load time, so the file is safe to commit.
 | `[autonomy]` | `video_mode` | `"queue"` | `auto` or `queue` |
 | `[autonomy]` | `music_max_artists_per_week` | `3` | auto-add budget |
 | `[autonomy]` | `music_max_albums_per_week` | `10` | weekly auto-add budget for album recs |
+| `[autonomy]` | `weekly_exploration_albums` | `2` | Weekly Exploration albums bought per week; `0` disables |
 | `[autonomy]` | `video_queue_max_pending` | `20` | queue cap (and auto-mode per-run cap) |
 | `[autonomy]` | `proposal_ttl_days` | `30` | stale proposals expire |
 | `[model]` | `embed_model` | `"BAAI/bge-m3"` | any sentence-transformers model |
@@ -324,7 +325,11 @@ identity header — is your reverse proxy's job.
 
 **What does ListenBrainz add?** Optional, and free: its open collaborative
 filtering feeds the music candidate pool (raw CF recs plus your "Weekly
-Exploration" playlist), which carries the music side through cold start. Reads
+Exploration" playlist), which carries the music side through cold start.
+Because the exploration playlist is by definition music you don't own yet,
+Gustarr also buys a few of its albums through Lidarr each week
+(`autonomy.weekly_exploration_albums`), so the mirrored Jellyfin playlist
+fills with playable tracks as the downloads land. Reads
 are anonymous — a token only lifts rate limits.
 
 **What does the web UI talk to besides Gustarr?** Your browser loads

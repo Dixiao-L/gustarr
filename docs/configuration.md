@@ -43,6 +43,8 @@ Only these keys are runtime-overridable (`settings.RUNTIME_KEYS`):
 | `paused` | bool | `false` (no TOML equivalent — stops `apply` entirely) |
 | `music_mode` | `"auto"` \| `"queue"` | `autonomy.music_mode` |
 | `music_max_artists_per_week` | int ≥ 0 | `autonomy.music_max_artists_per_week` |
+| `music_max_albums_per_week` | int ≥ 0 | `autonomy.music_max_albums_per_week` |
+| `weekly_exploration_albums` | int ≥ 0 | `autonomy.weekly_exploration_albums` |
 | `video_queue_max_pending` | int ≥ 1 | `autonomy.video_queue_max_pending` |
 | `exploration_frac` | float in [0.0, 0.9] | `model.exploration_frac` |
 
@@ -156,6 +158,7 @@ recommendations that are ready stay queued until the *arr appears.
 | `video_mode` | `"queue"` | `auto`: add top proposed video without approval (capped per run by `video_queue_max_pending`) |
 | `music_max_artists_per_week` | `3` | weekly auto-add budget, counted per ISO week; approvals don't consume it |
 | `music_max_albums_per_week` | `10` | weekly auto-add budget for album recommendations, counted per ISO week like the artist budget |
+| `weekly_exploration_albums` | `2` | albums bought from the ListenBrainz Weekly Exploration playlist per ISO week (a shared budget across profiles, spent top of the playlist first), so the Jellyfin playlist mirror gains playable tracks as downloads land; `0` disables |
 | `video_queue_max_pending` | `20` | max open movie/series proposals; rank stops proposing at the cap, apply expires overflow |
 | `proposal_ttl_days` | `30` | proposals older than this expire so the queue never silts up |
 
