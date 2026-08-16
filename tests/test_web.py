@@ -475,7 +475,9 @@ def test_identify_q_proxies_musicbrainz_search(web, monkeypatch):
     assert (hit["id"], hit["name"]) == ("mb-1", "Kinoko Teikoku")
     assert hit["disambiguation"] == ""
     url, params = calls[0]
-    assert "musicbrainz.org" in url
+    # full-prefix check, not substring: "musicbrainz.org" anywhere in a URL
+    # also matches attacker-shaped hosts (CodeQL py/incomplete-url-substring)
+    assert url.startswith("https://musicbrainz.org/")
     assert params["query"] == 'artist:"Kinoko Teikoku"'
 
 
