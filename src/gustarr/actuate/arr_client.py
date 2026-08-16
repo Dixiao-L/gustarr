@@ -8,13 +8,22 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .. import http
+from .. import http, ids
 from ..config import ArrConfig
 
 
 class ArrError(Exception):
     """Actuation failure that is not a transport error: empty lookup,
     unusable add payload — a deterministic verdict on the item."""
+
+
+class ArrPendingError(ArrError):
+    """The arr's own mirror hasn't caught up yet — e.g. a freshly added
+    Lidarr artist's album list populates asynchronously, so an absent
+    album row is usually the refresh still running, not a verdict on the
+    item. Apply retries (with an attempt cap) instead of flipping the
+    recommendation to terminal failed; observed in production where the
+    very next run succeeded."""
 
 
 class ArrConfigError(ArrError):
@@ -254,17 +263,20 @@ class LidarrClient(ArrClient):
                 f"lidarr artist add for {artist.get('artistName') or foreign} returned no id")
         return artist_id
 
-    def add_album(self, album_mbid: str) -> dict[str, Any]:
+    def add_album(self, album_mbid: str, title: str | None = None) -> dict[str, Any]:
         # Lidarr has no direct "add album" endpoint: album rows are
         # created as a side effect of adding the artist. So: lookup the
         # album (release-group mbid), ensure its artist exists (as an
         # unmonitored shell when absent), find the album row under that
         # artist, flip it to monitored, then trigger an AlbumSearch.
+        # ``title`` is the caller's own title for the album (from the
+        # recommendation's item), the fallback key when release-group ids
+        # drift — see below.
         found = self._get("album/lookup", params={"term": f"lidarr:{album_mbid}"}) or []
         if not found:
             raise ArrError(f"lidarr album lookup found nothing for mbid {album_mbid}")
         info = found[0]
-        title = info.get("title") or album_mbid
+        lookup_title = info.get("title") or album_mbid
         artist = info.get("artist")
         if not isinstance(artist, dict):
             raise ArrError(f"lidarr album lookup for {album_mbid} carries no artist resource")
@@ -272,16 +284,41 @@ class LidarrClient(ArrClient):
         albums = self._get(
             "album", params={"artistId": artist_id, "includeAllArtistAlbums": "true"}) or []
         album = next((a for a in albums if a.get("foreignAlbumId") == album_mbid), None)
+        healed_rg: str | None = None
+        if album is None and title:
+            # RG-ID DRIFT: MusicBrainz duplicates/merges release groups,
+            # so our RG mbid and the one Lidarr's mirror carries can name
+            # the SAME album differently (seen in production with a
+            # byte-identical title under different ids). An exact
+            # normalize_key title match under the same artist IS the
+            # album when it is unique — proceed with Lidarr's own id and
+            # tell the caller so it can heal the store. Two same-title
+            # rows (deluxe/reissue twins) prove nothing: never guess,
+            # fall through to pending below.
+            want = ids.normalize_key(title)
+            matches = [a for a in albums
+                       if ids.normalize_key(str(a.get("title") or "")) == want]
+            if len(matches) == 1:
+                album = matches[0]
+                healed_rg = str(album.get("foreignAlbumId") or "") or None
         if album is None:
-            raise ArrError(
-                f"lidarr has no album {album_mbid} under artist id {artist_id}"
-                " (metadata refresh may not have populated it yet)")
+            # REFRESH RACE: a freshly added artist's album list populates
+            # asynchronously, so absence right now is usually Lidarr's
+            # refresh still running — pending, not a verdict; the caller
+            # retries on a later run instead of burying the item.
+            raise ArrPendingError(
+                f"lidarr has not yet populated album {album_mbid} under artist id"
+                f" {artist_id} (metadata refresh pending; will retry)")
         if album.get("monitored"):
             # already monitored — that IS the desired end state, not an error
-            return {"existing": True, "title": title, "arr_id": album.get("id")}
-        album_id = album.get("id")
-        if album_id is None:
-            raise ArrError(f"lidarr album row for {album_mbid} carries no id")
-        self._put("album/monitor", {"albumIds": [album_id], "monitored": True})
-        self._post("command", {"name": "AlbumSearch", "albumIds": [album_id]})
-        return {"added": True, "title": title, "arr_id": album_id}
+            result = {"existing": True, "title": lookup_title, "arr_id": album.get("id")}
+        else:
+            album_id = album.get("id")
+            if album_id is None:
+                raise ArrError(f"lidarr album row for {album_mbid} carries no id")
+            self._put("album/monitor", {"albumIds": [album_id], "monitored": True})
+            self._post("command", {"name": "AlbumSearch", "albumIds": [album_id]})
+            result = {"added": True, "title": lookup_title, "arr_id": album_id}
+        if healed_rg is not None:
+            result["healed_rg"] = healed_rg
+        return result

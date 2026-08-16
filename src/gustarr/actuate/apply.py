@@ -20,7 +20,14 @@ from typing import Any, Callable
 from .. import db, http, queue, settings
 from ..config import Config
 from . import exploration, jellyfin_collections, jellyfin_playlist
-from .arr_client import ArrConfigError, ArrError, LidarrClient, RadarrClient, SonarrClient
+from .arr_client import (
+    ArrConfigError, ArrError, ArrPendingError, LidarrClient, RadarrClient, SonarrClient)
+
+# How many runs a pending arr-mirror gap (ArrPendingError) may retry
+# before the recommendation is honestly declared failed: production
+# races resolve within one nightly run, so five is already generous —
+# past that the mirror genuinely lacks the release group.
+PENDING_MAX_ATTEMPTS = 5
 
 
 def _ext_id(conn: sqlite3.Connection, item_id: int, ns: str) -> str | None:
@@ -54,12 +61,37 @@ def _transient(exc: Exception) -> bool:
     of the arr, not verdicts on the item — credentials are service-level
     (enrich's taxonomy: an api-key rotation window must not burn
     approvals). ArrConfigError is likewise operator-fixable config, so
-    the rec keeps its status and the next apply retries. Other 4xx and
+    the rec keeps its status and the next apply retries. ArrPendingError
+    is the arr's own mirror lagging (a fresh Lidarr artist's album list
+    populates asynchronously) — transient too, but capped: the music
+    loop flips it to failed after PENDING_MAX_ATTEMPTS. Other 4xx and
     the remaining ArrErrors are deterministic failures."""
-    if isinstance(exc, ArrConfigError):
+    if isinstance(exc, (ArrConfigError, ArrPendingError)):
         return True
     return isinstance(exc, http.ApiError) and (
         exc.status is None or exc.status in (401, 403, 429) or exc.status >= 500)
+
+
+def _heal_rg(
+    conn: sqlite3.Connection, item_id: int, result: Any, stats: dict[str, Any]
+) -> None:
+    """A Lidarr add that landed via the exact-title fallback proved our
+    release-group mbid drifted from Lidarr's (MusicBrainz RG
+    duplicates/merges): adopt Lidarr's id as this album's truth.
+    meta.release_group_mbid is what _music_mbid addresses Lidarr with,
+    so retries and future re-adds use the id that works; the identity
+    row makes any later collector sighting of Lidarr's id land on this
+    item (attach_identity's merge/refusal rules handle a twin that
+    already owns it). Called after _record_add so a twin merge remaps
+    the already-written rec/event rows instead of stranding them; the
+    commit makes the heal as durable as the add it corrects."""
+    healed = (result or {}).get("healed_rg") if isinstance(result, dict) else None
+    if not healed:
+        return
+    db.upsert_item_fields(conn, item_id, meta={"release_group_mbid": healed})
+    db.attach_identity(conn, item_id, "mbid", healed)
+    stats["rg_healed"] = stats.get("rg_healed", 0) + 1
+    conn.commit()
 
 
 def _bump_attempts(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
@@ -142,20 +174,26 @@ def _apply_music(
     # One client for both music domains so the tag/profile/root lookups
     # are fetched once per run (they're cached on the instance).
     client = LidarrClient(cfg.lidarr) if cfg.lidarr is not None else None
+    # Album adds carry the item's own title so the client can rescue a
+    # release-group-id drift by exact-title match; artists have no such
+    # fallback, so their adds ignore it.
     _apply_music_domain(
         conn, cfg, ts, dry_run, stats, client, domain="artist",
         budget_setting="music_max_artists_per_week",
-        added_key="music_added", budget_key="music_budget", add=LidarrClient.add_artist)
+        added_key="music_added", budget_key="music_budget",
+        add=lambda c, mbid, _title: c.add_artist(mbid))
     _apply_music_domain(
         conn, cfg, ts, dry_run, stats, client, domain="album",
         budget_setting="music_max_albums_per_week",
-        added_key="albums_added", budget_key="albums_budget", add=LidarrClient.add_album)
+        added_key="albums_added", budget_key="albums_budget",
+        add=lambda c, mbid, title: c.add_album(mbid, title=title))
 
 
 def _apply_music_domain(
     conn: sqlite3.Connection, cfg: Config, ts: str, dry_run: bool, stats: dict[str, Any],
     client: LidarrClient | None, *, domain: str, budget_setting: str,
-    added_key: str, budget_key: str, add: Callable[[LidarrClient, str], Any],
+    added_key: str, budget_key: str,
+    add: Callable[[LidarrClient, str, str | None], Any],
 ) -> None:
     # Artists and albums share one flow: same mode switch, same approve
     # semantics, same error split — only the domain, the weekly budget
@@ -240,8 +278,22 @@ def _apply_music_domain(
         queue.transition(conn, row["id"], "failed", ts)
     for row, mbid in picks:
         try:
-            add(client, mbid)
+            result = add(client, mbid, row["title"])
         except (http.ApiError, ArrError) as exc:
+            attempts = int(json.loads(row["why"] or "{}").get("attempts", 0))
+            # The cap only terminates approved rows: 'failed' is not a
+            # legal move from 'proposed' (TTL expiry retires those), and
+            # an approval must not dangle forever on a mirror gap.
+            if isinstance(exc, ArrPendingError) and row["status"] == "approved" \
+                    and attempts >= PENDING_MAX_ATTEMPTS:
+                # the mirror gap outlived every retry it was owed: stop
+                # pretending it is a race and fail with the honest verdict
+                stats["errors"].append(
+                    f"lidarr add {row['title'] or mbid}: lidarr's metadata mirror"
+                    f" has no album {mbid} for this artist after"
+                    f" {PENDING_MAX_ATTEMPTS} refreshes")
+                queue.transition(conn, row["id"], "failed", ts)
+                continue
             stats["errors"].append(f"lidarr add {row['title'] or mbid}: {exc}")
             if row["status"] == "approved" and not _transient(exc):
                 queue.transition(conn, row["id"], "failed", ts)
@@ -249,6 +301,7 @@ def _apply_music_domain(
                 _bump_attempts(conn, row)
             continue
         _record_add(conn, row, ts)
+        _heal_rg(conn, row["item_id"], result, stats)
         stats[added_key] += 1
 
 

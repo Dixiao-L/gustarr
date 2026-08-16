@@ -4,6 +4,30 @@ All notable changes to Gustarr are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/).
 
+## [0.6.1] - 2026-08-16
+
+### Fixed
+- Lidarr album adds no longer conflate two different failures behind one
+  "has no album under artist" error. A freshly added artist's album list
+  populates asynchronously in Lidarr, and the old taxonomy read that
+  absence as a deterministic verdict — apply flipped the recommendation
+  to terminal `failed` even though the very next run would have
+  succeeded. The gap is now `ArrPendingError`: the recommendation keeps
+  its status (with the usual `why.attempts` bump) and retries on later
+  runs, flipping to `failed` only after 5 attempts with the honest
+  message that Lidarr's metadata mirror lacks the release group. Weekly
+  Exploration adds share the same path: a pending add writes no
+  recommendation row and spends no budget, so the next run retries it.
+- When the wanted release-group mbid is absent from the artist's album
+  list but an album with the exact (normalize_key) same title exists
+  under a different id — MusicBrainz release-group duplicates/merges
+  drifting from Lidarr's mirror — the unique title match is taken as the
+  album: the add proceeds with Lidarr's own id and the store is healed
+  (`meta.release_group_mbid` plus an `mbid` identity row, counted as
+  `rg_healed` in apply stats), so retries stop chasing the dead id. Two
+  same-title rows (deluxe/reissue twins) are never guessed between; the
+  add stays pending instead.
+
 ## [0.6.0] - 2026-08-16
 
 ### Added
