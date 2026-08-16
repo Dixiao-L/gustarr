@@ -38,6 +38,10 @@ class FakeArr:
         self.next_album_id = 0
         self.monitor_puts = []  # recorded PUT album/monitor bodies
         self.commands = []  # recorded POST command bodies
+        # True models lidarr's async metadata refresh still running:
+        # artist adds succeed but their album rows have not materialized
+        # yet — complete_refresh() is the refresh finishing later
+        self.pending_refresh = False
 
     def register_artist(self, foreign_id, name):
         """Pre-existing library artist (added outside gustarr): its album
@@ -51,13 +55,31 @@ class FakeArr:
     def _spawn_albums(self, artist_row):
         # mirror lidarr: adding an artist creates its album rows; there
         # is no direct "add album" endpoint
+        if self.pending_refresh:
+            return  # the async refresh hasn't landed the rows yet
+        existing = {a["foreignAlbumId"] for a in self.albums
+                    if a["artistId"] == artist_row["id"]}
         for mbid, meta in self.album_lookup.items():
-            if meta["artist_mbid"] == artist_row["foreignArtistId"]:
-                self.next_album_id += 1
-                self.albums.append({
-                    "id": self.next_album_id, "foreignAlbumId": mbid,
-                    "title": meta["title"], "artistId": artist_row["id"],
-                    "monitored": meta.get("monitored", False)})
+            if meta["artist_mbid"] != artist_row["foreignArtistId"]:
+                continue
+            # library_mbid models release-group-id drift: lidarr's own
+            # library row carries a DIFFERENT foreignAlbumId than the
+            # mbid our lookup resolves (MusicBrainz RG duplicate/merge)
+            foreign = meta.get("library_mbid", mbid)
+            if foreign in existing:
+                continue
+            self.next_album_id += 1
+            self.albums.append({
+                "id": self.next_album_id, "foreignAlbumId": foreign,
+                "title": meta["title"], "artistId": artist_row["id"],
+                "monitored": meta.get("monitored", False)})
+
+    def complete_refresh(self):
+        """The deferred async metadata refresh finishing: every artist's
+        album rows materialize now (idempotent for rows already spawned)."""
+        self.pending_refresh = False
+        for row in self.artists:
+            self._spawn_albums(row)
 
     def handle(self, request: httpx.Request, path: str) -> httpx.Response:
         if request.headers.get("X-Api-Key") != self.api_key:
@@ -327,9 +349,14 @@ def events_of(conn, item_id):
         (item_id,)).fetchall()
 
 
-def seed_album(net, mbid, artist_mbid, title, artist_name="Some Artist"):
+def seed_album(net, mbid, artist_mbid, title, artist_name="Some Artist",
+               library_mbid=None):
+    """library_mbid: what lidarr's own library row will carry as
+    foreignAlbumId when it drifts from the mbid our lookup uses."""
     net.lidarr.album_lookup[mbid] = {
         "title": title, "artist_mbid": artist_mbid, "artist_name": artist_name}
+    if library_mbid is not None:
+        net.lidarr.album_lookup[mbid]["library_mbid"] = library_mbid
 
 
 # ── runtime settings overrides ───────────────────────────────────────
@@ -864,6 +891,100 @@ def test_approved_album_unknown_mbid_marked_failed(conn, tmp_path, net):
     assert stats["albums_added"] == 0
     assert any("found nothing" in e for e in stats["errors"])
     assert rec_row(conn, rid)["status"] == "failed"  # deterministic 4xx-style failure
+
+
+def test_album_refresh_race_transient_then_next_run_succeeds(conn, tmp_path, net):
+    # production defect (A): a freshly added artist's album list
+    # populates asynchronously — absence right now is a pending refresh,
+    # not a verdict, so the approval must survive to the next run
+    cfg = make_cfg(tmp_path, music_mode="queue")
+    seed_album(net, "al1", "ar1", "Album 1", "Artist One")
+    net.lidarr.pending_refresh = True
+    rid = add_rec(conn, "album", "Album 1", {"mbid": "al1"}, status="approved")
+
+    stats = apply_mod.run(conn, cfg)
+
+    assert stats["albums_added"] == 0
+    assert any("metadata refresh pending" in e for e in stats["errors"])
+    row = rec_row(conn, rid)
+    assert row["status"] == "approved"  # transient: kept, never terminally failed
+    assert json.loads(row["why"])["attempts"] == 1
+    # the refresh lands between runs: the very next apply succeeds
+    net.lidarr.complete_refresh()
+    stats = apply_mod.run(conn, cfg)
+    assert stats["albums_added"] == 1
+    assert rec_row(conn, rid)["status"] == "added"
+
+
+def test_album_pending_flips_failed_after_five_attempts(conn, tmp_path, net):
+    cfg = make_cfg(tmp_path, music_mode="queue")
+    seed_album(net, "al1", "ar1", "Album 1", "Artist One")
+    net.lidarr.pending_refresh = True  # the refresh never lands
+    rid = add_rec(conn, "album", "Album 1", {"mbid": "al1"}, status="approved")
+    for attempt in range(1, 6):
+        stats = apply_mod.run(conn, cfg)
+        row = rec_row(conn, rid)
+        assert row["status"] == "approved"  # five rounds stay retryable
+        assert json.loads(row["why"])["attempts"] == attempt
+    # the 6th attempt is the honest terminal verdict: the mirror simply
+    # lacks the release group, and retrying cannot manufacture it
+    stats = apply_mod.run(conn, cfg)
+    assert any(
+        "lidarr's metadata mirror has no album al1 for this artist"
+        " after 5 refreshes" in e for e in stats["errors"])
+    assert rec_row(conn, rid)["status"] == "failed"
+
+
+def test_album_rg_drift_healed_by_unique_title_match(conn, tmp_path, net):
+    # production defect (B): the album EXISTS under the artist but with
+    # a DIFFERENT release-group mbid (MusicBrainz duplicate/merge). The
+    # unique byte-identical title IS the album: the add proceeds with
+    # lidarr's own id and the store adopts it so nothing chases the dead
+    # id again.
+    cfg = make_cfg(tmp_path, music_mode="queue")
+    seed_album(net, "rg-ours", "ar1", "月の反射でみてた", "ヨルシカ",
+               library_mbid="rg-lidarr")
+    rid = add_rec(conn, "album", "月の反射でみてた", {"mbid": "rg-ours"},
+                  status="approved")
+
+    stats = apply_mod.run(conn, cfg)
+
+    assert stats["albums_added"] == 1
+    assert stats["rg_healed"] == 1
+    assert stats["errors"] == []
+    album = next(a for a in net.lidarr.albums if a["foreignAlbumId"] == "rg-lidarr")
+    assert album["monitored"] is True
+    assert net.lidarr.commands == [{"name": "AlbumSearch", "albumIds": [album["id"]]}]
+    row = rec_row(conn, rid)
+    assert row["status"] == "added"
+    # healed store: meta carries lidarr's id (what actuation addresses
+    # lidarr with), and the identity row catches future sightings of it
+    meta = json.loads(conn.execute(
+        "SELECT meta FROM items WHERE id=?", (row["item_id"],)).fetchone()["meta"])
+    assert meta["release_group_mbid"] == "rg-lidarr"
+    keys = {r["key"] for r in conn.execute(
+        "SELECT key FROM identities WHERE item_id=? AND ns='mbid'", (row["item_id"],))}
+    assert keys == {"rg-ours", "rg-lidarr"}
+
+
+def test_album_same_title_twins_never_guessed(conn, tmp_path, net):
+    # two same-title albums under the artist (deluxe/reissue duplicates):
+    # a title match proves nothing, so nothing is monitored on a guess —
+    # the add stays pending like the refresh race
+    cfg = make_cfg(tmp_path, music_mode="queue")
+    seed_album(net, "rg-w", "ar1", "Twin Album", library_mbid="rg-lib1")
+    seed_album(net, "rg-x", "ar1", "Twin Album", library_mbid="rg-lib2")
+    rid = add_rec(conn, "album", "Twin Album", {"mbid": "rg-w"}, status="approved")
+
+    stats = apply_mod.run(conn, cfg)
+
+    assert stats["albums_added"] == 0
+    assert "rg_healed" not in stats
+    assert net.lidarr.monitor_puts == []  # nothing guessed at
+    assert any("metadata refresh pending" in e for e in stats["errors"])
+    row = rec_row(conn, rid)
+    assert row["status"] == "approved"
+    assert json.loads(row["why"])["attempts"] == 1
 
 
 # ── video approvals ──────────────────────────────────────────────────
@@ -2023,6 +2144,30 @@ def test_exploration_lidarr_add_failure_does_not_burn_budget(conn, tmp_path, exp
     assert any("rg-0" in e or "Album 0" in e for e in stats["errors"])
     assert monitored_albums(expnet) == {"rg-1"}
     assert len(exploration_recs(conn)) == 1  # no rec row for the failure
+
+
+def test_exploration_refresh_race_stays_retryable_without_burning_budget(
+        conn, tmp_path, expnet):
+    # the same lidarr refresh race as apply's album path: a pending add
+    # writes no rec row and spends no budget, so the next nightly run
+    # simply buys the album once the metadata lands
+    cfg = make_exploration_cfg(tmp_path, albums=1)
+    seed_exploration_week(expnet, n=1)
+    expnet.lidarr.pending_refresh = True
+
+    stats = apply_mod.run(conn, cfg)["weekly_exploration"]
+
+    assert stats["added"] == 0
+    assert stats["budget"] == 1  # unburnt: only successful adds spend it
+    assert any("metadata refresh pending" in e for e in stats["errors"])
+    assert exploration_recs(conn) == []  # no rec row: nothing to unblock
+    # the refresh lands between runs: same week, same cached resolution
+    expnet.lidarr.complete_refresh()
+    stats = apply_mod.run(conn, cfg)["weekly_exploration"]
+    assert stats["added"] == 1
+    assert stats["cached"] is True  # zero fresh MusicBrainz traffic
+    assert monitored_albums(expnet) == {"rg-0"}
+    assert [r["status"] for r in exploration_recs(conn)] == ["auto_added"]
 
 
 def test_exploration_dry_run_makes_no_http(conn, tmp_path, expnet):

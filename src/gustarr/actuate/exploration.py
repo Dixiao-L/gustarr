@@ -36,8 +36,8 @@ _RG_PREFIX = "weekly_exploration:rgs:"
 
 def run(conn: sqlite3.Connection, cfg: Config, dry_run: bool = False) -> dict[str, Any]:
     # call-time import: apply imports this module at load, and the week
-    # window + add bookkeeping must stay apply's single implementation
-    from .apply import _record_add, _week_start
+    # window + add/heal bookkeeping must stay apply's single implementation
+    from .apply import _heal_rg, _record_add, _week_start
 
     limit = settings.get(conn, cfg, "weekly_exploration_albums")
     if limit <= 0:
@@ -105,10 +105,15 @@ def run(conn: sqlite3.Connection, cfg: Config, dry_run: bool = False) -> dict[st
                     stats["skipped"] += 1
                     continue
             try:
-                client.add_album(entry["rg"])
+                # the resolved title rides along so a release-group-id
+                # drift heals here exactly as in apply's album path
+                result = client.add_album(entry["rg"], title=entry.get("title"))
             except (http.ApiError, ArrError) as exc:
-                # one album failing (outage or verdict) must not spend
-                # the budget or stop the rest of the playlist
+                # one album failing (outage, verdict, or a pending
+                # metadata refresh — ArrPendingError is an ArrError)
+                # must not spend the budget or stop the rest of the
+                # playlist; no rec row is written, so the next run
+                # retries the add with the same semantics as apply's
                 stats["errors"].append(f"lidarr add {entry.get('title') or entry['rg']}:"
                                        f" {exc}")
                 continue
@@ -126,6 +131,7 @@ def run(conn: sqlite3.Connection, cfg: Config, dry_run: bool = False) -> dict[st
                 "SELECT id, item_id, profile, status, why FROM recommendations"
                 " WHERE id=?", (cur.lastrowid,)).fetchone()
             _record_add(conn, row, ts)
+            _heal_rg(conn, item_id, result, stats)
             budget -= 1
             stats["added"] += 1
     stats["budget"] = budget
