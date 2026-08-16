@@ -13,7 +13,7 @@ import pytest
 from gustarr import config as C
 from gustarr import db, http, queue, settings, signals
 from gustarr.actuate import apply as apply_mod
-from gustarr.actuate import arr_client, jellyfin_collections, jellyfin_playlist
+from gustarr.actuate import arr_client, exploration, jellyfin_collections, jellyfin_playlist
 from gustarr.config import ArrConfig
 
 # ── fakes ────────────────────────────────────────────────────────────
@@ -1705,3 +1705,342 @@ def test_weekly_playlist_dry_run_makes_no_jellyfin_calls(conn, tmp_path, plnet):
     assert [p for _m, h, p in plnet.log[before:] if h == "jellyfin.test"] == []
     assert jf.playlist_items(pid) == ["jf-a"]  # existing playlist untouched
     assert db.pget_state(conn, "ldx", "jellyfin:weekly_playlist_id") == pid
+
+
+# ── weekly exploration album acquisition ─────────────────────────────
+
+
+class FakeMB:
+    """MusicBrainz /ws/2/recording/{mbid} exactly as the exploration
+    resolution queries it: fmt=json required, artist-credit and releases
+    (each carrying its release-group) included — the same shapes
+    enrich.py's credit helpers already parse. Unknown mbids 404; mbids in
+    ``fail`` return the configured status so one bad recording can be
+    modelled without touching the rest."""
+
+    def __init__(self):
+        self.recordings = {}  # recording mbid -> response dict
+        self.fail = {}  # recording mbid -> status code
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if not path.startswith("/ws/2/recording/"):
+            return httpx.Response(404, text=f"unhandled musicbrainz {path}")
+        if request.url.params.get("fmt") != "json":
+            return httpx.Response(400, text="fmt=json required")
+        mbid = path.removeprefix("/ws/2/recording/")
+        if mbid in self.fail:
+            return httpx.Response(self.fail[mbid], text="error",
+                                  headers={"Retry-After": "0"})
+        data = self.recordings.get(mbid)
+        if data is None:
+            return httpx.Response(404, text="Not Found")
+        return httpx.Response(200, json=data)
+
+
+class FakeExplorationNet:
+    """Lidarr (the strict FakeArr), ListenBrainz (FakeLB) and
+    MusicBrainz — everything the exploration stage talks to."""
+
+    def __init__(self):
+        self.lidarr = FakeArr(
+            "lk", [{"id": 20, "name": "Standard"}], [{"path": "/music"}],
+            metadata_profiles=[{"id": 30, "name": "Standard"}])
+        self.lb = FakeLB()
+        self.mb = FakeMB()
+        self.log = []  # (method, host, path)
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        host = request.url.host
+        self.log.append((request.method, host, request.url.path))
+        if host == "lidarr.test":
+            return self.lidarr.handle(request, request.url.path.removeprefix("/api/v1/"))
+        if host == "api.listenbrainz.org":
+            return self.lb.handle(request)
+        if host == "musicbrainz.org":
+            return self.mb.handle(request)
+        return httpx.Response(404, text=f"no such host {host}")
+
+    def mb_calls(self):
+        return [p for _m, h, p in self.log if h == "musicbrainz.org"]
+
+
+@pytest.fixture
+def expnet(monkeypatch):
+    monkeypatch.setattr(http, "HOST_DELAYS", {})
+    monkeypatch.setattr(http.time, "sleep", lambda _s: None)
+    fake = FakeExplorationNet()
+    transport = httpx.MockTransport(fake.handler)
+    orig = http.request_json
+
+    def patched(method, url, **kw):
+        kw["transport"] = transport
+        return orig(method, url, **kw)
+
+    monkeypatch.setattr(http, "request_json", patched)
+    return fake
+
+
+def make_exploration_cfg(tmp_path, albums=2, profiles=None, lidarr=True):
+    raw = {
+        "core": {"data_dir": str(tmp_path)},
+        "profiles": profiles or {"ldx": {"listenbrainz_user": "ldx"}},
+        # music_mode queue: only the exploration stage may touch Lidarr
+        "autonomy": {"music_mode": "queue", "weekly_exploration_albums": albums},
+    }
+    if lidarr:
+        raw["lidarr"] = {"url": "http://lidarr.test", "api_key": "lk",
+                         "quality_profile": "Standard", "root_folder": "/music"}
+    return C._build(raw)
+
+
+def mb_recording(rec_mbid, rg, album_title, artist_mbid, artist_name):
+    """A recording lookup response carrying the bits the resolution
+    reads: top-level artist-credit plus the first release's group."""
+    return {
+        "id": rec_mbid,
+        "title": f"Recording {rec_mbid}",
+        "artist-credit": [
+            {"name": artist_name,
+             "artist": {"id": artist_mbid, "name": artist_name}}],
+        "releases": [
+            {"id": f"rel-{rg}", "title": album_title,
+             "release-group": {"id": rg, "title": album_title,
+                               "primary-type": "Album"}}],
+    }
+
+
+def seed_exploration_week(net, mbid="week-1", n=3, user="ldx", date="2026-07-06"):
+    """A weekly playlist of n tracks, each resolvable to its own album
+    (rg-i by am-i) that Lidarr knows how to look up."""
+    tracks = []
+    for i in range(n):
+        rec = f"rec-{i}"
+        tracks.append(jspf(rec, f"Track {i}", f"Artist {i}"))
+        net.mb.recordings[rec] = mb_recording(
+            rec, f"rg-{i}", f"Album {i}", f"am-{i}", f"Artist {i}")
+        seed_album(net, f"rg-{i}", f"am-{i}", f"Album {i}", f"Artist {i}")
+    net.lb.set_week(user, mbid, tracks, date=date)
+
+
+def monitored_albums(net):
+    return {a["foreignAlbumId"] for a in net.lidarr.albums if a["monitored"]}
+
+
+def exploration_recs(conn):
+    return conn.execute(
+        "SELECT * FROM recommendations"
+        " WHERE json_extract(why, '$.weekly_exploration') ORDER BY id").fetchall()
+
+
+def test_exploration_buys_top_of_playlist_and_records_like_auto_adds(
+        conn, tmp_path, expnet):
+    cfg = make_exploration_cfg(tmp_path, albums=2)
+    seed_exploration_week(expnet, n=3)
+
+    stats = apply_mod.run(conn, cfg)["weekly_exploration"]
+
+    assert stats == {"resolved": 3, "cached": False, "added": 2,
+                     "budget": 0, "skipped": 0, "errors": []}
+    # top of the playlist first — never the tail
+    assert monitored_albums(expnet) == {"rg-0", "rg-1"}
+    recs = exploration_recs(conn)
+    assert [r["status"] for r in recs] == ["auto_added", "auto_added"]
+    for r in recs:
+        assert r["profile"] == "ldx"
+        assert r["acted_at"]
+        why = json.loads(r["why"])
+        assert why["weekly_exploration"] is True
+        assert why["playlist"] == "week-1"
+        # audit trail only: gustarr's own add must never read as praise
+        events = events_of(conn, r["item_id"])
+        assert [(e["kind"], e["scale"], e["source"], e["profile"]) for e in events] \
+            == [("auto_add", 0.0, "gustarr", "ldx")]
+    # the item carries the artist relation the resolution learned
+    meta = json.loads(conn.execute(
+        "SELECT meta FROM items WHERE id=?", (recs[0]["item_id"],)).fetchone()["meta"])
+    assert meta["artist"] == "Artist 0"
+    assert meta["artist_mbid"] == "am-0"
+    # irreversible-add rule: committed immediately, visible to a second
+    # connection even though apply never reached a final commit
+    other = db.connect(tmp_path / "t.db")
+    try:
+        assert other.execute(
+            "SELECT COUNT(*) FROM recommendations WHERE status='auto_added'"
+        ).fetchone()[0] == 2
+    finally:
+        other.close()
+
+
+def test_exploration_budget_respected_across_runs_same_week(conn, tmp_path, expnet):
+    cfg = make_exploration_cfg(tmp_path, albums=2)
+    seed_exploration_week(expnet, n=3)
+    assert apply_mod.run(conn, cfg)["weekly_exploration"]["added"] == 2
+    before = len(expnet.log)
+
+    stats = apply_mod.run(conn, cfg)["weekly_exploration"]
+
+    # the week's budget is spent: the second run doesn't even fetch LB
+    assert stats == {"resolved": 0, "cached": False, "added": 0,
+                     "budget": 0, "skipped": 0, "errors": []}
+    assert expnet.log[before:] == []
+    assert monitored_albums(expnet) == {"rg-0", "rg-1"}
+
+
+def test_exploration_new_iso_week_refreshes_budget_and_cache_skips_mb(
+        conn, tmp_path, expnet):
+    cfg = make_exploration_cfg(tmp_path, albums=2)
+    seed_exploration_week(expnet, n=3)
+    apply_mod.run(conn, cfg)
+    assert len(expnet.mb_calls()) == 3  # one resolution round
+    # the ISO week rolls over: last week's spend no longer counts
+    last_week = (datetime.now(timezone.utc) - timedelta(days=8)) \
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+    conn.execute("UPDATE recommendations SET acted_at=?", (last_week,))
+    conn.commit()
+
+    stats = apply_mod.run(conn, cfg)["weekly_exploration"]
+
+    # fresh budget, but the cached playlist never re-queries MusicBrainz
+    assert stats["budget"] == 1  # 2 refreshed minus the one add below
+    assert stats["added"] == 1
+    assert stats["cached"] is True
+    assert stats["skipped"] == 2  # rg-0/rg-1 already auto_added
+    assert len(expnet.mb_calls()) == 3  # STILL 3: zero new lookups
+    assert monitored_albums(expnet) == {"rg-0", "rg-1", "rg-2"}
+
+
+def test_exploration_new_playlist_drops_old_cache_key(conn, tmp_path, expnet):
+    cfg = make_exploration_cfg(tmp_path, albums=1)
+    seed_exploration_week(expnet, mbid="week-1", n=1)
+    apply_mod.run(conn, cfg)
+    assert db.get_state(conn, "weekly_exploration:rgs:week-1") is not None
+    # a new week arrives (newer date wins the createdfor listing)
+    tracks = [jspf("rec-new", "New Track", "New Artist")]
+    expnet.mb.recordings["rec-new"] = mb_recording(
+        "rec-new", "rg-new", "New Album", "am-new", "New Artist")
+    seed_album(expnet, "rg-new", "am-new", "New Album", "New Artist")
+    expnet.lb.set_week("ldx", "week-2", tracks, date="2026-07-13")
+    last_week = (datetime.now(timezone.utc) - timedelta(days=8)) \
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+    conn.execute("UPDATE recommendations SET acted_at=?", (last_week,))
+    conn.commit()
+
+    stats = apply_mod.run(conn, cfg)["weekly_exploration"]
+
+    assert stats["added"] == 1
+    # the old week's cache is retired the moment the new one lands
+    assert db.get_state(conn, "weekly_exploration:rgs:week-1") is None
+    assert db.get_state(conn, "weekly_exploration:rgs:week-2") is not None
+    assert json.loads(db.get_state(conn, "weekly_exploration:rgs:week-2")) == [
+        {"rg": "rg-new", "title": "New Album",
+         "artist": "New Artist", "artist_mbid": "am-new"}]
+
+
+def test_exploration_skips_decided_albums_and_rejected_artists(conn, tmp_path, expnet):
+    cfg = make_exploration_cfg(tmp_path, albums=2)
+    seed_exploration_week(expnet, n=3)
+    # rg-0 was already auto-added for this profile in some earlier week
+    add_rec(conn, "album", "Album 0", {"mbid": "rg-0"}, status="auto_added",
+            acted_at="2026-01-05T00:00:00Z", profile="ldx")
+    # the profile once rejected Artist 1: their albums never sneak back in
+    artist1 = db.resolve_item(conn, "artist", "mbid", "am-1", title="Artist 1")
+    db.add_event(conn, db.now(), artist1, "reject", 1.0, "user", profile="ldx")
+    conn.commit()
+
+    stats = apply_mod.run(conn, cfg)["weekly_exploration"]
+
+    assert stats == {"resolved": 3, "cached": False, "added": 1,
+                     "budget": 1, "skipped": 2, "errors": []}
+    assert monitored_albums(expnet) == {"rg-2"}
+    assert [json.loads(r["why"])["playlist"] for r in exploration_recs(conn)] == ["week-1"]
+
+
+def test_exploration_zero_budget_short_circuits_with_zero_http(conn, tmp_path, expnet):
+    cfg = make_exploration_cfg(tmp_path, albums=0)
+    seed_exploration_week(expnet, n=2)
+    stats = apply_mod.run(conn, cfg)
+    assert stats["weekly_exploration"] == {"skipped": "disabled"}
+    assert expnet.log == []
+
+
+def test_exploration_setting_override_wins_over_config(conn, tmp_path, expnet):
+    cfg = make_exploration_cfg(tmp_path, albums=5)
+    seed_exploration_week(expnet, n=3)
+    settings.set(conn, "weekly_exploration_albums", 1)
+
+    stats = apply_mod.run(conn, cfg)["weekly_exploration"]
+
+    assert stats["added"] == 1
+    assert stats["budget"] == 0
+    assert monitored_albums(expnet) == {"rg-0"}
+    # and 0 at runtime disables outright
+    settings.set(conn, "weekly_exploration_albums", 0)
+    assert apply_mod.run(conn, cfg)["weekly_exploration"] == {"skipped": "disabled"}
+
+
+def test_exploration_without_lidarr_skips_cleanly(conn, tmp_path, expnet):
+    cfg = make_exploration_cfg(tmp_path, lidarr=False)
+    seed_exploration_week(expnet, n=2)
+    stats = apply_mod.run(conn, cfg)
+    assert stats["weekly_exploration"] == {"skipped": "lidarr not configured"}
+    assert expnet.log == []
+
+
+def test_exploration_without_lb_users_skips_cleanly(conn, tmp_path, expnet):
+    cfg = make_exploration_cfg(tmp_path, profiles={"video-only": {}})
+    stats = apply_mod.run(conn, cfg)
+    assert stats["weekly_exploration"] == {"skipped": "listenbrainz not configured"}
+    assert expnet.log == []
+
+
+def test_exploration_mb_failure_skips_track_not_stage(conn, tmp_path, expnet):
+    cfg = make_exploration_cfg(tmp_path, albums=3)
+    seed_exploration_week(expnet, n=3)
+    expnet.mb.fail["rec-1"] = 404  # one recording lookup dies
+
+    stats = apply_mod.run(conn, cfg)["weekly_exploration"]
+
+    assert stats["resolved"] == 2  # the failed track only, not the stage
+    assert stats["added"] == 2
+    assert monitored_albums(expnet) == {"rg-0", "rg-2"}
+    # the partial round is what got cached — the failed track is gone for
+    # the week, the others never re-query
+    cached = json.loads(db.get_state(conn, "weekly_exploration:rgs:week-1"))
+    assert [e["rg"] for e in cached] == ["rg-0", "rg-2"]
+
+
+def test_exploration_lidarr_add_failure_does_not_burn_budget(conn, tmp_path, expnet):
+    cfg = make_exploration_cfg(tmp_path, albums=1)
+    seed_exploration_week(expnet, n=2)
+    del expnet.lidarr.album_lookup["rg-0"]  # lidarr's lookup finds nothing
+
+    stats = apply_mod.run(conn, cfg)["weekly_exploration"]
+
+    # the failed add spends nothing: the budget buys the next album
+    assert stats["added"] == 1
+    assert stats["budget"] == 0
+    assert any("rg-0" in e or "Album 0" in e for e in stats["errors"])
+    assert monitored_albums(expnet) == {"rg-1"}
+    assert len(exploration_recs(conn)) == 1  # no rec row for the failure
+
+
+def test_exploration_dry_run_makes_no_http(conn, tmp_path, expnet):
+    cfg = make_exploration_cfg(tmp_path, albums=2)
+    seed_exploration_week(expnet, n=2)
+    stats = apply_mod.run(conn, cfg, dry_run=True)
+    assert stats["weekly_exploration"] == {"skipped": "dry_run"}
+    assert expnet.log == []
+    assert conn.execute("SELECT COUNT(*) FROM recommendations").fetchone()[0] == 0
+
+
+def test_exploration_failure_never_fails_apply(conn, tmp_path, expnet, monkeypatch):
+    cfg = make_exploration_cfg(tmp_path, albums=2)
+
+    def boom(*a, **kw):
+        raise RuntimeError("listenbrainz melted")
+
+    monkeypatch.setattr(exploration, "run", boom)
+    stats = apply_mod.run(conn, cfg)
+    assert "listenbrainz melted" in stats["weekly_exploration_error"]
+    assert "weekly_exploration" not in stats

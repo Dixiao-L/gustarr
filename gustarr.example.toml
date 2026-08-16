@@ -74,6 +74,7 @@ music_mode = "auto"    # auto-add music within the caps below ("queue" = ask fir
 video_mode = "queue"   # movies/TV wait for approve/reject ("auto" = add top picks)
 music_max_artists_per_week = 3   # weekly auto-add budget; approvals don't consume it
 music_max_albums_per_week = 10   # weekly auto-add budget for album picks
+weekly_exploration_albums = 2    # LB Weekly Exploration albums bought per week; 0 disables
 video_queue_max_pending = 20     # open-proposal cap; overflow expires lowest-scored
 proposal_ttl_days = 30           # stale proposals expire instead of silting the queue
 

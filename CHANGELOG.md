@@ -4,6 +4,26 @@ All notable changes to Gustarr are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [SemVer](https://semver.org/).
 
+## [0.6.0] - 2026-08-16
+
+### Added
+- Weekly Exploration album acquisition: each ISO week, apply buys a
+  small budgeted number of albums from the ListenBrainz Weekly
+  Exploration playlist through Lidarr, so the mirrored Jellyfin playlist
+  — by definition music the user doesn't own — gains playable tracks as
+  the downloads land instead of sitting at zero matches all week. The
+  budget (`autonomy.weekly_exploration_albums`, default 2, `0` disables)
+  is shared across profiles, spent top of the playlist first, and
+  runtime-overridable like the other caps. Recording→release-group
+  resolution runs against MusicBrainz once per playlist and is cached in
+  the store, so the other nightly runs of the same week cost zero
+  MusicBrainz traffic. Already-decided albums (any open/acted/failed
+  recommendation, anything rejected, anything in the library) and albums
+  by artists the profile ever rejected are skipped; adds are recorded
+  exactly like the ordinary music auto-adds (recommendation row with a
+  `weekly_exploration` why marker, inert audit event, committed
+  immediately) and never fail the apply run.
+
 ## [0.5.2] - 2026-07-20
 
 ### Fixed

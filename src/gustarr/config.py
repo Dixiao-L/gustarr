@@ -58,6 +58,10 @@ class AutonomyConfig:
     video_mode: str = "queue"  # auto | queue
     music_max_artists_per_week: int = 3
     music_max_albums_per_week: int = 10
+    # Albums bought from the ListenBrainz Weekly Exploration playlist per
+    # ISO week (shared across profiles) so the playlist mirror gains
+    # playable tracks as downloads land; 0 disables the stage.
+    weekly_exploration_albums: int = 2
     video_queue_max_pending: int = 20
     # Recommendations older than this are marked expired so the queue
     # never silts up with stale suggestions.
