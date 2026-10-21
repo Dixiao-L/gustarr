@@ -22,7 +22,10 @@
           # >=13.0.3); nixpkgs still defaults cudaPackages to 12.9 and
           # refuses to evaluate. Any >=525 driver runs CUDA-13 userspace,
           # so this is a metadata unblock, not a compatibility gamble.
-          overlays = [ (final: _prev: { cudaPackages = final.cudaPackages_13; }) ];
+          overlays = [
+            (final: _prev: { cudaPackages = final.cudaPackages_13; })
+            (import ./nix/ca-trust-overlay.nix)
+          ];
           config.allowUnfreePredicate = pkg:
             let n = lib.getName pkg; in
             # torch-bin evaluates under pname "torch" (nixpkgs shares the
