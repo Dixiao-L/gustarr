@@ -1,0 +1,64 @@
+--- a/tests/hazmat/primitives/test_argon2.py
++++ b/tests/hazmat/primitives/test_argon2.py
+@@ -6,6 +6,7 @@
+ import base64
+ import binascii
+ import os
++import subprocess
+ import sys
+ 
+ import pytest
+@@ -150,17 +151,42 @@
+         ),
+     )
+     def test_argon2_malloc_failure(self, clazz, backend):
+-        # memory_cost is in KiB, so 2**32 - 1 KiB is ~4 TiB. This should
+-        # fail to allocate on any reasonable system.
+-        argon2 = clazz(
+-            salt=b"salt" * 2,
+-            length=32,
+-            iterations=1,
+-            lanes=1,
+-            memory_cost=2**32 - 1,
+-        )
+-        with pytest.raises(MemoryError):
+-            argon2.derive(b"password")
++        # Linux can overcommit this 4 TiB request and OOM-kill the worker
++        # during initialization. Bound a child process, then check the same
++        # MemoryError path without changing the pytest worker's limits.
++        subprocess.run(
++            [
++                sys.executable,
++                "-c",
++                """
++import resource
++import sys
++
++import pytest
++from cryptography.hazmat.primitives.kdf import argon2
++
++soft, hard = resource.getrlimit(resource.RLIMIT_AS)
++limit = 1024**3
++for existing in (soft, hard):
++    if existing != resource.RLIM_INFINITY:
++        limit = min(limit, existing)
++resource.setrlimit(resource.RLIMIT_AS, (limit, hard))
++
++kdf = getattr(argon2, sys.argv[1])(
++    salt=b"salt" * 2,
++    length=32,
++    iterations=1,
++    lanes=1,
++    memory_cost=2**32 - 1,
++)
++with pytest.raises(MemoryError):
++    kdf.derive(b"password")
++""",
++                clazz.__name__,
++            ],
++            check=True,
++            timeout=30,
++        )
+ 
+     def test_already_finalized(self, clazz, backend):
+         argon2id = clazz(
