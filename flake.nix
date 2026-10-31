@@ -25,6 +25,7 @@
           overlays = [
             (final: _prev: { cudaPackages = final.cudaPackages_13; })
             (import ./nix/ca-trust-overlay.nix)
+            (import ./nix/cryptography-allocation-overlay.nix)
           ];
           config.allowUnfreePredicate = pkg:
             let n = lib.getName pkg; in
@@ -109,6 +110,12 @@
         // lib.optionalAttrs (lib.hasSuffix "linux" system) {
           ml = mkGustarr pkgs true;
         });
+
+      # This is the private package set used by the ML dependency chain,
+      # including Thrift's Python build environment. Check its actual package.
+      checks = forAll (system: lib.optionalAttrs (lib.hasSuffix "linux" system) {
+        cryptography-allocation = (mkPkgs system).python3Packages.cryptography;
+      });
 
       nixosModules.default = import ./nix/module.nix self;
 
