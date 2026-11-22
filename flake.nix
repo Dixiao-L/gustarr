@@ -16,6 +16,9 @@
       # consumer (sentence-transformers → transformers → ...) onto the same
       # torch-bin instance.
       mkPkgs = system:
+        let
+          upstreamPkgs = import nixpkgs { inherit system; };
+        in
         import nixpkgs {
           inherit system;
           # torch-bin 2.12 wheels are built against CUDA 13 (cuda-bindings
@@ -26,6 +29,11 @@
             (final: _prev: { cudaPackages = final.cudaPackages_13; })
             (import ./nix/ca-trust-overlay.nix)
             (import ./nix/cryptography-allocation-overlay.nix)
+            (_final: _prev: lib.optionalAttrs (lib.hasSuffix "linux" system) {
+              # Offline manpage generator in rdma-core.nativeBuildInputs; reuse the
+              # unmodified upstream cached binary instead of rebuilding GHC from source.
+              inherit (upstreamPkgs) pandoc pandoc-cli;
+            })
           ];
           config.allowUnfreePredicate = pkg:
             let n = lib.getName pkg; in
